@@ -1,5 +1,7 @@
 # ivapp
 
+维护入口：[项目全盘分析](docs/PROJECT_ANALYSIS.md) · [部署与回滚](docs/DEPLOYMENT.md)
+
 临时 C 端 FastAPI：接收 ivadmin 发布、教学置顶 + `feed_weight` 排序的推荐 Feed、Redis 曝光沉底去重；邮箱验证码登录。
 
 自带 **独立 MySQL**（库名 `ivapp`）与 **Redis**，**不与 ivadmin 共用**；MySQL / Redis **不对宿主机映射端口**，仅 compose 内网。
@@ -70,9 +72,9 @@ docker-compose up -d --build
 
 | 环境变量 | 说明 |
 |----------|------|
-| `SMTP_HOST` | 默认阿里企业邮 `smtp.qiye.aliyun.com`；置空则只打日志 |
+| `SMTP_HOST` | 由环境配置；置空则只打日志 |
 | `SMTP_PORT` | 默认 `465`（SSL） |
-| `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | 发件账号，默认 `mail@pixopixo.com` |
+| `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | 发件账号；源码不提供真实默认值 |
 | `SMTP_SSL` / `SMTP_TLS` | 465 用 SSL（`SMTP_SSL=true`，`SMTP_TLS=false`） |
 | `CODE_TTL_SECONDS` | 验证码有效期，默认 600 |
 | `TOKEN_TTL_DAYS` | token 有效期，默认 30 |
