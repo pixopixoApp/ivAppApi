@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.36
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+pymysql>=1.1.1
+python-multipart>=0.0.20
+google-auth>=2.36.0
+requests>=2.32.0
+redis>=5.0.0
