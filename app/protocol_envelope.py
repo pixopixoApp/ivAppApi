@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.schemas import (
     AuthProtocolHeadIn,
-    EmptyBody,
     AvatarResponse,
     BirthdayBodyOut,
     BirthdayResponse,
     DeactivateBodyOut,
     DeactivateResponse,
+    DeactivateSendCodeResponse,
+    EmptyBody,
     FollowersBodyOut,
     FollowersResponse,
     FollowingBodyOut,
@@ -42,7 +43,7 @@ HeadIn = ProtocolHeadIn | AuthProtocolHeadIn
 
 
 def _now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def resolve_token(head: ProtocolHeadIn) -> str:
@@ -63,6 +64,9 @@ def make_head(
     status: int,
     ver: str,
     head_in: HeadIn | None = None,
+    error_code: str | None = None,
+    message: str | None = None,
+    retry_after_seconds: int | None = None,
 ) -> ProtocolHeadOut:
     out_ver = ver
     if head_in is not None and head_in.ver.strip():
@@ -73,6 +77,9 @@ def make_head(
         ver=out_ver,
         time=_now_str(),
         ssid=resolve_ssid(head_in),
+        error_code=error_code,
+        message=message,
+        retry_after_seconds=retry_after_seconds,
     )
 
 
@@ -174,9 +181,52 @@ def send_code_error(
     status: int = 100,
     ver: str,
     head_in: AuthProtocolHeadIn,
+    error_code: str | None = None,
+    message: str | None = None,
+    retry_after_seconds: int | None = None,
 ) -> SendCodeResponse:
     return SendCodeResponse(
-        head=make_head(act="send_code", status=status, ver=ver, head_in=head_in),
+        head=make_head(
+            act="send_code",
+            status=status,
+            ver=ver,
+            head_in=head_in,
+            error_code=error_code,
+            message=message,
+            retry_after_seconds=retry_after_seconds,
+        ),
+        body=EmptyBody(),
+    )
+
+
+def deactivate_send_code_ok(
+    *, ver: str, head_in: ProtocolHeadIn
+) -> DeactivateSendCodeResponse:
+    return DeactivateSendCodeResponse(
+        head=make_head(act="deactivate_send_code", status=0, ver=ver, head_in=head_in),
+        body=EmptyBody(),
+    )
+
+
+def deactivate_send_code_error(
+    *,
+    ver: str,
+    head_in: ProtocolHeadIn,
+    status: int = 100,
+    error_code: str | None = None,
+    message: str | None = None,
+    retry_after_seconds: int | None = None,
+) -> DeactivateSendCodeResponse:
+    return DeactivateSendCodeResponse(
+        head=make_head(
+            act="deactivate_send_code",
+            status=status,
+            ver=ver,
+            head_in=head_in,
+            error_code=error_code,
+            message=message,
+            retry_after_seconds=retry_after_seconds,
+        ),
         body=EmptyBody(),
     )
 
@@ -222,9 +272,18 @@ def google_login_error(
     status: int = 100,
     ver: str,
     head_in: AuthProtocolHeadIn,
+    error_code: str | None = None,
+    message: str | None = None,
 ) -> GoogleLoginResponse:
     return GoogleLoginResponse(
-        head=make_head(act="google_login", status=status, ver=ver, head_in=head_in),
+        head=make_head(
+            act="google_login",
+            status=status,
+            ver=ver,
+            head_in=head_in,
+            error_code=error_code,
+            message=message,
+        ),
         body=EmptyBody(),
     )
 

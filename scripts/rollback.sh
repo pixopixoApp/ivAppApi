@@ -7,12 +7,14 @@ if [[ -f "$ROOT_DIR/.deploy.env" ]]; then
   source "$ROOT_DIR/.deploy.env"
 fi
 
-DEPLOY_HOST="${DEPLOY_HOST:-182.92.102.61}"
+DEPLOY_HOST="${DEPLOY_HOST:-123.56.218.5}"
 DEPLOY_USER="${DEPLOY_USER:-root}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/play_video/ivapp}"
 DEPLOY_PROJECT="${DEPLOY_PROJECT:-ivapp}"
 DEPLOY_SERVICE="${DEPLOY_SERVICE:-api}"
+DEPLOY_WORKER_SERVICE="${DEPLOY_WORKER_SERVICE:-worker}"
+DEPLOY_CDN_WORKER_SERVICE="${DEPLOY_CDN_WORKER_SERVICE:-cdn-worker}"
 DEPLOY_BACKUP_ROOT="${DEPLOY_BACKUP_ROOT:-/opt/play_video/backups/ivapp}"
 DEPLOY_HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8100/health}"
 
@@ -53,13 +55,15 @@ fi
 BACKUP_PATH="$DEPLOY_BACKUP_ROOT/$BACKUP_ID"
 ssh -p "$DEPLOY_PORT" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- \
   "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" \
-  "$DEPLOY_HEALTH_URL" <<'REMOTE'
+  "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" "$DEPLOY_HEALTH_URL" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 backup_path="$2"
 project="$3"
 service="$4"
-health_url="$5"
+worker_service="$5"
+cdn_worker_service="$6"
+health_url="$7"
 
 case "$deploy_path" in
   /opt/*) ;;
@@ -68,6 +72,15 @@ esac
 test -d "$backup_path/source"
 test -f "$backup_path/source/docker-compose.yml"
 test -f "$deploy_path/.env"
+
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$worker_service"
+fi
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$cdn_worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$cdn_worker_service"
+fi
 
 rsync -a --delete \
   --exclude='.git/' \
@@ -86,6 +99,18 @@ docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d --no-dep
 
 for ((attempt = 1; attempt <= 20; attempt++)); do
   if curl -fsS --max-time 5 "$health_url" >/dev/null; then
+    if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+      | grep -qx "$worker_service"; then
+      docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" build "$worker_service"
+      docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+        --no-deps --force-recreate "$worker_service"
+    fi
+    if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+      | grep -qx "$cdn_worker_service"; then
+      docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" build "$cdn_worker_service"
+      docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+        --no-deps --force-recreate "$cdn_worker_service"
+    fi
     curl -fsS --max-time 5 "$health_url"
     echo
     echo "Rollback succeeded: $backup_path"

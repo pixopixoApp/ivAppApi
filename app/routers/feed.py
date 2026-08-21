@@ -2,27 +2,61 @@ from __future__ import annotations
 
 import re
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
+from sqlalchemy import and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.auth_user import load_app_user, require_app_user, resolve_current_user
+from app.auth_user import (
+    load_app_user,
+    require_app_user,
+    resolve_current_user,
+    resolve_request_token,
+)
 from app.config import Settings, get_settings
 from app.db import get_db
-from app.feed_rank import build_feed_sequence, page_circular, pin_tutorial
+from app.feed_rank import (
+    build_feed_sequence,
+    cursor_after_recent,
+    page_circular,
+    pin_tutorial,
+)
+from app.google_auth import GoogleAuthUnavailable, verify_google_id_token
+from app.html_content import (
+    CONTENT_TYPE_HTML,
+    CONTENT_TYPE_RUNTIME,
+    HTML_BRIDGE_VERSION,
+    HtmlContentError,
+    normalize_required_capabilities,
+)
 from app.impressions import ImpressionUnavailableError, get_impression_store
 from app.logging_config import get_logger
-from app.mail import send_verification_code
-from app.models import AnalyticsLog, EmailCode, PublishedVideo, RecommendCursor, User, UserToken
-from app.google_auth import verify_google_id_token
+from app.models import (
+    AnalyticsLog,
+    Follow,
+    PublishedVideo,
+    RecommendCursor,
+    User,
+    UserToken,
+    VideoView,
+)
+from app.pagination import (
+    CursorError,
+    datetime_from_cursor_value,
+    datetime_to_cursor_value,
+    decode_cursor,
+    encode_cursor,
+)
 from app.protocol_envelope import (
     google_login_error,
     google_login_ok,
     impression_error,
     impression_ok,
-    resolve_token,
+    resolve_ssid,
     send_code_error,
     send_code_ok,
     track_error,
@@ -34,9 +68,10 @@ from app.protocol_envelope import (
     video_error,
     video_ok,
 )
-from app.protocol_video import story_to_video, timeline_to_video
+from app.protocol_video import RUNTIME_SPEC_VERSION, RuntimeSpecError, read_runtime_spec
+from app.public_origin import canonicalize_public_payload, canonicalize_public_url
+from app.safety import blocked_peer_ids, users_blocked_between
 from app.schemas import (
-    ClipOut,
     FeedItemOut,
     GoogleLoginRequest,
     GoogleLoginResponse,
@@ -55,16 +90,14 @@ from app.schemas import (
     VideoRequest,
     VideoResponse,
 )
-from app.users import get_or_create_user, is_author_visible, needs_birthday
+from app.users import get_or_create_user, is_author_visible, is_under_13, needs_birthday
+from app.verification_codes import PURPOSE_LOGIN, find_valid_code, issue_email_code
 
 public_router = APIRouter(tags=["feed"])
 auth_router = APIRouter(tags=["feed"], dependencies=[Depends(require_app_user)])
 log = get_logger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_CONTENT_MODE_STORY = "story"
-
-
 def _normalize_email(raw: str) -> str:
     return raw.strip().lower()
 
@@ -73,83 +106,251 @@ def _valid_email(email: str) -> bool:
     return bool(email) and _EMAIL_RE.match(email) is not None
 
 
-def _story_clip_url(item_id: str, clip_id: str) -> str:
-    return f"/media/{item_id}/{clip_id}.mp4"
-
-
-def _item_from_published(db: Session, row: PublishedVideo) -> FeedItemOut | None:
+def _item_from_published(
+    db: Session,
+    row: PublishedVideo,
+    *,
+    settings: Settings,
+    viewer_user_id: str | None = None,
+    public_share_base_url: str = "",
+) -> FeedItemOut | None:
+    if row.deleted_at is not None:
+        return None
+    if not bool(getattr(row, "distribution_enabled", True)):
+        return None
     avatar_url = ""
     nickname = ""
     if row.user_id:
         author = db.get(User, row.user_id)
         if author is not None:
-            avatar_url = author.avatar_url or ""
+            avatar_url = canonicalize_public_url(settings, author.avatar_url) or ""
             nickname = author.nickname or ""
 
-    mode = (row.content_mode or "single").strip().lower()
-    clips_raw: list[dict] = []
-    if mode == _CONTENT_MODE_STORY:
-        story = row.timeline if isinstance(row.timeline, dict) else None
-        url_by_clip: dict[str, str] = {}
-        if isinstance(story, dict):
-            clips_in = story.get("clips")
-            if isinstance(clips_in, dict):
-                for cid in clips_in:
-                    url_by_clip[str(cid)] = _story_clip_url(row.id, str(cid))
-        clips_raw = story_to_video(story, url_by_clip)
+    content_type = row.content_type or CONTENT_TYPE_RUNTIME
+    clips = None
+    html_url = None
+    bridge_version = None
+    required_capabilities: list[str] = []
+    if content_type == CONTENT_TYPE_RUNTIME:
+        try:
+            clips = read_runtime_spec(
+                canonicalize_public_payload(settings, row.runtime_spec),
+                item_id=row.id,
+                version=row.runtime_spec_version,
+            )
+        except RuntimeSpecError as exc:
+            log.error(
+                "published item excluded: invalid runtime spec video_id=%s err=%s",
+                row.id,
+                exc,
+            )
+            return None
+    elif content_type == CONTENT_TYPE_HTML:
+        if not row.html_url or row.bridge_version != HTML_BRIDGE_VERSION:
+            log.error("published HTML item excluded: invalid payload item_id=%s", row.id)
+            return None
+        try:
+            required_capabilities = normalize_required_capabilities(
+                row.required_capabilities or []
+            )
+        except HtmlContentError as exc:
+            log.error(
+                "published HTML item excluded: invalid capabilities item_id=%s err=%s",
+                row.id,
+                exc,
+            )
+            return None
+        html_url = canonicalize_public_url(settings, row.html_url)
+        bridge_version = row.bridge_version
     else:
-        clip = timeline_to_video(row.timeline, row.video_url, clip_id=row.id)
-        clips_raw = [clip]
-
-    if not clips_raw:
+        log.error(
+            "published item excluded: unknown content_type item_id=%s content_type=%s",
+            row.id,
+            content_type,
+        )
         return None
 
-    clips = [ClipOut.model_validate(c) for c in clips_raw]
+    play_count = (
+        db.query(VideoView).filter(VideoView.video_id == row.id).count()
+    )
+    viewer_following_author = False
+    if viewer_user_id and row.user_id and viewer_user_id != row.user_id:
+        viewer_following_author = (
+            db.query(Follow)
+            .filter(
+                Follow.follower_user_id == viewer_user_id,
+                Follow.followee_user_id == row.user_id,
+            )
+            .first()
+            is not None
+        )
     return FeedItemOut(
         item_id=row.id,
+        content_type=content_type,
+        title=row.title or "",
+        description=row.description or "",
+        share_url=(
+            f"{public_share_base_url.rstrip('/')}/api/v1/share/{row.id}"
+            if public_share_base_url
+            else f"/api/v1/share/{row.id}"
+        ),
         user_id=row.user_id,
         nickname=nickname,
         avatar_url=avatar_url,
+        play_count=play_count,
+        is_following=viewer_following_author,
+        viewer_following_author=viewer_following_author,
+        following=viewer_following_author,
         video=clips,
+        html_url=html_url,
+        bridge_version=bridge_version,
+        required_capabilities=required_capabilities,
     )
+
+
+@dataclass(frozen=True)
+class PublishedItemsPage:
+    items: list[FeedItemOut]
+    next_cursor: str | None
+    has_more: bool
 
 
 def list_published_items(
     db: Session,
     *,
+    settings: Settings,
     author_user_ids: list[str] | None = None,
+    viewer_user_id: str | None = None,
     limit: int = 10,
-) -> list[FeedItemOut]:
-    """List published items by author ids (newest first), skipping invisible authors."""
-    q = db.query(PublishedVideo)
+    cursor: str | None = None,
+    cursor_kind: str = "published_items",
+    cursor_secret: str,
+    public_share_base_url: str = "",
+) -> PublishedItemsPage:
+    """Keyset-paginate persisted, visible Runtime and HTML items (newest first)."""
+    q = (
+        db.query(PublishedVideo)
+        .outerjoin(User, PublishedVideo.user_id == User.user_id)
+        .filter(
+            or_(
+                and_(
+                    PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+                    PublishedVideo.runtime_spec.is_not(None),
+                    PublishedVideo.runtime_spec_version == RUNTIME_SPEC_VERSION,
+                ),
+                and_(
+                    PublishedVideo.content_type == CONTENT_TYPE_HTML,
+                    PublishedVideo.html_url.is_not(None),
+                    PublishedVideo.bridge_version == HTML_BRIDGE_VERSION,
+                ),
+            ),
+            PublishedVideo.deleted_at.is_(None),
+            PublishedVideo.review_status == "approved",
+            PublishedVideo.distribution_enabled.is_(True),
+            or_(
+                PublishedVideo.user_id.is_(None),
+                PublishedVideo.user_id == "",
+                User.enabled.is_(True),
+            ),
+        )
+    )
     if author_user_ids is not None:
         if not author_user_ids:
-            return []
+            return PublishedItemsPage(items=[], next_cursor=None, has_more=False)
         q = q.filter(PublishedVideo.user_id.in_(author_user_ids))
-    rows = q.order_by(PublishedVideo.created_at.desc()).limit(max(limit * 3, limit)).all()
-    items: list[FeedItemOut] = []
+    hidden_authors = blocked_peer_ids(db, viewer_user_id)
+    if hidden_authors:
+        q = q.filter(
+            or_(
+                PublishedVideo.user_id.is_(None),
+                PublishedVideo.user_id == "",
+                PublishedVideo.user_id.notin_(hidden_authors),
+            )
+        )
+    if cursor:
+        values = decode_cursor(cursor=cursor, kind=cursor_kind, secret=cursor_secret)
+        created_at = datetime_from_cursor_value(values.get("created_at"))
+        row_id = values.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            raise CursorError("cursor item id missing")
+        q = q.filter(
+            or_(
+                PublishedVideo.created_at < created_at,
+                and_(
+                    PublishedVideo.created_at == created_at,
+                    PublishedVideo.id < row_id,
+                ),
+            )
+        )
+    rows = (
+        q.order_by(PublishedVideo.created_at.desc(), PublishedVideo.id.desc())
+        .limit(max((limit + 1) * 5, 50))
+        .all()
+    )
+    accepted: list[tuple[PublishedVideo, FeedItemOut]] = []
     for row in rows:
-        if not is_author_visible(db, row.user_id):
-            continue
-        item = _item_from_published(db, row)
+        item = _item_from_published(
+            db,
+            row,
+            settings=settings,
+            viewer_user_id=viewer_user_id,
+            public_share_base_url=public_share_base_url,
+        )
         if item is None:
             continue
-        items.append(item)
-        if len(items) >= limit:
+        accepted.append((row, item))
+        if len(accepted) >= limit + 1:
             break
-    return items
+    has_more = len(accepted) > limit
+    page = accepted[:limit]
+    next_cursor = None
+    if has_more and page:
+        last_row = page[-1][0]
+        next_cursor = encode_cursor(
+            kind=cursor_kind,
+            values={
+                "created_at": datetime_to_cursor_value(last_row.created_at),
+                "id": last_row.id,
+            },
+            secret=cursor_secret,
+        )
+    return PublishedItemsPage(
+        items=[item for _, item in page],
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
 
-def _ordered_pool(db: Session) -> tuple[list[str], str | None]:
+def _ordered_pool(db: Session, *, viewer_user_id: str | None = None) -> tuple[list[str], str | None]:
     """Return (weight-ordered visible ids, tutorial_id or None)."""
     rows = (
         db.query(PublishedVideo)
-        .order_by(PublishedVideo.feed_weight.desc(), PublishedVideo.id.asc())
+        .filter(
+            or_(
+                and_(
+                    PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+                    PublishedVideo.runtime_spec.is_not(None),
+                    PublishedVideo.runtime_spec_version == RUNTIME_SPEC_VERSION,
+                ),
+                and_(
+                    PublishedVideo.content_type == CONTENT_TYPE_HTML,
+                    PublishedVideo.html_url.is_not(None),
+                    PublishedVideo.bridge_version == HTML_BRIDGE_VERSION,
+                ),
+            ),
+            PublishedVideo.deleted_at.is_(None),
+            PublishedVideo.review_status == "approved",
+            PublishedVideo.distribution_enabled.is_(True),
+        )
+        .order_by(PublishedVideo.feed_weight.desc(), PublishedVideo.created_at.desc(), PublishedVideo.id.asc())
         .all()
     )
     ordered: list[str] = []
     tutorial_id: str | None = None
+    hidden_authors = blocked_peer_ids(db, viewer_user_id)
     for row in rows:
         if not is_author_visible(db, row.user_id):
+            continue
+        if row.user_id and row.user_id in hidden_authors:
             continue
         ordered.append(row.id)
         if bool(getattr(row, "is_tutorial", False)) and tutorial_id is None:
@@ -160,16 +361,45 @@ def _ordered_pool(db: Session) -> tuple[list[str], str | None]:
 def _next_video_ids(
     db: Session,
     *,
-    token: str,
+    state_key: str,
     limit: int,
     user_id: str | None,
-) -> list[str]:
-    weight_ordered, tutorial_id = _ordered_pool(db)
-    ordered = pin_tutorial(weight_ordered, tutorial_id=tutorial_id)
+    cursor_token: str | None,
+    cursor_secret: str,
+) -> tuple[list[str], str | None]:
+    weight_ordered, tutorial_id = _ordered_pool(db, viewer_user_id=user_id)
+    cycle_ordered = pin_tutorial(weight_ordered, tutorial_id=tutorial_id)
     seen_ids: set[str] | None = None
+    cycle_resume_cursor: int | None = None
+    cycle_resume_anchor: str | None = None
     if user_id:
         try:
-            seen_ids = get_impression_store().list_seen_ids(user_id=user_id)
+            impression_store = get_impression_store()
+            seen_ids = impression_store.list_seen_ids(user_id=user_id)
+            # A cycle is complete only when every currently eligible item was
+            # actually played. Cursor-based prefetch must never reset a cycle
+            # behind the active client; the explicit first-page/boundary request
+            # owns the transition.
+            if (
+                cursor_token is None
+                and cycle_ordered
+                and set(cycle_ordered).issubset(seen_ids)
+            ):
+                recent_ids = impression_store.list_recent_ids(user_id=user_id)
+                cycle_resume_cursor, cycle_resume_anchor = cursor_after_recent(
+                    cycle_ordered,
+                    recent_ids=recent_ids,
+                )
+                impression_store.clear_cycle(user_id=user_id)
+                seen_ids = set()
+                log.info(
+                    "video feed cycle reset user_id=%s pool=%d recent=%s anchor=%s resume=%d",
+                    user_id,
+                    len(cycle_ordered),
+                    recent_ids,
+                    cycle_resume_anchor or "-",
+                    cycle_resume_cursor,
+                )
         except ImpressionUnavailableError:
             log.warning(
                 "video feed redis unavailable; weight-only no sink user_id=%s",
@@ -177,22 +407,58 @@ def _next_video_ids(
             )
             seen_ids = None
 
-    sequence = build_feed_sequence(ordered, seen_ids=seen_ids)
+    sequence = build_feed_sequence(cycle_ordered, seen_ids=seen_ids)
     n = len(sequence)
 
-    state = db.get(RecommendCursor, token)
-    cursor = state.cursor if state is not None else 0
+    state = None
+    if cursor_token:
+        values = decode_cursor(
+            cursor=cursor_token,
+            kind="recommendations",
+            secret=cursor_secret,
+        )
+        cursor = values.get("index")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise CursorError("invalid recommendation cursor position")
+    else:
+        state = (
+            db.query(RecommendCursor)
+            .filter(RecommendCursor.token == state_key)
+            .with_for_update()
+            .one_or_none()
+        )
+        if cycle_resume_cursor is not None:
+            cursor = cycle_resume_cursor
+        else:
+            cursor = state.cursor if state is not None else 0
     out, new_cursor = page_circular(sequence, cursor=cursor, limit=limit)
 
-    if state is None:
-        db.add(RecommendCursor(token=token, cursor=new_cursor))
-    else:
-        state.cursor = new_cursor
-    db.commit()
+    if not cursor_token:
+        if state is None:
+            db.add(RecommendCursor(token=state_key, cursor=new_cursor))
+        else:
+            state.cursor = new_cursor
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raced = db.get(RecommendCursor, state_key)
+            if raced is None:
+                raise
+            raced.cursor = new_cursor
+            db.commit()
+
+    next_cursor = None
+    if sequence:
+        next_cursor = encode_cursor(
+            kind="recommendations",
+            values={"index": new_cursor},
+            secret=cursor_secret,
+        )
 
     log.info(
         "video feed token=%s user_id=%s pool=%d tutorial=%s seen=%s cursor=%d->%d limit=%d returned=%d",
-        token,
+        state_key,
         user_id or "-",
         n,
         tutorial_id or "-",
@@ -202,7 +468,7 @@ def _next_video_ids(
         limit,
         len(out),
     )
-    return out
+    return out, next_cursor
 
 
 @public_router.post(
@@ -220,46 +486,35 @@ def post_send_code(
     email = _normalize_email(payload.body.email)
     if not _valid_email(email):
         log.warning("send_code invalid email")
-        return send_code_error(ver=settings.server_ver, head_in=payload.head)
-
-    now = datetime.now(timezone.utc)
-    latest = (
-        db.query(EmailCode)
-        .filter(EmailCode.email == email)
-        .order_by(EmailCode.created_at.desc())
-        .first()
-    )
-    if latest is not None:
-        created = latest.created_at
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        if (now - created).total_seconds() < settings.send_code_interval_seconds:
-            log.warning("send_code rate limited email=%s", email)
-            return send_code_error(ver=settings.server_ver, head_in=payload.head)
-
-    for row in (
-        db.query(EmailCode)
-        .filter(EmailCode.email == email, EmailCode.used_at.is_(None))
-        .all()
-    ):
-        row.used_at = now
-
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    db.add(
-        EmailCode(
-            email=email,
-            code=code,
-            expires_at=now + timedelta(seconds=settings.code_ttl_seconds),
-            created_at=now,
+        return send_code_error(
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code="INVALID_EMAIL",
+            message="Please enter a valid email address.",
         )
-    )
-    db.commit()
 
-    try:
-        send_verification_code(settings, email=email, code=code)
-    except Exception:  # noqa: BLE001
-        log.exception("send_code mail failed email=%s", email)
-        return send_code_error(ver=settings.server_ver, head_in=payload.head)
+    result = issue_email_code(
+        db,
+        settings,
+        email=email,
+        purpose=PURPOSE_LOGIN,
+    )
+    if not result.ok:
+        if result.error_code == "CODE_RATE_LIMITED":
+            log.warning("send_code rate limited email=%s", email)
+            return send_code_error(
+                ver=settings.server_ver,
+                head_in=payload.head,
+                error_code=result.error_code,
+                message="A code was just sent. Please wait a moment and try again.",
+                retry_after_seconds=result.retry_after_seconds,
+            )
+        return send_code_error(
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code=result.error_code,
+            message="We couldn’t send the email. Please try again shortly.",
+        )
 
     log.info("send_code ok email=%s", email)
     return send_code_ok(ver=settings.server_ver, head_in=payload.head)
@@ -283,25 +538,15 @@ def post_verify(
         return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
     now = datetime.now(timezone.utc)
-    row = (
-        db.query(EmailCode)
-        .filter(
-            EmailCode.email == email,
-            EmailCode.code == code,
-            EmailCode.used_at.is_(None),
-        )
-        .order_by(EmailCode.created_at.desc())
-        .first()
+    row = find_valid_code(
+        db,
+        email=email,
+        code=code,
+        purpose=PURPOSE_LOGIN,
+        now=now,
     )
     if row is None:
         log.warning("verify bad code email=%s", email)
-        return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
-
-    expires = row.expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires <= now:
-        log.warning("verify expired code email=%s", email)
         return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
     row.used_at = now
@@ -329,6 +574,8 @@ def post_verify(
         email=email,
         expires_at=token_expires.isoformat(),
         needs_birthday=needs_birthday(user),
+        birthday=user.birthday or "",
+        is_under_13=is_under_13(user),
     )
     log.info("verify ok email=%s user_id=%s", email, user.user_id)
     return verify_ok(body=body, ver=settings.server_ver, head_in=payload.head)
@@ -348,18 +595,37 @@ def post_google_login(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> GoogleLoginResponse:
-    client_id = (settings.google_client_id or "").strip()
-    if not client_id:
-        log.warning("google_login client id not configured")
+    client_ids = tuple(dict.fromkeys(
+        value.strip()
+        for value in (settings.google_client_ids or "").split(",")
+        if value.strip()
+    )) or ((settings.google_client_id or "").strip(),)
+    client_ids = tuple(value for value in client_ids if value)
+    if not client_ids:
+        log.warning("google_login client ids not configured")
         return google_login_error(ver=settings.server_ver, head_in=payload.head)
 
     try:
         identity = verify_google_id_token(
             token=payload.body.id_token,
-            client_id=client_id,
+            client_ids=client_ids,
+            timeout_seconds=settings.google_timeout_seconds,
+        )
+    except GoogleAuthUnavailable:
+        return google_login_error(
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code="GOOGLE_UNAVAILABLE",
+            message="Google sign-in is temporarily unavailable. Please try again shortly.",
         )
     except ValueError:
-        return google_login_error(status=101, ver=settings.server_ver, head_in=payload.head)
+        return google_login_error(
+            status=101,
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code="GOOGLE_TOKEN_INVALID",
+            message="Google sign-in couldn’t be verified. Please try again.",
+        )
 
     now = datetime.now(timezone.utc)
     user = get_or_create_user(db, provider="google", subject=identity.subject)
@@ -391,6 +657,8 @@ def post_google_login(
         email=identity.email,
         expires_at=token_expires.isoformat(),
         needs_birthday=needs_birthday(user),
+        birthday=user.birthday or "",
+        is_under_13=is_under_13(user),
     )
     log.info(
         "google_login ok user_id=%s sub=%s needs_birthday=%s",
@@ -406,8 +674,8 @@ def post_google_login(
     response_model=VideoResponse,
     response_model_exclude_none=True,
     summary="拉取推荐视频列表",
-    description="游客可访问（可不带 token）。教学片未看时置顶；否则 feed_weight 降序 + id 升序；"
-    "登录用户已看沉底并可循环。"
+    description="游客可访问（可不带 token）。教学片未看时置顶；否则 feed_weight 降序；"
+    "登录用户在一个播放周期内只收到未看内容，整池播放完成后重置。"
     "成功 body.items[]（App v1.0：每 clip 的 interactions 带 on_success/on_miss；Story 可选 clip.on_end；无 transition）。"
     "单视频 video.length=1；Story 多段且入口 clip 在首位。池为空 status=100。",
 )
@@ -417,15 +685,24 @@ def post_video(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VideoResponse:
-    token = resolve_token(payload.head)
+    token = resolve_request_token(request, payload.head, act="video")
     user = resolve_current_user(request, db, token)
     limit = payload.body.limit
-    video_ids = _next_video_ids(
-        db,
-        token=token,
-        limit=limit,
-        user_id=user.user_id if user else None,
-    )
+    ssid = resolve_ssid(payload.head)
+    payload.head.ssid = ssid
+    state_key = f"feed:user:{user.user_id}" if user else f"feed:ssid:{ssid}"
+    try:
+        video_ids, next_cursor = _next_video_ids(
+            db,
+            state_key=state_key,
+            limit=limit,
+            user_id=user.user_id if user else None,
+            cursor_token=payload.body.cursor,
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+        )
+    except CursorError as exc:
+        log.warning("video invalid cursor err=%s", exc)
+        return video_error(ver=settings.server_ver, head_in=payload.head)
     if not video_ids:
         log.warning("video feed empty pool token=%s", token)
         return video_error(ver=settings.server_ver, head_in=payload.head)
@@ -436,14 +713,25 @@ def post_video(
         if row is None:
             log.warning("video feed skip missing id=%s", vid)
             continue
-        item = _item_from_published(db, row)
+        item = _item_from_published(
+            db,
+            row,
+            settings=settings,
+            viewer_user_id=user.user_id if user else None,
+            public_share_base_url=settings.public_share_base_url,
+        )
         if item is not None:
             items.append(item)
 
     if not items:
         return video_error(ver=settings.server_ver, head_in=payload.head)
 
-    body = VideoBodyOut(items=items)
+    body = VideoBodyOut(
+        items=items,
+        next_cursor=next_cursor,
+        has_more=True,
+        is_circular=True,
+    )
     log.info("video feed ok token=%s items=%d", token, len(items))
     return video_ok(body=body, ver=settings.server_ver, head_in=payload.head)
 
@@ -459,6 +747,7 @@ def post_video(
 )
 def post_video_detail(
     payload: VideoDetailRequest,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VideoDetailResponse:
@@ -467,7 +756,12 @@ def post_video_detail(
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
     row = db.get(PublishedVideo, video_id)
-    if row is None:
+    if (
+        row is None
+        or row.deleted_at is not None
+        or row.review_status != "approved"
+        or not row.distribution_enabled
+    ):
         log.warning("video_detail missing video_id=%s", video_id)
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
@@ -479,7 +773,21 @@ def post_video_detail(
         )
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
-    item = _item_from_published(db, row)
+    token = resolve_request_token(request, payload.head, act="video_detail")
+    viewer = resolve_current_user(request, db, token)
+    if (
+        viewer is not None
+        and row.user_id
+        and users_blocked_between(db, viewer.user_id, row.user_id)
+    ):
+        return video_detail_error(ver=settings.server_ver, head_in=payload.head)
+    item = _item_from_published(
+        db,
+        row,
+        settings=settings,
+        viewer_user_id=viewer.user_id if viewer else None,
+        public_share_base_url=settings.public_share_base_url,
+    )
     if item is None:
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
@@ -500,17 +808,24 @@ def post_video_detail(
 )
 def post_track(
     payload: TrackRequest,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TrackResponse:
-    token = resolve_token(payload.head)
+    token = resolve_request_token(request, payload.head, act="track")
     video_id = payload.body.video_id.strip()
     data = payload.body.data.strip() if isinstance(payload.body.data, str) else ""
     if not video_id or not data:
         log.warning("track invalid body token=%s video_id=%s", token, video_id)
         return track_error(ver=settings.server_ver, head_in=payload.head)
 
-    if db.get(PublishedVideo, video_id) is None:
+    tracked = db.get(PublishedVideo, video_id)
+    if (
+        tracked is None
+        or tracked.deleted_at is not None
+        or tracked.review_status != "approved"
+        or not tracked.distribution_enabled
+    ):
         log.warning("track unknown video_id=%s token=%s", video_id, token)
         return track_error(ver=settings.server_ver, head_in=payload.head)
 
@@ -523,8 +838,8 @@ def post_track(
 @auth_router.post(
     "/impression",
     response_model=ImpressionResponse,
-    summary="上报曝光（沉底去重）",
-    description="需登录。body.video_id 写入 Redis 去重池；Feed 将该片沉底但仍可循环。"
+    summary="上报曝光（播放周期去重）",
+    description="需登录。body.video_id 写入 Redis 播放周期；本轮不再重复下发，整池完成后自动重置。"
     "成功 status=0；视频不存在或 Redis 不可用 status=100；无效 token status=101。",
 )
 def post_impression(
@@ -533,7 +848,7 @@ def post_impression(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ImpressionResponse:
-    token = resolve_token(payload.head)
+    token = resolve_request_token(request, payload.head, act="impression")
     user = resolve_current_user(request, db, token)
     if user is None:
         # auth_router already requires login; defensive
@@ -544,7 +859,10 @@ def post_impression(
         )
 
     video_id = payload.body.video_id.strip()
-    if not video_id or db.get(PublishedVideo, video_id) is None:
+    impression_video = db.get(PublishedVideo, video_id) if video_id else None
+    if (not video_id or impression_video is None or impression_video.deleted_at is not None
+            or impression_video.review_status != "approved"
+            or not impression_video.distribution_enabled):
         log.warning(
             "impression invalid video_id=%s user_id=%s",
             video_id,
@@ -557,6 +875,19 @@ def post_impression(
     except ImpressionUnavailableError:
         log.warning("impression redis unavailable user_id=%s", user.user_id)
         return impression_error(ver=settings.server_ver, head_in=payload.head)
+
+    exists = (
+        db.query(VideoView)
+        .filter(VideoView.video_id == video_id, VideoView.user_id == user.user_id)
+        .first()
+    )
+    if exists is None:
+        db.add(VideoView(video_id=video_id, user_id=user.user_id))
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent impression may win the unique(video_id,user_id) insert.
+            db.rollback()
 
     log.info("impression ok user_id=%s video_id=%s", user.user_id, video_id)
     return impression_ok(ver=settings.server_ver, head_in=payload.head)

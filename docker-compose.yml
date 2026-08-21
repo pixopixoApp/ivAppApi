@@ -16,7 +16,7 @@ services:
       start_period: 20s
 
   redis:
-    image: redis:latest
+    image: redis:7.4-alpine
     restart: unless-stopped
     volumes:
       - ./volumes/redis:/data
@@ -39,7 +39,7 @@ services:
       PMA_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       UPLOAD_LIMIT: 256M
     ports:
-      - "${PHPMYADMIN_PORT:-8101}:80"
+      - "127.0.0.1:${PHPMYADMIN_PORT:-8101}:80"
 
   api:
     build:
@@ -61,5 +61,73 @@ services:
     volumes:
       # Code (read-only)
       - ./app:/app/app:ro
-      # Data (media etc. under ./volumes/)
-      - ./volumes:/volumes
+      - ./scripts:/app/scripts:ro
+      - ${HTML_IMPORT_SPOOL_HOST_PATH:-./volumes/html-imports}:/data/html-imports
+    networks:
+      default:
+      pixo-backend:
+        aliases:
+          - ivapp-api
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    volumes:
+      - ./app:/app/app:ro
+    networks:
+      default:
+      pixo-backend:
+
+  cdn-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.cdn_worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
+      # Settings requires this field, but the CDN worker never authenticates
+      # publish requests. Keep the real publish secret out of this container.
+      PUBLISH_KEY: cdn-worker-unused
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALIYUN_OSS_PUBLIC_BASE_URL: ${ALIYUN_OSS_PUBLIC_BASE_URL:-}
+      PUBLIC_MEDIA_LEGACY_ORIGINS: ${PUBLIC_MEDIA_LEGACY_ORIGINS:-}
+      OSS_ROOT_PREFIX: ${OSS_ROOT_PREFIX:-ivapp-media/v1}
+      CDN_CACHE_ENABLED: ${CDN_CACHE_ENABLED:-false}
+      CDN_PREFETCH_ON_PUBLISH: ${CDN_PREFETCH_ON_PUBLISH:-true}
+      CDN_DOMAIN: ${CDN_DOMAIN:-}
+      CDN_API_REGION: ${CDN_API_REGION:-cn-hangzhou}
+      CDN_WORKER_POLL_SECONDS: ${CDN_WORKER_POLL_SECONDS:-2}
+      CDN_WORKER_BATCH_SIZE: ${CDN_WORKER_BATCH_SIZE:-50}
+      CDN_WORKER_MAX_ATTEMPTS: ${CDN_WORKER_MAX_ATTEMPTS:-6}
+      CDN_WORKER_LEASE_SECONDS: ${CDN_WORKER_LEASE_SECONDS:-300}
+      ALIBABA_CLOUD_ECS_METADATA: ${ALIBABA_CLOUD_ECS_METADATA:-}
+    volumes:
+      - ./app:/app/app:ro
+    networks:
+      default:
+      pixo-backend:
+
+networks:
+  pixo-backend:
+    external: true

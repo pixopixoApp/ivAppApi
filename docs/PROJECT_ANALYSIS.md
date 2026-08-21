@@ -1,8 +1,10 @@
 # ivapp 后端全盘分析
 
+> 本文记录 2026-08-08 改造前基线。已实施的修复与当前行为以仓库根目录 [README.md](../README.md) 为准；本文中的“当前缺口”不代表改造后仍存在。
+
 审计时间：2026-08-08（Asia/Shanghai）
 
-线上来源：`root@182.92.102.61:/opt/play_video/ivapp`
+当前部署：`root@123.56.218.5:/opt/play_video/ivapp`
 
 线上源提交：`f0d4882d166589875d42af76bfb83fe9d6917fde`
 

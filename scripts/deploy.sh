@@ -7,12 +7,14 @@ if [[ -f "$ROOT_DIR/.deploy.env" ]]; then
   source "$ROOT_DIR/.deploy.env"
 fi
 
-DEPLOY_HOST="${DEPLOY_HOST:-182.92.102.61}"
+DEPLOY_HOST="${DEPLOY_HOST:-123.56.218.5}"
 DEPLOY_USER="${DEPLOY_USER:-root}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/play_video/ivapp}"
 DEPLOY_PROJECT="${DEPLOY_PROJECT:-ivapp}"
 DEPLOY_SERVICE="${DEPLOY_SERVICE:-api}"
+DEPLOY_WORKER_SERVICE="${DEPLOY_WORKER_SERVICE:-worker}"
+DEPLOY_CDN_WORKER_SERVICE="${DEPLOY_CDN_WORKER_SERVICE:-cdn-worker}"
 DEPLOY_DATABASE_SERVICE="${DEPLOY_DATABASE_SERVICE:-mysql}"
 DEPLOY_RELEASE_ROOT="${DEPLOY_RELEASE_ROOT:-/opt/play_video/releases/ivapp}"
 DEPLOY_BACKUP_ROOT="${DEPLOY_BACKUP_ROOT:-/opt/play_video/backups/ivapp}"
@@ -24,6 +26,7 @@ DRY_RUN=0
 ALLOW_DIRTY=0
 SKIP_CHECKS=0
 BUILD_IMAGE=1
+BACKFILL_RUNTIME_SPECS=0
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +37,8 @@ Options:
   --allow-dirty   Allow deployment from a dirty local Git worktree.
   --skip-checks   Skip scripts/check.sh.
   --no-build      Reuse the current API image; only replace source and recreate API.
+  --backfill-runtime-specs
+                   Explicitly compile and persist all historic playback specs.
   -h, --help      Show this help.
 
 Configuration is loaded from .deploy.env when present. Production .env is never
@@ -47,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --skip-checks) SKIP_CHECKS=1 ;;
     --no-build) BUILD_IMAGE=0 ;;
+    --backfill-runtime-specs) BACKFILL_RUNTIME_SPECS=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -77,9 +83,12 @@ SSH=(ssh -p "$DEPLOY_PORT" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST")
 RSYNC_SSH="ssh -p $DEPLOY_PORT -o BatchMode=yes"
 RSYNC_FILTERS=(
   --exclude='.git/'
+  --exclude='.venv/'
+  --exclude='node_modules/'
   --exclude='.env'
   --exclude='.deploy.env'
   --exclude='volumes/'
+  --exclude='data/'
   --exclude='__pycache__/'
   --exclude='*.pyc'
   --exclude='.pytest_cache/'
@@ -150,18 +159,21 @@ rsync -az --no-owner --no-group --delete-delay \
 
 echo "[deploy] validating release configuration"
 if ! "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$BUILD_IMAGE" <<'REMOTE'
+  "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" "$BUILD_IMAGE" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 release_path="$2"
 project="$3"
 service="$4"
-build_image="$5"
+worker_service="$5"
+cdn_worker_service="$6"
+build_image="$7"
 chmod 700 "$release_path"
 ln -sfn "$deploy_path/.env" "$release_path/.env"
 docker-compose -p "$project" -f "$release_path/docker-compose.yml" config --quiet
 if [[ "$build_image" -eq 1 ]]; then
-  docker-compose -p "$project" -f "$release_path/docker-compose.yml" build "$service"
+  docker-compose -p "$project" -f "$release_path/docker-compose.yml" build \
+    "$service" "$worker_service" "$cdn_worker_service"
 fi
 REMOTE
 then
@@ -200,12 +212,14 @@ REMOTE
 rollback() {
   echo "[deploy] rolling back to $BACKUP_PATH" >&2
   "${SSH[@]}" bash -s -- \
-    "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" <<'REMOTE'
+    "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 backup_path="$2"
 project="$3"
 service="$4"
+worker_service="$5"
+cdn_worker_service="$6"
 test -d "$backup_path/source"
 rsync -a --delete \
   --exclude='.git/' \
@@ -220,14 +234,65 @@ chmod 600 "$deploy_path/.env"
 docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --quiet
 docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" build "$service"
 docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d --no-deps --force-recreate "$service"
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+    --no-deps --force-recreate "$worker_service"
+fi
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$cdn_worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+    --no-deps --force-recreate "$cdn_worker_service"
+fi
 REMOTE
 }
+
+echo "[deploy] stopping background workers before source switch"
+"${SSH[@]}" bash -s -- \
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+set -Eeuo pipefail
+deploy_path="$1"
+project="$2"
+worker_service="$3"
+cdn_worker_service="$4"
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$worker_service"
+fi
+if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+  | grep -qx "$cdn_worker_service"; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$cdn_worker_service"
+fi
+REMOTE
 
 echo "[deploy] syncing release into the live source tree"
 if ! rsync -az --no-owner --no-group --delete-delay \
   "${RSYNC_FILTERS[@]}" \
   -e "$RSYNC_SSH" \
   "$ROOT_DIR/" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"; then
+  rollback
+  exit 1
+fi
+
+echo "[deploy] applying forward database migrations"
+if ! "${SSH[@]}" bash -s -- \
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$BACKFILL_RUNTIME_SPECS" <<'REMOTE'
+set -Eeuo pipefail
+deploy_path="$1"
+project="$2"
+service="$3"
+backfill="$4"
+docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+  "$service" alembic upgrade head
+if [[ "$backfill" -eq 1 ]]; then
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+    "$service" python -m app.runtime_backfill
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+    "$service" python -m app.runtime_backfill --apply
+fi
+REMOTE
+then
+  echo "[deploy] migration/backfill failed; API was not switched" >&2
   rollback
   exit 1
 fi
@@ -276,6 +341,24 @@ if ! health_check; then
   else
     echo "[deploy] rollback completed but health check still fails; manual intervention required" >&2
   fi
+  exit 1
+fi
+
+echo "[deploy] recreating background workers"
+if ! "${SSH[@]}" bash -s -- \
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+set -Eeuo pipefail
+deploy_path="$1"
+project="$2"
+worker_service="$3"
+cdn_worker_service="$4"
+docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+  --no-deps --force-recreate "$worker_service"
+docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+  --no-deps --force-recreate "$cdn_worker_service"
+REMOTE
+then
+  echo "[deploy] API is healthy but a background worker failed to start" >&2
   exit 1
 fi
 

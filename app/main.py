@@ -7,11 +7,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.auth_user import AppAuthError
+from app.cdn_cache import validate_cdn_config
 from app.config import get_settings
-from app.db import init_db
 from app.logging_config import get_logger, setup_logging
+from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
-from app.routers import admin, feed, user
+from app.routers import admin, feed, media_storage, platform, safety, user
 
 log = get_logger(__name__)
 
@@ -21,9 +22,19 @@ async def lifespan(_app: FastAPI):
     settings = get_settings()
     setup_logging(level=settings.log_level)
     log.info("starting ivapp log_level=%s", settings.log_level)
-    Path(settings.media_root).mkdir(parents=True, exist_ok=True)
-    init_db()
-    log.info("database ready media_root=%s", settings.media_root)
+    media_mode = settings.media_storage_mode.strip().lower()
+    if media_mode not in {"local", "oss"}:
+        raise RuntimeError("MEDIA_STORAGE_MODE must be local or oss")
+    if media_mode == "local":
+        Path(settings.media_root).mkdir(parents=True, exist_ok=True)
+    else:
+        validate_oss_config(settings)
+    validate_cdn_config(settings)
+    log.info(
+        "database migrations are managed by Alembic media_storage_mode=%s media_root=%s",
+        settings.media_storage_mode,
+        settings.media_root,
+    )
     yield
     log.info("shutting down ivapp")
 
@@ -42,10 +53,16 @@ app = FastAPI(
 )
 app.include_router(admin.router)
 app.include_router(admin.media_router)
+app.include_router(media_storage.router)
 app.include_router(feed.public_router)
 app.include_router(feed.auth_router)
 app.include_router(user.upload_router)
 app.include_router(user.auth_router)
+app.include_router(platform.public_router)
+app.include_router(platform.creator_router)
+app.include_router(platform.operations_router)
+app.include_router(safety.client_router)
+app.include_router(safety.operations_router)
 
 
 @app.exception_handler(AppAuthError)

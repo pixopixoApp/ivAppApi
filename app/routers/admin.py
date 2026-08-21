@@ -7,21 +7,56 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.avatar_storage import (
     AvatarStorageError,
     avatar_media_type,
     resolve_avatar_path,
-    save_user_avatar,
+    store_user_avatar,
 )
+from app.cdn_cache import enqueue_prefetch, html_package_public_urls
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
+from app.html_content import (
+    CONTENT_TYPE_HTML,
+    CONTENT_TYPE_RUNTIME,
+    HTML_BRIDGE_VERSION,
+    HtmlContentError,
+    normalize_required_capabilities,
+    probe_html_entry,
+    validate_html_package_url,
+)
 from app.impressions import ImpressionUnavailableError, get_impression_store
 from app.logging_config import get_logger
-from app.models import AnalyticsLog, PublishedVideo, User
+from app.media_api import RuntimeObjectPublishRequest, RuntimePreviewRequest
+from app.media_service import MediaServiceError, media_mode_is_oss
+from app.models import (
+    AnalyticsLog,
+    CreatorCreation,
+    HtmlPackage,
+    MediaObject,
+    PublishedMediaAsset,
+    PublishedVideo,
+    User,
+    VideoView,
+)
+from app.oss_storage import OssStorageError, public_url, sign_get_url
+from app.protocol_video import (
+    RUNTIME_SPEC_VERSION,
+    RuntimeSpecError,
+    compile_runtime_spec,
+    read_runtime_spec,
+)
+from app.public_origin import canonicalize_public_payload, canonicalize_public_url
+from app.publication_service import (
+    RuntimeSourceAsset,
+    load_published_runtime_urls,
+    publish_runtime_assets,
+)
 from app.schemas import (
     AdminUserDeactivateResponse,
     AdminUserListResponse,
@@ -33,9 +68,13 @@ from app.schemas import (
     BatchUsersResponse,
     BatchVideosRequest,
     BatchVideosResponse,
+    ContentManagementUpdateRequest,
     FeedWeightUpdateRequest,
     PublishedVideoInfo,
+    PublishHtmlRequest,
+    PublishHtmlResponse,
     PublishResponse,
+    RuntimeSpecAuditOut,
     Timeline,
     UnpublishResponse,
     UserImpressionsOut,
@@ -56,14 +95,16 @@ _CONTENT_MODE_SINGLE = "single"
 _CONTENT_MODE_STORY = "story"
 
 
-def _admin_user_out(row: User) -> AdminUserOut:
+def _admin_user_out(row: User, settings: Settings | None = None) -> AdminUserOut:
+    active_settings = settings or get_settings()
     return AdminUserOut(
         user_id=row.user_id,
         provider=row.provider,
         subject=row.subject,
         enabled=bool(row.enabled),
         nickname=row.nickname or "",
-        avatar_url=row.avatar_url or "",
+        avatar_url=canonicalize_public_url(active_settings, row.avatar_url) or "",
+        bio=row.bio or "",
         source=row.source or "app",
         created_at=row.created_at.isoformat() if row.created_at else "",
     )
@@ -139,6 +180,10 @@ def _story_clip_url(item_id: str, clip_id: str) -> str:
 
 def _remove_published_media(settings: Settings, item_id: str) -> None:
     """Remove single file and/or story directory for an item_id."""
+    if media_mode_is_oss(settings):
+        # OSS objects are immutable and retained permanently. Unpublish/update
+        # only changes database bindings.
+        return
     if not _is_valid_id(item_id):
         return
     single = _media_root(settings) / f"{item_id}.mp4"
@@ -158,7 +203,7 @@ def _parse_timeline(raw: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"timeline must be JSON: {exc}") from exc
     try:
         return Timeline.model_validate(data).model_dump(mode="python")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
 
 
@@ -190,11 +235,19 @@ def _parse_story(raw: str) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail=f"story.clips[{cid}].timeline required")
         try:
             tl = Timeline.model_validate(timeline).model_dump(mode="python")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"invalid timeline for clip {cid}: {exc}"
             ) from exc
-        normalized_clips[cid] = {"timeline": tl}
+        normalized_body: dict[str, Any] = {"timeline": tl}
+        if "on_end" in body:
+            if not isinstance(body["on_end"], dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"story.clips[{cid}].on_end must be object",
+                )
+            normalized_body["on_end"] = body["on_end"]
+        normalized_clips[cid] = normalized_body
     if entry not in normalized_clips:
         raise HTTPException(status_code=400, detail="entry_clip_id must be a key in clips")
     return {"entry_clip_id": entry, "clips": normalized_clips}
@@ -243,6 +296,7 @@ def upsert_user(
             enabled=payload.enabled,
             nickname=payload.nickname,
             avatar_url=payload.avatar_url,
+            bio=payload.bio,
             create_if_missing=True,
         )
         db.commit()
@@ -412,7 +466,7 @@ async def upload_user_avatar(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     _: Annotated[None, Depends(require_publish_key)],
-    file: UploadFile = File(..., description="头像图片文件"),
+    file: Annotated[UploadFile, File(description="头像图片文件")],
 ) -> AdminUserOut:
     uid = user_id.strip()
     if db.get(User, uid) is None:
@@ -420,19 +474,21 @@ async def upload_user_avatar(
 
     raw = await file.read()
     try:
-        avatar_url = save_user_avatar(
+        avatar_url, media_object_id = store_user_avatar(
+            db,
             settings,
             user_id=uid,
             raw=raw,
             filename=file.filename,
             content_type=file.content_type,
         )
-        row = apply_user_update(
-            db,
-            user_id=uid,
-            avatar_url=avatar_url,
-            create_if_missing=False,
-        )
+        row = db.get(User, uid)
+        if row is None:
+            raise LookupError(uid)
+        row.avatar_url = avatar_url
+        row.avatar_media_object_id = media_object_id
+        db.add(row)
+        enqueue_prefetch(db, settings, [avatar_url])
         db.commit()
         db.refresh(row)
     except AvatarStorageError as exc:
@@ -493,6 +549,11 @@ async def publish(
         File(description="story 模式：多个 mp4，文件名为 {clip_id}.mp4"),
     ] = None,
 ) -> PublishResponse:
+    if media_mode_is_oss(settings):
+        raise HTTPException(
+            status_code=410,
+            detail="multipart media publish is disabled; upload to OSS and use /internal/v1/publish-assets",
+        )
     item_id = _require_valid_id(video_id.strip())
     mode = (content_mode or _CONTENT_MODE_SINGLE).strip().lower()
     if mode not in (_CONTENT_MODE_SINGLE, _CONTENT_MODE_STORY):
@@ -504,6 +565,13 @@ async def publish(
         raise HTTPException(status_code=400, detail="user_id not found")
     if not author.enabled:
         raise HTTPException(status_code=400, detail="user is disabled")
+
+    existing_row = db.get(PublishedVideo, item_id)
+    if existing_row is not None and existing_row.content_type != CONTENT_TYPE_RUNTIME:
+        raise HTTPException(
+            status_code=409,
+            detail="item_id is already published with a different content_type",
+        )
 
     if mode == _CONTENT_MODE_STORY:
         if not story or not story.strip():
@@ -536,6 +604,18 @@ async def publish(
                 status_code=400, detail=f"unexpected clip files: {', '.join(extra)}"
             )
 
+        payload_json: dict[str, Any] = story_obj
+        video_url = _story_clip_url(item_id, entry)
+        try:
+            runtime_spec = compile_runtime_spec(
+                item_id=item_id,
+                content_mode=mode,
+                source=payload_json,
+                video_url=video_url,
+            )
+        except RuntimeSpecError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         _remove_published_media(settings, item_id)
         dest_dir = _story_dir(settings, item_id)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -544,9 +624,6 @@ async def publish(
             path = _story_clip_path(settings, item_id, cid)
             path.write_bytes(raw)
             total_bytes += len(raw)
-
-        payload_json: dict[str, Any] = story_obj
-        video_url = _story_clip_url(item_id, entry)
         detail = f"clips={len(by_clip)} bytes={total_bytes}"
     else:
         if not timeline or not timeline.strip():
@@ -568,18 +645,27 @@ async def publish(
         if not raw:
             raise HTTPException(status_code=400, detail="empty video upload")
 
+        payload_json = timeline_obj
+        video_url = _single_video_url(item_id)
+        try:
+            runtime_spec = compile_runtime_spec(
+                item_id=item_id,
+                content_mode=mode,
+                source=payload_json,
+                video_url=video_url,
+            )
+        except RuntimeSpecError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         _remove_published_media(settings, item_id)
         dest = _single_media_path(settings, item_id)
         dest.write_bytes(raw)
-
-        payload_json = timeline_obj
-        video_url = _single_video_url(item_id)
         detail = f"interactions={n_interactions} bytes={len(raw)}"
 
     now = datetime.now(timezone.utc)
     weight = 0 if feed_weight is None else int(feed_weight)
     tutorial_flag = _parse_form_bool(is_tutorial)
-    row = db.get(PublishedVideo, item_id)
+    row = existing_row
     if row is None:
         tutorial_value = False if tutorial_flag is None else tutorial_flag
         if tutorial_value:
@@ -587,12 +673,20 @@ async def publish(
         db.add(
             PublishedVideo(
                 id=item_id,
+                content_type=CONTENT_TYPE_RUNTIME,
                 video_url=video_url,
                 timeline=payload_json,
+                runtime_spec=runtime_spec,
+                runtime_spec_version=RUNTIME_SPEC_VERSION,
+                html_url=None,
+                bridge_version=None,
+                required_capabilities=[],
                 version=version,
                 user_id=author_id,
                 content_mode=mode,
                 feed_weight=weight,
+                content_source="pgc",
+                review_status="approved",
                 is_tutorial=tutorial_value,
                 created_at=now,
                 updated_at=now,
@@ -617,10 +711,16 @@ async def publish(
             user_id=author_id,
             content_mode=mode,
             updated=False,
+            runtime_spec_version=RUNTIME_SPEC_VERSION,
         )
 
     row.video_url = video_url
     row.timeline = payload_json
+    row.runtime_spec = runtime_spec
+    row.runtime_spec_version = RUNTIME_SPEC_VERSION
+    row.html_url = None
+    row.bridge_version = None
+    row.required_capabilities = []
     row.version = version
     row.user_id = author_id
     row.content_mode = mode
@@ -650,6 +750,374 @@ async def publish(
         user_id=author_id,
         content_mode=mode,
         updated=True,
+        runtime_spec_version=RUNTIME_SPEC_VERSION,
+    )
+
+
+@router.post(
+    "/publish-assets",
+    response_model=PublishResponse,
+    summary="Publish verified OSS runtime assets",
+    description="No file bytes cross ivapp. Assets must be finalized media_object ids.",
+)
+def publish_assets(
+    payload: RuntimeObjectPublishRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> PublishResponse:
+    if not media_mode_is_oss(settings):
+        raise HTTPException(status_code=409, detail="OSS media storage is not enabled")
+    item_id = _require_valid_id(payload.video_id.strip())
+    author_id = payload.user_id.strip()
+    author = db.get(User, author_id)
+    if author is None:
+        raise HTTPException(status_code=400, detail="user_id not found")
+    if not author.enabled:
+        raise HTTPException(status_code=400, detail="user is disabled")
+    existing = db.get(PublishedVideo, item_id)
+    if existing is not None and existing.content_type != CONTENT_TYPE_RUNTIME:
+        raise HTTPException(
+            status_code=409,
+            detail="item_id is already published with a different content_type",
+        )
+
+    if payload.content_mode == _CONTENT_MODE_SINGLE:
+        if payload.timeline is None:
+            raise HTTPException(status_code=400, detail="timeline is required")
+        try:
+            source_payload = Timeline.model_validate(payload.timeline).model_dump(mode="python")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
+        declarations = [item for item in payload.assets if item.role == "single"]
+        if len(declarations) != 1 or len(payload.assets) != 1:
+            raise HTTPException(status_code=400, detail="single mode requires exactly one single asset")
+    else:
+        if payload.story is None:
+            raise HTTPException(status_code=400, detail="story is required")
+        source_payload = _parse_story(json.dumps(payload.story, ensure_ascii=False))
+        declarations = [item for item in payload.assets if item.role == "clip"]
+        expected = set(source_payload["clips"].keys())
+        actual = {item.clip_id for item in declarations}
+        if len(declarations) != len(actual) or len(declarations) != len(payload.assets):
+            raise HTTPException(status_code=400, detail="story assets must be unique clips")
+        if expected != actual:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "story asset mismatch", "missing": missing, "extra": extra},
+            )
+
+    media_by_id = {
+        row.id: row
+        for row in db.query(MediaObject)
+        .filter(MediaObject.id.in_([item.media_object_id for item in declarations]))
+        .all()
+    }
+    if len(media_by_id) != len(declarations):
+        raise HTTPException(status_code=404, detail="one or more media objects were not found")
+    sources = [
+        RuntimeSourceAsset(
+            role=item.role,
+            clip_id=item.clip_id,
+            media=media_by_id[item.media_object_id],
+        )
+        for item in declarations
+    ]
+    try:
+        published_assets = publish_runtime_assets(
+            db,
+            settings,
+            video_id=item_id,
+            version=payload.version,
+            source_payload=source_payload,
+            assets=sources,
+        )
+        video_url = (
+            published_assets.urls["single"]
+            if payload.content_mode == _CONTENT_MODE_SINGLE
+            else published_assets.urls[source_payload["entry_clip_id"]]
+        )
+        runtime_spec = compile_runtime_spec(
+            item_id=item_id,
+            content_mode=payload.content_mode,
+            source=source_payload,
+            video_url=video_url,
+            video_urls=(
+                published_assets.urls
+                if payload.content_mode == _CONTENT_MODE_STORY
+                else None
+            ),
+        )
+    except (MediaServiceError, OssStorageError, RuntimeSpecError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    now = datetime.now(timezone.utc)
+    updated = existing is not None
+    row = existing or PublishedVideo(
+        id=item_id,
+        content_type=CONTENT_TYPE_RUNTIME,
+        created_at=now,
+    )
+    tutorial = bool(payload.is_tutorial) if payload.is_tutorial is not None else bool(row.is_tutorial)
+    if tutorial:
+        _clear_other_tutorials(db, keep_video_id=item_id)
+    row.content_type = CONTENT_TYPE_RUNTIME
+    row.video_url = video_url
+    row.timeline = source_payload
+    row.runtime_spec = runtime_spec
+    row.runtime_spec_version = RUNTIME_SPEC_VERSION
+    row.html_url = None
+    row.bridge_version = None
+    row.required_capabilities = []
+    row.active_publication_id = published_assets.publication_id
+    row.html_package_id = None
+    row.version = payload.version
+    row.title = payload.title.strip()
+    row.description = payload.description.strip()
+    row.user_id = author_id
+    row.content_mode = payload.content_mode
+    if payload.feed_weight is not None or not updated:
+        row.feed_weight = int(payload.feed_weight or 0)
+    row.content_source = "pgc"
+    row.review_status = "approved"
+    row.is_tutorial = tutorial
+    row.deleted_at = None
+    row.updated_at = now
+    db.add(row)
+    enqueue_prefetch(db, settings, published_assets.urls.values())
+    db.commit()
+    return PublishResponse(
+        video_id=item_id,
+        version=payload.version,
+        video_url=video_url,
+        user_id=author_id,
+        content_mode=payload.content_mode,
+        updated=updated,
+        runtime_spec_version=RUNTIME_SPEC_VERSION,
+    )
+
+
+@router.post(
+    "/preview-runtime",
+    summary="Compile a signed admin preview without publishing it",
+)
+def preview_runtime(
+    payload: RuntimePreviewRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    """Return the same runtime spec compiler used by publication, without writes.
+
+    ivadmin owns the preview authorization and sends only the current version's
+    business JSON plus already-finalized media object IDs.  This service owns
+    OSS URL issuance, so video bytes never transit ivadmin.
+    """
+    if not media_mode_is_oss(settings):
+        raise HTTPException(status_code=409, detail="OSS media storage is not enabled")
+    preview_id = _require_valid_id(payload.preview_id.strip(), label="preview_id")
+    if payload.content_mode == _CONTENT_MODE_SINGLE:
+        if payload.timeline is None:
+            raise HTTPException(status_code=400, detail="timeline is required")
+        try:
+            source_payload = Timeline.model_validate(payload.timeline).model_dump(mode="python")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
+        declarations = [item for item in payload.assets if item.role == "single"]
+        if len(declarations) != 1 or len(payload.assets) != 1:
+            raise HTTPException(status_code=400, detail="single mode requires exactly one single asset")
+    else:
+        if payload.story is None:
+            raise HTTPException(status_code=400, detail="story is required")
+        source_payload = _parse_story(json.dumps(payload.story, ensure_ascii=False))
+        declarations = [item for item in payload.assets if item.role == "clip"]
+        expected = set(source_payload["clips"].keys())
+        actual = {item.clip_id for item in declarations}
+        if len(declarations) != len(actual) or len(declarations) != len(payload.assets) or expected != actual:
+            raise HTTPException(status_code=400, detail="story assets must exactly match story clips")
+
+    media_by_id = {
+        row.id: row
+        for row in db.query(MediaObject)
+        .filter(MediaObject.id.in_([item.media_object_id for item in declarations]))
+        .all()
+    }
+    if len(media_by_id) != len(declarations) or any(row.state != "ready" for row in media_by_id.values()):
+        raise HTTPException(status_code=404, detail="one or more ready media objects were not found")
+    ttl = max(30, min(3600, settings.oss_private_get_ttl_seconds))
+    try:
+        urls = {
+            item.clip_id or "single": (
+                public_url(settings, media_by_id[item.media_object_id].object_key)
+                if media_by_id[item.media_object_id].visibility == "public"
+                else sign_get_url(
+                    settings,
+                    key=media_by_id[item.media_object_id].object_key,
+                    expires_seconds=ttl,
+                    filename=media_by_id[item.media_object_id].original_filename,
+                )
+            )
+            for item in declarations
+        }
+        entry_url = urls["single"] if payload.content_mode == _CONTENT_MODE_SINGLE else urls[source_payload["entry_clip_id"]]
+        runtime_spec = compile_runtime_spec(
+            item_id=preview_id,
+            content_mode=payload.content_mode,
+            source=source_payload,
+            video_url=entry_url,
+            video_urls=urls if payload.content_mode == _CONTENT_MODE_STORY else None,
+        )
+    except (OssStorageError, RuntimeSpecError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"schema": "pixo.mobile-preview.v1", "preview_id": preview_id, "runtime_spec": runtime_spec, "media_expires_in": ttl}
+
+
+@router.post(
+    "/publish-html",
+    response_model=PublishHtmlResponse,
+    summary="发布已验收的 HTML 互动内容",
+    description="Header 需 X-Publish-Key。仅写入已上传到受信 HTTPS 域名的不可变内容包。",
+)
+def publish_html(
+    payload: PublishHtmlRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> PublishHtmlResponse:
+    item_id = _require_valid_id(payload.item_id.strip(), label="item_id")
+    version = payload.version.strip()
+    author_id = payload.user_id.strip()
+    author = db.get(User, author_id)
+    if author is None:
+        raise HTTPException(status_code=400, detail="user_id not found")
+    if not author.enabled:
+        raise HTTPException(status_code=400, detail="user is disabled")
+
+    package = None
+    if media_mode_is_oss(settings):
+        if not payload.package_id:
+            raise HTTPException(status_code=400, detail="package_id is required in OSS mode")
+        package = db.get(HtmlPackage, payload.package_id)
+        if (
+            package is None
+            or package.state != "ready"
+            or package.item_id != item_id
+            or package.version != version
+        ):
+            raise HTTPException(status_code=400, detail="verified HTML package not found")
+        if payload.html_url != package.html_url:
+            raise HTTPException(status_code=400, detail="html_url does not match verified package")
+    try:
+        capabilities = normalize_required_capabilities(payload.required_capabilities)
+        html_url = validate_html_package_url(
+            payload.html_url,
+            item_id=item_id,
+            version=version,
+            settings=settings,
+        )
+        if not media_mode_is_oss(settings):
+            probe_html_entry(html_url, settings)
+    except (HtmlContentError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    row = db.get(PublishedVideo, item_id)
+    if row is not None and row.content_type != CONTENT_TYPE_HTML:
+        raise HTTPException(
+            status_code=409,
+            detail="item_id is already published with a different content_type",
+        )
+
+    now = datetime.now(timezone.utc)
+    normalized_title = payload.title.strip()
+    normalized_description = payload.description.strip()
+    if not normalized_title:
+        raise HTTPException(status_code=400, detail="title required")
+    if row is None:
+        row = PublishedVideo(
+            id=item_id,
+            content_type=CONTENT_TYPE_HTML,
+            video_url=None,
+            timeline=None,
+            runtime_spec=None,
+            runtime_spec_version=None,
+            html_url=html_url,
+            bridge_version=HTML_BRIDGE_VERSION,
+            required_capabilities=capabilities,
+            html_package_id=(package.id if package else None),
+            version=version,
+            title=normalized_title,
+            description=normalized_description,
+            user_id=author_id,
+            content_mode=_CONTENT_MODE_SINGLE,
+            feed_weight=int(payload.feed_weight),
+            content_source="manual_upload",
+            review_status="approved",
+            is_tutorial=False,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        updated = False
+    elif row.version == version:
+        same_payload = (
+            row.html_url == html_url
+            and row.bridge_version == HTML_BRIDGE_VERSION
+            and list(row.required_capabilities or []) == capabilities
+            and (row.title or "") == normalized_title
+            and (row.description or "") == normalized_description
+            and row.user_id == author_id
+            and int(row.feed_weight or 0) == int(payload.feed_weight)
+            and row.html_package_id == (package.id if package else None)
+        )
+        if not same_payload:
+            raise HTTPException(
+                status_code=409,
+                detail="item_id + version already exists with different metadata",
+            )
+        updated = False
+    else:
+        row.html_url = html_url
+        row.bridge_version = HTML_BRIDGE_VERSION
+        row.required_capabilities = capabilities
+        row.html_package_id = package.id if package else None
+        row.active_publication_id = None
+        row.version = version
+        row.title = normalized_title
+        row.description = normalized_description
+        row.user_id = author_id
+        row.feed_weight = int(payload.feed_weight)
+        row.content_source = "manual_upload"
+        row.review_status = "approved"
+        row.updated_at = now
+        updated = True
+
+    if package is not None:
+        enqueue_prefetch(
+            db,
+            settings,
+            html_package_public_urls(db, settings, package_id=package.id),
+        )
+    db.commit()
+    log.info(
+        "publish html item_id=%s version=%s user_id=%s updated=%s capabilities=%s url=%s",
+        item_id,
+        version,
+        author_id,
+        updated,
+        ",".join(capabilities),
+        html_url,
+    )
+    return PublishHtmlResponse(
+        item_id=item_id,
+        version=version,
+        html_url=html_url,
+        bridge_version=HTML_BRIDGE_VERSION,
+        required_capabilities=capabilities,
+        user_id=author_id,
+        updated=updated,
     )
 
 
@@ -657,18 +1125,355 @@ def _is_valid_video_id(video_id: str) -> bool:
     return _is_valid_id(video_id)
 
 
-def _video_info(row: PublishedVideo) -> PublishedVideoInfo:
+def _video_info(
+    row: PublishedVideo,
+    settings: Settings | None = None,
+) -> PublishedVideoInfo:
+    active_settings = settings or get_settings()
     return PublishedVideoInfo(
         video_id=row.id,
         version=row.version,
-        video_url=row.video_url,
+        content_type=row.content_type,
+        video_url=canonicalize_public_url(active_settings, row.video_url),
+        html_url=canonicalize_public_url(active_settings, row.html_url),
+        bridge_version=row.bridge_version,
+        required_capabilities=list(row.required_capabilities or []),
         user_id=row.user_id,
         content_mode=(row.content_mode or _CONTENT_MODE_SINGLE),
         feed_weight=int(row.feed_weight or 0),
+        distribution_enabled=bool(getattr(row, "distribution_enabled", True)),
         is_tutorial=bool(getattr(row, "is_tutorial", False)),
+        runtime_spec_version=row.runtime_spec_version,
         created_at=row.created_at.isoformat() if row.created_at else "",
         updated_at=row.updated_at.isoformat() if row.updated_at else "",
     )
+
+
+def _content_management_out(db: Session, settings: Settings, row: PublishedVideo) -> dict[str, Any]:
+    """Small, UI-oriented projection. Binary media is always browser→OSS."""
+    author = db.get(User, row.user_id) if row.user_id else None
+    cover_url = ""
+    if row.cover_media_object_id:
+        cover = db.get(MediaObject, row.cover_media_object_id)
+        if cover is not None:
+            try:
+                cover_url = sign_get_url(settings, key=cover.object_key, expires_seconds=900)
+            except OssStorageError:
+                log.warning("content cover signing failed video_id=%s", row.id)
+    creation = db.query(CreatorCreation).filter(CreatorCreation.published_video_id == row.id).one_or_none()
+    return {
+        "id": row.id,
+        "source": row.content_source or "pgc",
+        "content_type": row.content_type,
+        "title": row.title or row.id,
+        "description": row.description or "",
+        "status": row.review_status or "approved",
+        "creation_status": creation.status if creation else "published",
+        "author_user_id": row.user_id or "",
+        "author_nickname": (author.nickname if author else "") or "",
+        "feed_weight": int(row.feed_weight or 0),
+        "distribution_enabled": bool(getattr(row, "distribution_enabled", True)),
+        "is_tutorial": bool(row.is_tutorial),
+        "cover_url": cover_url,
+        # Runtime cards use this as a video poster fallback; never proxy bytes through ivapp.
+        "preview_url": canonicalize_public_url(
+            settings,
+            row.html_url if row.content_type == CONTENT_TYPE_HTML else row.video_url,
+        )
+        or "",
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+        "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+        "reviewed_by": row.reviewed_by or "",
+        "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
+        "review_note": row.review_note or "",
+    }
+
+
+@router.get("/content-management", summary="统一内容管理列表")
+def list_content_management(
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+    source: str = Query(default="all", pattern="^(all|pgc|ugc|manual_upload)$"),
+    status: str = Query(default="all", pattern="^(all|draft|pending|approved|rejected)$"),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    q = db.query(PublishedVideo).filter(PublishedVideo.deleted_at.is_(None))
+    if source != "all":
+        q = q.filter(PublishedVideo.content_source == source)
+    if status != "all":
+        q = q.filter(PublishedVideo.review_status == status)
+    total = q.count()
+    rows = q.order_by(PublishedVideo.updated_at.desc(), PublishedVideo.id.desc()).offset(offset).limit(limit).all()
+    return {"items": [_content_management_out(db, settings, row) for row in rows], "total": total}
+
+
+@router.get("/content-management/{video_id}", summary="统一内容管理详情")
+def get_content_management_detail(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    row = db.get(PublishedVideo, video_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="video not found")
+    detail = _content_management_out(db, settings, row)
+    # This private endpoint is for operations only. It returns metadata/configuration, never media
+    # bytes; browser preview continues to load directly from OSS.
+    detail["runtime_spec"] = (
+        canonicalize_public_payload(settings, row.runtime_spec)
+        if row.content_type == CONTENT_TYPE_RUNTIME
+        else None
+    )
+    detail["timeline"] = row.timeline if row.content_type == CONTENT_TYPE_RUNTIME else None
+    detail["html_url"] = (
+        canonicalize_public_url(settings, row.html_url)
+        if row.content_type == CONTENT_TYPE_HTML
+        else None
+    )
+    detail["version"] = row.version
+    return detail
+
+
+@router.patch("/content-management/{video_id}", summary="编辑已生成内容")
+def patch_content_management_detail(
+    video_id: str,
+    payload: ContentManagementUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    """Update operator-owned metadata and, for Runtime, a validated timeline.
+
+    A draft is deliberately never publicly reachable.  Setting a row to draft
+    also turns off distribution, so a later query/filter regression cannot
+    accidentally put an unfinished work back into the Feed.
+    """
+    row = db.get(PublishedVideo, video_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="video not found")
+    changed = payload.model_fields_set
+    if not changed:
+        raise HTTPException(status_code=400, detail="at least one editable field is required")
+
+    if "title" in changed:
+        row.title = str(payload.title or "").strip()
+    if "description" in changed:
+        row.description = str(payload.description or "").strip()
+    if "review_status" in changed:
+        row.review_status = payload.review_status or row.review_status
+        if payload.review_status == "draft":
+            row.distribution_enabled = False
+            row.is_tutorial = False
+
+    if "timeline" in changed:
+        if row.content_type != CONTENT_TYPE_RUNTIME:
+            raise HTTPException(status_code=409, detail="HTML content has no runtime timeline")
+        if not isinstance(payload.timeline, dict):
+            raise HTTPException(status_code=400, detail="timeline must be an object")
+        if not row.video_url:
+            raise HTTPException(status_code=409, detail="runtime video_url is missing")
+        try:
+            story_urls = None
+            if (row.content_mode or _CONTENT_MODE_SINGLE) == _CONTENT_MODE_STORY:
+                # Reuse the publication parser so editing a Story does not
+                # discard its clip graph or per-clip on_end actions.
+                source = _parse_story(json.dumps(payload.timeline, ensure_ascii=False))
+                if not row.active_publication_id:
+                    raise MediaServiceError("story runtime publication is missing")
+                story_urls = load_published_runtime_urls(
+                    db, settings, video_id=row.id, publication_id=row.active_publication_id
+                )
+            else:
+                source = Timeline.model_validate(payload.timeline).model_dump(
+                    mode="python", exclude_none=True
+                )
+            row.timeline = source
+            row.runtime_spec = compile_runtime_spec(
+                item_id=row.id,
+                content_mode=row.content_mode or _CONTENT_MODE_SINGLE,
+                source=source,
+                video_url=canonicalize_public_url(settings, row.video_url) or row.video_url,
+                video_urls=story_urls,
+            )
+            row.runtime_spec_version = RUNTIME_SPEC_VERSION
+        except HTTPException:
+            raise
+        except (MediaServiceError, OssStorageError, RuntimeSpecError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"invalid runtime timeline: {exc}") from exc
+
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    detail = _content_management_out(db, settings, row)
+    detail["runtime_spec"] = (
+        canonicalize_public_payload(settings, row.runtime_spec)
+        if row.content_type == CONTENT_TYPE_RUNTIME
+        else None
+    )
+    detail["timeline"] = row.timeline if row.content_type == CONTENT_TYPE_RUNTIME else None
+    detail["html_url"] = (
+        canonicalize_public_url(settings, row.html_url)
+        if row.content_type == CONTENT_TYPE_HTML
+        else None
+    )
+    detail["version"] = row.version
+    return detail
+
+
+@router.get("/videos/{video_id}/metrics", summary="获取内容播放聚合指标")
+def get_video_metrics(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    """Return compact operational metrics; raw client events stay out of normal UI reads."""
+    row = db.get(PublishedVideo, video_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="video not found")
+
+    unique_view_count, first_viewed_at, last_viewed_at = (
+        db.query(
+            func.count(VideoView.id),
+            func.min(VideoView.first_viewed_at),
+            func.max(VideoView.first_viewed_at),
+        )
+        .filter(VideoView.video_id == row.id)
+        .one()
+    )
+    telemetry_event_count, last_telemetry_at = (
+        db.query(func.count(AnalyticsLog.id), func.max(AnalyticsLog.created_at))
+        .filter(AnalyticsLog.video_id == row.id)
+        .one()
+    )
+    return {
+        "video_id": row.id,
+        # A view is recorded only after Android reports actual media playback.
+        "unique_view_count": int(unique_view_count or 0),
+        "first_viewed_at": first_viewed_at.isoformat() if first_viewed_at else None,
+        "last_viewed_at": last_viewed_at.isoformat() if last_viewed_at else None,
+        # Kept for observability only. It is not a play count and is never used for ranking.
+        "telemetry_event_count": int(telemetry_event_count or 0),
+        "last_telemetry_at": last_telemetry_at.isoformat() if last_telemetry_at else None,
+    }
+
+
+@router.post("/videos/{video_id}/review", summary="审核 UGC 内容")
+def review_video(
+    video_id: str,
+    payload: dict[str, Any],
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    row = db.get(PublishedVideo, video_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="video not found")
+    if row.content_source != "ugc":
+        raise HTTPException(status_code=409, detail="only UGC content requires review")
+    decision = str(payload.get("status") or "").strip()
+    if decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="status must be approved or rejected")
+    row.review_status = decision
+    row.reviewed_by = str(payload.get("reviewed_by") or "").strip()[:128]
+    row.review_note = str(payload.get("note") or "").strip()[:500]
+    row.reviewed_at = datetime.now(timezone.utc)
+    row.updated_at = row.reviewed_at
+    creation = db.query(CreatorCreation).filter(CreatorCreation.published_video_id == row.id).one_or_none()
+    if creation is not None:
+        creation.status = "published" if decision == "approved" else "rejected"
+        creation.progress_stage = creation.status
+        creation.updated_at = row.reviewed_at
+    db.commit()
+    return _video_info(row).model_dump() | {"review_status": row.review_status}
+
+
+@router.get(
+    "/runtime-specs/audit",
+    response_model=RuntimeSpecAuditOut,
+    summary="审计持久化播放协议",
+)
+def audit_runtime_specs(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> RuntimeSpecAuditOut:
+    rows = (
+        db.query(PublishedVideo)
+        .filter(PublishedVideo.content_type == CONTENT_TYPE_RUNTIME)
+        .order_by(PublishedVideo.id.asc())
+        .all()
+    )
+    missing: list[str] = []
+    invalid: dict[str, str] = {}
+    ready = 0
+    for row in rows:
+        if row.runtime_spec is None or not row.runtime_spec_version:
+            missing.append(row.id)
+            continue
+        try:
+            read_runtime_spec(
+                row.runtime_spec,
+                item_id=row.id,
+                version=row.runtime_spec_version,
+            )
+        except RuntimeSpecError as exc:
+            invalid[row.id] = str(exc)
+        else:
+            ready += 1
+    return RuntimeSpecAuditOut(
+        total=len(rows),
+        ready=ready,
+        missing_video_ids=missing,
+        invalid=invalid,
+    )
+
+
+@router.post(
+    "/videos/{video_id}/runtime-spec/recompile",
+    response_model=PublishedVideoInfo,
+    summary="显式重新编译单个作品的持久化播放协议",
+)
+def recompile_video_runtime_spec(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> PublishedVideoInfo:
+    row = db.get(PublishedVideo, video_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="video not found")
+    if row.content_type != CONTENT_TYPE_RUNTIME:
+        raise HTTPException(status_code=409, detail="HTML content has no runtime spec")
+    if not row.video_url:
+        raise HTTPException(status_code=409, detail="runtime video_url is missing")
+    source = row.timeline if isinstance(row.timeline, dict) else {}
+    try:
+        story_urls = None
+        if (row.content_mode or _CONTENT_MODE_SINGLE) == _CONTENT_MODE_STORY:
+            if not row.active_publication_id:
+                raise MediaServiceError("story runtime publication is missing")
+            story_urls = load_published_runtime_urls(
+                db,
+                settings,
+                video_id=row.id,
+                publication_id=row.active_publication_id,
+            )
+        spec = compile_runtime_spec(
+            item_id=row.id,
+            content_mode=row.content_mode or _CONTENT_MODE_SINGLE,
+            source=source,
+            video_url=canonicalize_public_url(settings, row.video_url) or row.video_url,
+            video_urls=story_urls,
+        )
+    except (MediaServiceError, OssStorageError, RuntimeSpecError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    row.runtime_spec = spec
+    row.runtime_spec_version = RUNTIME_SPEC_VERSION
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return _video_info(row)
 
 
 @router.get(
@@ -697,7 +1502,7 @@ def get_video(
     "/videos/{video_id}/feed",
     response_model=PublishedVideoInfo,
     summary="更新 Feed 运营字段",
-    description="Header 需 X-Publish-Key。body 可选 feed_weight / is_tutorial（至少一项）；"
+    description="Header 需 X-Publish-Key。body 可选 feed_weight / is_tutorial / distribution_enabled（至少一项）；"
     "is_tutorial=true 时清其它教学标记。返回视频元数据。不存在 → 404。",
 )
 def update_video_feed_weight(
@@ -709,9 +1514,13 @@ def update_video_feed_weight(
     if not _is_valid_video_id(video_id):
         raise HTTPException(status_code=400, detail="invalid video_id")
 
-    if payload.feed_weight is None and payload.is_tutorial is None:
+    if (
+        payload.feed_weight is None
+        and payload.is_tutorial is None
+        and payload.distribution_enabled is None
+    ):
         raise HTTPException(
-            status_code=400, detail="feed_weight or is_tutorial required"
+            status_code=400, detail="feed_weight, is_tutorial, or distribution_enabled required"
         )
 
     row = db.get(PublishedVideo, video_id)
@@ -724,13 +1533,18 @@ def update_video_feed_weight(
         if payload.is_tutorial:
             _clear_other_tutorials(db, keep_video_id=video_id)
         row.is_tutorial = bool(payload.is_tutorial)
+    if payload.distribution_enabled is not None:
+        row.distribution_enabled = bool(payload.distribution_enabled)
+        if not row.distribution_enabled:
+            row.is_tutorial = False
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     log.info(
-        "feed fields updated video_id=%s feed_weight=%s is_tutorial=%s",
+        "feed fields updated video_id=%s feed_weight=%s is_tutorial=%s distribution_enabled=%s",
         video_id,
         row.feed_weight,
         bool(row.is_tutorial),
+        bool(row.distribution_enabled),
     )
     return _video_info(row)
 
@@ -890,6 +1704,8 @@ def serve_avatar(
     filename: str,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> FileResponse:
+    if media_mode_is_oss(settings) and not settings.media_read_fallback_local:
+        raise HTTPException(status_code=404, detail="avatar not found")
     try:
         path = resolve_avatar_path(settings, filename)
     except AvatarStorageError as exc:
@@ -912,10 +1728,29 @@ def serve_avatar(
 def serve_story_media(
     item_id: str,
     clip_id: str,
+    db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> FileResponse:
+) -> Response:
     if not _is_valid_id(item_id) or not _is_valid_id(clip_id):
         raise HTTPException(status_code=400, detail="invalid media path")
+    if media_mode_is_oss(settings):
+        video = db.get(PublishedVideo, item_id)
+        if video is not None and video.active_publication_id:
+            binding = (
+                db.query(PublishedMediaAsset)
+                .filter(
+                    PublishedMediaAsset.video_id == item_id,
+                    PublishedMediaAsset.publication_id == video.active_publication_id,
+                    PublishedMediaAsset.role == "clip",
+                    PublishedMediaAsset.clip_id == clip_id,
+                )
+                .one_or_none()
+            )
+            media = db.get(MediaObject, binding.media_object_id) if binding else None
+            if media is not None:
+                return RedirectResponse(public_url(settings, media.object_key), status_code=307)
+        if not settings.media_read_fallback_local:
+            raise HTTPException(status_code=404, detail="media not found")
     path = _story_clip_path(settings, item_id, clip_id)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="media not found")
@@ -930,10 +1765,28 @@ def serve_story_media(
 )
 def serve_media(
     video_id: str,
+    db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> FileResponse:
+) -> Response:
     if not _is_valid_id(video_id):
         raise HTTPException(status_code=400, detail="invalid video_id")
+    if media_mode_is_oss(settings):
+        video = db.get(PublishedVideo, video_id)
+        if video is not None and video.active_publication_id:
+            binding = (
+                db.query(PublishedMediaAsset)
+                .filter(
+                    PublishedMediaAsset.video_id == video_id,
+                    PublishedMediaAsset.publication_id == video.active_publication_id,
+                    PublishedMediaAsset.role == "single",
+                )
+                .one_or_none()
+            )
+            media = db.get(MediaObject, binding.media_object_id) if binding else None
+            if media is not None:
+                return RedirectResponse(public_url(settings, media.object_key), status_code=307)
+        if not settings.media_read_fallback_local:
+            raise HTTPException(status_code=404, detail="media not found")
     path = _single_media_path(settings, video_id)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="media not found")

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -95,6 +95,47 @@ def resolve_current_user(request: Request, db: Session, token: str) -> AppUser |
     return load_app_user(db, token)
 
 
+def _bearer_token(request: Request) -> str:
+    raw = (request.headers.get("Authorization") or "").strip()
+    if not raw:
+        return ""
+    scheme, separator, value = raw.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not value.strip():
+        return ""
+    return value.strip()
+
+
+def resolve_request_token(
+    request: Request,
+    head: ProtocolHeadIn,
+    *,
+    act: str | None = None,
+) -> str:
+    """Accept legacy head.token and Bearer, rejecting ambiguous identities."""
+    body_token = resolve_token(head)
+    if body_token == "anonymous":
+        body_token = ""
+    bearer = _bearer_token(request)
+    if body_token and bearer and body_token != bearer:
+        log.warning("auth token conflict path=%s", request.url.path)
+        raise AppAuthError(
+            act=act or _PATH_ACT.get(request.url.path, "auth"),
+            head_in=head,
+            status=AUTH_FAIL_STATUS,
+        )
+    return bearer or body_token or "anonymous"
+
+
+def resolve_multipart_token(
+    request: Request,
+    *,
+    form_token: str | None,
+    act: str,
+) -> str:
+    head = ProtocolHeadIn(act=act, token=(form_token or "").strip())
+    return resolve_request_token(request, head, act=act)
+
+
 def _act_from_request(request: Request, head: ProtocolHeadIn) -> str:
     if isinstance(head.act, str) and head.act.strip():
         return head.act.strip()
@@ -120,7 +161,7 @@ async def require_app_user(
             head = ProtocolHeadIn()
 
     act = _act_from_request(request, head)
-    token = resolve_token(head)
+    token = resolve_request_token(request, head, act=act)
     user = load_app_user(db, token)
     if user is None:
         log.warning(
@@ -131,8 +172,23 @@ async def require_app_user(
         raise AppAuthError(act=act, head_in=head, status=AUTH_FAIL_STATUS)
 
     request.state.app_user = user
+    request.state.app_token = token
 
     async def _receive() -> dict:
         return {"type": "http.request", "body": raw, "more_body": False}
 
-    request._receive = _receive  # noqa: SLF001 — replay body for FastAPI parsing
+    request._receive = _receive
+
+
+async def require_bearer_user(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+) -> AppUser:
+    """Authentication dependency for new REST endpoints (Bearer only)."""
+    token = _bearer_token(request)
+    user = load_app_user(db, token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="valid Bearer token required")
+    request.state.app_user = user
+    request.state.app_token = token
+    return user

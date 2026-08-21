@@ -1,0 +1,139 @@
+{
+  "schema": "pixo.runtime-test-source.v1",
+  "purpose": "Android on-device visual interaction acceptance test",
+  "item_id": "vision_all_targets_android_v1",
+  "version": "vision-all-targets-android-v1",
+  "content_type": "runtime",
+  "title": "视觉互动全量测试（Android）",
+  "description": "依次测试全部端侧手势与表情。每一项出现时视频会暂停，完成当前提示后自动继续；没有倒计时。",
+  "user_id": "0d6843393d9942f082842b83c57bdd97",
+  "feed_weight": 1000000,
+  "content_mode": "single",
+  "source_media": {
+    "public_url": "https://video.pixopixo.cn/ivapp-media/v1/public/runtime/c3b1cbd2-743b-4b79-869b-750a837fffd8/pubm_9a0c8eb9f477910430f868a2168aec71a551be67/single.mp4",
+    "duration_ms": 21433,
+    "reuse_policy": "Resolve this existing owned OSS object to its MediaObject record, then publish through /internal/v1/publish-assets. The publish service must make a new immutable OSS copy under this item_id; do not reuse the source publication folder."
+  },
+  "timeline": {
+    "interactions": [
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 800,
+        "pause_video": true,
+        "hint": "第 1/16 项｜比耶手势：打开前置摄像头，举起一只手，伸出食指和中指形成 V，并保持约半秒。",
+        "vision": { "target": "hand_victory", "camera_facing": "front", "show_preview": true, "min_confidence": 0.82, "stable_for_ms": 400 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 2000,
+        "pause_video": true,
+        "hint": "第 2/16 项｜点赞：打开前置摄像头，竖起大拇指，其他手指收起，并保持约半秒。",
+        "vision": { "target": "hand_thumb_up", "camera_facing": "front", "show_preview": true, "min_confidence": 0.60, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 3200,
+        "pause_video": true,
+        "hint": "第 3/16 项｜拇指向下：打开前置摄像头，握拳后将大拇指朝下，并保持约半秒。",
+        "vision": { "target": "hand_thumb_down", "camera_facing": "front", "show_preview": true, "min_confidence": 0.82, "stable_for_ms": 400 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 4400,
+        "pause_video": true,
+        "hint": "第 4/16 项｜张开手掌：打开前置摄像头，五指完全张开，让手掌正对镜头，并保持约半秒。",
+        "vision": { "target": "hand_open_palm", "camera_facing": "front", "show_preview": true, "min_confidence": 0.55, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 5600,
+        "pause_video": true,
+        "hint": "第 5/16 项｜握拳：打开前置摄像头，握紧一只拳头并正对镜头，保持约半秒。",
+        "vision": { "target": "hand_closed_fist", "camera_facing": "front", "show_preview": true, "min_confidence": 0.82, "stable_for_ms": 400 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 6800,
+        "pause_video": true,
+        "hint": "第 6/16 项｜食指向上：打开前置摄像头，只伸出食指并指向上方，其他手指收起，保持约半秒。",
+        "vision": { "target": "hand_pointing_up", "camera_facing": "front", "show_preview": true, "min_confidence": 0.55, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 8000,
+        "pause_video": true,
+        "hint": "第 7/16 项｜我爱你手势：打开前置摄像头，伸出拇指、食指和小指，中指与无名指收起，保持约半秒。",
+        "vision": { "target": "hand_i_love_you", "camera_facing": "front", "show_preview": true, "min_confidence": 0.60, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 9200,
+        "pause_video": true,
+        "hint": "第 8/16 项｜微笑：正视前置摄像头，自然露出笑容，并保持约半秒。",
+        "vision": { "target": "face_smile", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 10400,
+        "pause_video": true,
+        "hint": "第 9/16 项｜左眼眨眼：正视前置摄像头，闭合你本人左眼再睁开（不是屏幕左边）。",
+        "vision": { "target": "face_wink_left", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 11600,
+        "pause_video": true,
+        "hint": "第 10/16 项｜右眼眨眼：正视前置摄像头，闭合你本人右眼再睁开（不是屏幕右边）。",
+        "vision": { "target": "face_wink_right", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 12800,
+        "pause_video": true,
+        "hint": "第 11/16 项｜双眼眨眼：正视前置摄像头，双眼同时闭合再睁开。",
+        "vision": { "target": "face_blink", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 14000,
+        "pause_video": true,
+        "hint": "第 12/16 项｜张嘴：正视前置摄像头，张开嘴巴并保持约半秒。",
+        "vision": { "target": "face_mouth_open", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 15200,
+        "pause_video": true,
+        "hint": "第 13/16 项｜嘟嘴：正视前置摄像头，收拢嘴唇做出嘟嘴表情，并保持约半秒。",
+        "vision": { "target": "face_mouth_pucker", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 16400,
+        "pause_video": true,
+        "hint": "第 14/16 项｜挑眉：正视前置摄像头，抬起双侧眉毛，并保持约半秒。",
+        "vision": { "target": "face_brow_raise", "camera_facing": "front", "show_preview": true, "min_confidence": 0.65, "stable_for_ms": 250 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 17600,
+        "pause_video": true,
+        "hint": "第 15/16 项｜皱眉：正视前置摄像头，双眉向中间收拢，并保持约半秒。",
+        "vision": { "target": "face_brow_furrow", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      },
+      {
+        "gesture": "camera_motion",
+        "gate_at_ms": 18800,
+        "pause_video": true,
+        "hint": "第 16/16 项｜鼓腮：正视前置摄像头，鼓起双侧脸颊，并保持约半秒。",
+        "vision": { "target": "face_cheek_puff", "camera_facing": "front", "show_preview": true, "min_confidence": 0.5, "stable_for_ms": 150 }
+      }
+    ]
+  },
+  "expected_runtime_contract": {
+    "pause_video": true,
+    "response_window_ms": 0,
+    "on_success": { "action": "continue" },
+    "on_miss": { "action": "continue" }
+  }
+}

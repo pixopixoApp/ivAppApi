@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy.orm import Session
+
 from app.config import Settings
+from app.media_service import media_mode_is_oss
+from app.models import MediaObject
+from app.oss_storage import object_key, upload_bytes
 
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
 
@@ -85,6 +93,79 @@ def save_user_avatar(
     dest = directory / f"{uid}.{ext}"
     dest.write_bytes(raw)
     return f"/media/avatars/{uid}.{ext}"
+
+
+def store_user_avatar(
+    db: Session,
+    settings: Settings,
+    *,
+    user_id: str,
+    raw: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> tuple[str, str | None]:
+    """Persist an avatar without leaving a server-local file in OSS mode."""
+    if not media_mode_is_oss(settings):
+        return (
+            save_user_avatar(
+                settings,
+                user_id=user_id,
+                raw=raw,
+                filename=filename,
+                content_type=content_type,
+            ),
+            None,
+        )
+    if not raw:
+        raise AvatarStorageError("empty avatar upload")
+    if len(raw) > MAX_AVATAR_BYTES:
+        raise AvatarStorageError("avatar too large (max 2MB)")
+    _safe_user_id(user_id)
+    ext = _resolve_ext(filename=filename, content_type=content_type)
+    media_type = _EXT_CONTENT_TYPE[ext]
+    object_id = f"mo_{secrets.token_urlsafe(18)}"
+    key = object_key(
+        settings,
+        "public",
+        "avatars",
+        object_id[-2:],
+        f"{object_id}.{ext}",
+    )
+    digest = hashlib.sha256(raw).hexdigest()
+    url = upload_bytes(
+        settings,
+        key=key,
+        payload=raw,
+        content_type=media_type,
+        public=True,
+        immutable=True,
+        extra_headers={
+            "x-oss-meta-pixo-object-id": object_id,
+            "x-oss-meta-sha256": digest,
+        },
+    )
+    now = datetime.now(timezone.utc)
+    db.add(
+        MediaObject(
+            id=object_id,
+            upload_session_id=None,
+            purpose="avatar",
+            origin="server_upload",
+            visibility="public",
+            state="ready",
+            staging_key=key,
+            object_key=key,
+            original_filename=filename or f"avatar.{ext}",
+            content_type=media_type,
+            size_bytes=len(raw),
+            sha256=digest,
+            etag="",
+            extra_json={},
+            verified_at=now,
+            created_at=now,
+        )
+    )
+    return url, object_id
 
 
 def resolve_avatar_path(settings: Settings, filename: str) -> Path:

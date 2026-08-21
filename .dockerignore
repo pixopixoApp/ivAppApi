@@ -1,0 +1,16 @@
+.git
+.env
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.egg-info
+**/._*
+.DS_Store
+**/.DS_Store
+build
+dist
+volumes
+runs
+logs

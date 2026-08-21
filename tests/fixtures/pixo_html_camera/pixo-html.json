@@ -1,0 +1,14 @@
+{
+  "item_id": "html_camera_qa_001",
+  "entry": "index.html",
+  "title": "HTML Camera QA",
+  "description": "Host SDK camera lifecycle fixture",
+  "bridge_version": 1,
+  "required_capabilities": [
+    "motion",
+    "microphoneLevel",
+    "cameraStream",
+    "haptics",
+    "mediaControl"
+  ]
+}

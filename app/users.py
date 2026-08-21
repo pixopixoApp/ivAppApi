@@ -74,16 +74,39 @@ def normalize_nickname(raw: str) -> str:
     return s
 
 
+def normalize_bio(raw: str) -> str:
+    s = raw.strip() if isinstance(raw, str) else ""
+    if len(s) > 80:
+        raise ValueError("bio too long")
+    return s
+
+
 def normalize_birthday(raw: str) -> str:
     """Require YYYY-MM-DD; raise ValueError if invalid."""
     s = raw.strip() if isinstance(raw, str) else ""
     if not s:
         raise ValueError("birthday required")
     try:
-        datetime.strptime(s, "%Y-%m-%d")
+        born = date.fromisoformat(s)
     except ValueError as exc:
         raise ValueError("birthday must be YYYY-MM-DD") from exc
+    if born > datetime.now(timezone.utc).date():
+        raise ValueError("birthday cannot be in the future")
     return s
+
+
+def age_years(birthday_yyyy_mm_dd: str, *, today: date | None = None) -> int:
+    s = normalize_birthday(birthday_yyyy_mm_dd)
+    born = date.fromisoformat(s)
+    on = today or datetime.now(timezone.utc).date()
+    return on.year - born.year - ((on.month, on.day) < (born.month, born.day))
+
+
+def is_under_13(user: User, *, today: date | None = None) -> bool | None:
+    birthday = (user.birthday or "").strip()
+    if not birthday:
+        return None
+    return age_years(birthday, today=today) < MIN_ACCOUNT_AGE_YEARS
 
 
 def assert_min_age(
@@ -94,10 +117,7 @@ def assert_min_age(
 ) -> None:
     """Raise ValueError if age on ``today`` (UTC) is under min_years."""
     s = normalize_birthday(birthday_yyyy_mm_dd)
-    born = datetime.strptime(s, "%Y-%m-%d").date()
-    on = today or datetime.now(timezone.utc).date()
-    years = on.year - born.year - ((on.month, on.day) < (born.month, born.day))
-    if years < min_years:
+    if age_years(s, today=today) < min_years:
         raise ValueError("age below minimum")
 
 
@@ -140,6 +160,7 @@ def apply_user_update(
     enabled: bool | None = None,
     nickname: str | None = None,
     avatar_url: str | None = None,
+    bio: str | None = None,
     source: str | None = None,
     create_if_missing: bool = False,
 ) -> User:
@@ -172,6 +193,7 @@ def apply_user_update(
             enabled=True if enabled is None else bool(enabled),
             nickname="" if nickname is None else normalize_nickname(nickname),
             avatar_url="" if avatar_url is None else normalize_relative_avatar(avatar_url),
+            bio="" if bio is None else normalize_bio(bio),
             birthday="",
             source=src,
             created_at=now,
@@ -195,6 +217,8 @@ def apply_user_update(
         row.nickname = normalize_nickname(nickname)
     if avatar_url is not None:
         row.avatar_url = normalize_relative_avatar(avatar_url)
+    if bio is not None:
+        row.bio = normalize_bio(bio)
     # source is immutable after create
 
     db.flush()
@@ -227,6 +251,7 @@ def to_profile_fields(user: User) -> dict[str, str | bool]:
         "user_id": user.user_id,
         "nickname": user.nickname or "",
         "avatar_url": user.avatar_url or "",
+        "bio": user.bio or "",
         "email": user.subject if user.provider == "email" else "",
         "enabled": bool(user.enabled),
         "birthday": user.birthday or "",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 class ProtocolHeadIn(BaseModel):
@@ -11,7 +11,7 @@ class ProtocolHeadIn(BaseModel):
     act: str = Field(default="video", description="动作名")
     ver: str = Field(default="1.2", description="客户端版本号")
     time: str | None = Field(default="2024-06-19 12:00:00", description="客户端时间")
-    token: str = Field(default="token1234567890", description="用户 token")
+    token: str = Field(default="", description="用户 token；也可改用 Authorization: Bearer")
     ssid: str | None = Field(default=None, description="会话 ID，可选；服务端可回填")
 
 
@@ -32,6 +32,14 @@ class ProtocolHeadOut(BaseModel):
     ver: str = Field(description="服务端版本号")
     time: str = Field(description="服务端时间")
     ssid: str = Field(description="会话 ID")
+    error_code: str | None = Field(default=None, description="机器可读错误码")
+    message: str | None = Field(default=None, description="可直接展示的简短友好提示")
+    retry_after_seconds: int | None = Field(default=None, description="建议重试等待秒数")
+
+    @model_serializer(mode="wrap")
+    def _omit_nulls(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class EmptyBody(BaseModel):
@@ -62,6 +70,11 @@ class TimelineInteraction(BaseModel):
     reaction_start_ms: int | None = None
     reaction_end_ms: int | None = None
     hint: str | None = None
+    pause_video: bool = True
+    vision: dict[str, Any] | None = Field(
+        default=None,
+        description="camera_motion 的受控端侧视觉识别配置",
+    )
     region: Region | None = None
 
 
@@ -87,6 +100,39 @@ class PublishResponse(BaseModel):
     user_id: str = Field(description="作者 user_id")
     content_mode: str = Field(description="内容模式：single 或 story")
     updated: bool = Field(description="是否覆盖已有发布（false=新建）")
+    runtime_spec_version: str = Field(description="已持久化的播放协议版本")
+    content_type: Literal["runtime"] = "runtime"
+
+
+class PublishHtmlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str = Field(min_length=1, max_length=128)
+    package_id: str | None = Field(default=None, min_length=1, max_length=64)
+    version: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="不可变内容包 SHA-256（小写十六进制）",
+    )
+    html_url: str = Field(min_length=1, max_length=2048)
+    bridge_version: Literal[1]
+    required_capabilities: list[str] = Field(default_factory=list, max_length=5)
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1200)
+    user_id: str = Field(min_length=1, max_length=64)
+    feed_weight: int = 0
+
+
+class PublishHtmlResponse(BaseModel):
+    item_id: str
+    version: str
+    html_url: str
+    bridge_version: Literal[1]
+    required_capabilities: list[str]
+    user_id: str
+    content_type: Literal["html"] = "html"
+    updated: bool
 
 
 class UnpublishResponse(BaseModel):
@@ -97,13 +143,26 @@ class UnpublishResponse(BaseModel):
 class PublishedVideoInfo(BaseModel):
     video_id: str = Field(description="发布单元幂等键（item_id）")
     version: str = Field(description="内容版本号")
-    video_url: str = Field(description="入口视频相对路径")
+    content_type: Literal["runtime", "html"] = "runtime"
+    video_url: str | None = Field(default=None, description="Runtime 入口视频相对路径")
+    html_url: str | None = Field(default=None, description="HTML HTTPS 入口")
+    bridge_version: int | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
     user_id: str | None = Field(default=None, description="作者 user_id；存量可空")
     content_mode: str = Field(default="single", description="内容模式：single 或 story")
     feed_weight: int = Field(default=0, description="Feed 权重，越大越靠前")
+    distribution_enabled: bool = Field(default=True, description="是否允许向 App / 公开接口分发")
     is_tutorial: bool = Field(default=False, description="是否教学片（全站至多一条，未看时 Feed 置顶）")
+    runtime_spec_version: str | None = Field(default=None, description="已持久化的播放协议版本")
     created_at: str = Field(description="创建时间 ISO8601")
     updated_at: str = Field(description="更新时间 ISO8601")
+
+
+class RuntimeSpecAuditOut(BaseModel):
+    total: int
+    ready: int
+    missing_video_ids: list[str] = Field(default_factory=list)
+    invalid: dict[str, str] = Field(default_factory=dict)
 
 
 class FeedWeightUpdateRequest(BaseModel):
@@ -112,6 +171,25 @@ class FeedWeightUpdateRequest(BaseModel):
         default=None,
         description="是否教学片；不传则不改；true 时清其它片的教学标记",
     )
+    distribution_enabled: bool | None = Field(
+        default=None,
+        description="是否允许向 App / 公开接口分发；false 时自动取消教学片标记",
+    )
+
+
+class ContentManagementUpdateRequest(BaseModel):
+    """运营后台编辑已生成内容的受控字段。
+
+    ``timeline`` 始终在服务端重新编译为 runtime_spec；客户端无法直接写入
+    runtime_spec，从而避免展示配置和实际播放器协议失去一致性。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=1200)
+    timeline: dict[str, Any] | None = None
+    review_status: Literal["draft", "approved"] | None = None
 
 
 class UserImpressionsOut(BaseModel):
@@ -135,6 +213,7 @@ class AdminUserUpsertRequest(BaseModel):
         max_length=512,
         description="头像相对路径，如 /media/avatars/x.png；传空串可清空",
     )
+    bio: str | None = Field(default=None, max_length=80, description="个人介绍；传空串可清空")
 
 
 class AdminUserOut(BaseModel):
@@ -144,6 +223,7 @@ class AdminUserOut(BaseModel):
     enabled: bool = Field(description="是否启用")
     nickname: str = Field(default="", description="昵称")
     avatar_url: str = Field(default="", description="头像相对路径")
+    bio: str = Field(default="", description="个人介绍")
     source: str = Field(description="创建来源：app=真实用户，admin=管理后台")
     created_at: str = Field(description="创建时间 ISO8601")
 
@@ -184,6 +264,7 @@ class VideoBodyIn(BaseModel):
     """App 拉视频列表；可空。limit 控制本批条数。"""
 
     limit: int = Field(default=10, ge=1, le=50, description="本批返回视频条数")
+    cursor: str | None = Field(default=None, max_length=1024, description="服务端返回的不透明游标")
 
 
 class VideoRequest(BaseModel):
@@ -275,14 +356,49 @@ class ClipOut(BaseModel):
 
 class FeedItemOut(BaseModel):
     item_id: str = Field(description="发布单元 id（publish 的 video_id）")
+    content_type: Literal["runtime", "html"] = Field(description="播放协议类型")
+    title: str = Field(default="", description="作品标题")
+    description: str = Field(default="", description="作品描述")
+    share_url: str = Field(default="", description="可分享的作品落地页")
     user_id: str | None = Field(default=None, description="作者 user_id；存量可空")
     nickname: str = Field(default="", description="作者昵称；无作者或未设置则为空串")
     avatar_url: str = Field(default="", description="作者头像相对路径；无作者或未设置则为空串")
-    video: list[ClipOut] = Field(description="单视频 length=1；Story 多段，入口 clip 在首位")
+    play_count: int = Field(default=0, ge=0, description="去重登录用户播放量")
+    is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
+    viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
+    following: bool = Field(default=False, description="is_following 的兼容字段")
+    video: list[ClipOut] | None = Field(
+        default=None, description="Runtime：单视频 length=1；Story 多段，入口 clip 在首位"
+    )
+    html_url: str | None = Field(default=None, description="HTML：受信 HTTPS 入口")
+    bridge_version: int | None = Field(default=None, description="HTML Bridge 版本")
+    required_capabilities: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_content_payload(self) -> FeedItemOut:
+        if self.content_type == "runtime":
+            if not self.video:
+                raise ValueError("runtime feed item requires video")
+            if self.html_url is not None or self.bridge_version is not None:
+                raise ValueError("runtime feed item cannot contain HTML payload")
+        else:
+            if self.video is not None:
+                raise ValueError("html feed item cannot contain runtime video")
+            if not self.html_url or self.bridge_version != 1:
+                raise ValueError("html feed item requires html_url and bridge_version=1")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_inapplicable_fields(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        return {key: value for key, value in data.items() if value is not None}
 
 
 class VideoBodyOut(BaseModel):
     items: list[FeedItemOut] = Field(description="Feed 发布单元列表")
+    next_cursor: str | None = Field(default=None, description="下一批不透明游标")
+    has_more: bool = Field(default=False, description="是否可继续请求")
+    is_circular: bool = Field(default=False, description="是否为可循环的无限推荐流")
 
 
 class VideoResponse(BaseModel):
@@ -371,6 +487,20 @@ class SendCodeResponse(BaseModel):
     body: EmptyBody
 
 
+def _deactivate_send_code_head() -> ProtocolHeadIn:
+    return ProtocolHeadIn(act="deactivate_send_code")
+
+
+class DeactivateSendCodeRequest(BaseModel):
+    head: ProtocolHeadIn = Field(default_factory=_deactivate_send_code_head)
+    body: EmptyBody = Field(default_factory=EmptyBody)
+
+
+class DeactivateSendCodeResponse(BaseModel):
+    head: ProtocolHeadOut
+    body: EmptyBody
+
+
 class VerifyBodyIn(BaseModel):
     email: str = Field(description="邮箱")
     code: str = Field(min_length=6, max_length=6, description="6 位数字验证码")
@@ -393,6 +523,8 @@ class VerifyBodyOut(BaseModel):
     needs_birthday: bool = Field(
         description="是否需要设置生日（birthday 为空时为 true）"
     )
+    birthday: str = Field(default="", description="已保存生日；未设置为空串")
+    is_under_13: bool | None = Field(default=None, description="已设置生日时是否未满 13 岁")
 
 
 class VerifyResponse(BaseModel):
@@ -451,6 +583,7 @@ class FollowingBodyIn(BaseModel):
         description="目标用户 id；空则查当前登录用户",
     )
     limit: int = Field(default=50, ge=1, le=200, description="返回关注条数上限")
+    cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
 
 class FollowingRequest(BaseModel):
@@ -467,6 +600,8 @@ class FollowingItemOut(BaseModel):
 
 class FollowingBodyOut(BaseModel):
     items: list[FollowingItemOut] = Field(description="关注列表")
+    next_cursor: str | None = None
+    has_more: bool = False
 
 
 class FollowingResponse(BaseModel):
@@ -481,6 +616,7 @@ class FollowersBodyIn(BaseModel):
         description="目标用户 id；空则查当前登录用户",
     )
     limit: int = Field(default=50, ge=1, le=200, description="返回粉丝条数上限")
+    cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
 
 def _followers_head() -> ProtocolHeadIn:
@@ -494,6 +630,8 @@ class FollowersRequest(BaseModel):
 
 class FollowersBodyOut(BaseModel):
     items: list[FollowingItemOut] = Field(description="粉丝列表（字段同 following item）")
+    next_cursor: str | None = None
+    has_more: bool = False
 
 
 class FollowersResponse(BaseModel):
@@ -505,6 +643,7 @@ class ProfileBodyOut(BaseModel):
     user_id: str = Field(description="用户稳定 id")
     nickname: str = Field(default="", description="昵称")
     avatar_url: str = Field(default="", description="头像相对路径")
+    bio: str = Field(default="", description="个人介绍")
     email: str = Field(default="", description="邮箱（邮箱登录时为 subject）")
     enabled: bool = Field(default=True, description="是否启用")
     following_count: int = Field(default=0, description="关注数")
@@ -532,6 +671,7 @@ class ProfileUpdateBodyIn(BaseModel):
         max_length=512,
         description="头像相对路径（以 / 开头）；不传则不改；空串清空",
     )
+    bio: str | None = Field(default=None, max_length=80, description="个人介绍；传空串可清空")
 
 
 def _profile_update_head() -> ProtocolHeadIn:
@@ -561,6 +701,7 @@ class PublicProfileBodyOut(BaseModel):
     user_id: str = Field(description="用户稳定 id")
     nickname: str = Field(default="", description="昵称")
     avatar_url: str = Field(default="", description="头像相对路径")
+    bio: str = Field(default="", description="个人介绍")
     enabled: bool = Field(default=True, description="是否启用")
     following_count: int = Field(default=0, description="关注数")
     follower_count: int = Field(default=0, description="粉丝数")
@@ -640,6 +781,7 @@ class DeactivateResponse(BaseModel):
 class UserVideosBodyIn(BaseModel):
     user_id: str = Field(min_length=1, max_length=64, description="作者 user_id")
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
+    cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
 
 def _user_videos_head() -> ProtocolHeadIn:
@@ -658,6 +800,7 @@ class UserVideosResponse(BaseModel):
 
 class MyVideosBodyIn(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
+    cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
 
 def _my_videos_head() -> ProtocolHeadIn:
@@ -676,6 +819,7 @@ class MyVideosResponse(BaseModel):
 
 class FollowingFeedBodyIn(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
+    cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
 
 def _following_feed_head() -> ProtocolHeadIn:

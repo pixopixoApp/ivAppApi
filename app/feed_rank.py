@@ -21,12 +21,41 @@ def build_feed_sequence(
     *,
     seen_ids: set[str] | None,
 ) -> list[str]:
-    """Ordered ids; login sink = unseen then seen; guest/None = as-is."""
+    """Ordered ids; a logged-in cycle contains only genuinely unseen items.
+
+    The caller resets the Redis set atomically-at-boundary once the eligible
+    pool is exhausted.  Appending seen items here made a short pool repeat
+    before the user had consumed a full cycle.
+    """
     if not seen_ids:
         return list(ordered_ids)
-    unseen = [vid for vid in ordered_ids if vid not in seen_ids]
-    seen = [vid for vid in ordered_ids if vid in seen_ids]
-    return unseen + seen
+    return [vid for vid in ordered_ids if vid not in seen_ids]
+
+
+def cursor_after_recent(
+    ordered_ids: list[str],
+    *,
+    recent_ids: list[str],
+) -> tuple[int, str | None]:
+    """Resume after the highest-ranked recent item still in the pool.
+
+    The pool is already in recommendation order (normally newest content first
+    within the same weight). Choosing the earliest pool entry among the three
+    recent impressions prevents a newly published item from jumping back to the
+    front when one or two older tail items were played after it.
+    """
+    if not ordered_ids:
+        return 0, None
+    index_by_id = {video_id: index for index, video_id in enumerate(ordered_ids)}
+    candidates = [
+        (index_by_id[video_id], video_id)
+        for video_id in recent_ids
+        if video_id in index_by_id
+    ]
+    if candidates:
+        index, video_id = min(candidates)
+        return (index + 1) % len(ordered_ids), video_id
+    return 0, None
 
 
 def page_circular(

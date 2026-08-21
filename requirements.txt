@@ -1,10 +1,18 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-sqlalchemy>=2.0.36
-pydantic-settings>=2.6.0
-python-dotenv>=1.0.1
-pymysql>=1.1.1
-python-multipart>=0.0.20
-google-auth>=2.36.0
-requests>=2.32.0
-redis>=5.0.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+sqlalchemy==2.0.51
+alembic==1.16.5
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
+pymysql==1.2.0
+python-multipart==0.0.32
+google-auth==2.56.3
+requests==2.34.2
+redis==8.1.0
+httpx==0.28.1
+oss2==2.19.1
+# Alibaba credentials 1.x requires aiofiles<25; pin it so mirrors resolve the
+# CDN SDK dependency graph deterministically.
+aiofiles==24.1.0
+alibabacloud-cdn20180510==9.2.0
+playwright==1.54.0

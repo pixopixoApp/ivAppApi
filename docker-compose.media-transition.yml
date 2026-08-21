@@ -1,0 +1,7 @@
+services:
+  api:
+    volumes:
+      - ./volumes/media:/volumes/media
+  worker:
+    volumes:
+      - ./volumes/media:/volumes/media

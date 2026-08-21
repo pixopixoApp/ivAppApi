@@ -1,17 +1,32 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from app.auth_user import load_app_user, require_app_user, resolve_current_user
-from app.avatar_storage import AvatarStorageError, save_user_avatar
+from app.account_deletion import AccountDeletionUnavailable, delete_account_data
+from app.auth_user import (
+    load_app_user,
+    require_app_user,
+    resolve_current_user,
+    resolve_multipart_token,
+)
+from app.avatar_storage import AvatarStorageError, store_user_avatar
+from app.cdn_cache import enqueue_prefetch
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.logging_config import get_logger
-from app.models import EmailCode, Follow, User, UserToken
+from app.models import Follow, User
+from app.pagination import (
+    CursorError,
+    datetime_from_cursor_value,
+    datetime_to_cursor_value,
+    decode_cursor,
+    encode_cursor,
+)
 from app.protocol_envelope import (
     avatar_error,
     avatar_ok,
@@ -19,6 +34,8 @@ from app.protocol_envelope import (
     birthday_ok,
     deactivate_error,
     deactivate_ok,
+    deactivate_send_code_error,
+    deactivate_send_code_ok,
     follow_error,
     follow_ok,
     followers_error,
@@ -41,7 +58,9 @@ from app.protocol_envelope import (
     user_videos_error,
     user_videos_ok,
 )
+from app.public_origin import canonicalize_public_url
 from app.routers.feed import list_published_items
+from app.safety import users_blocked_between
 from app.schemas import (
     AvatarResponse,
     BirthdayBodyOut,
@@ -50,6 +69,8 @@ from app.schemas import (
     DeactivateBodyOut,
     DeactivateRequest,
     DeactivateResponse,
+    DeactivateSendCodeRequest,
+    DeactivateSendCodeResponse,
     FollowersBodyOut,
     FollowersRequest,
     FollowersResponse,
@@ -80,12 +101,17 @@ from app.schemas import (
 )
 from app.users import (
     apply_user_update,
-    assert_min_age,
     follow_counts,
     is_following,
+    is_under_13,
     needs_birthday,
     normalize_birthday,
     to_profile_fields,
+)
+from app.verification_codes import (
+    PURPOSE_DEACTIVATE,
+    find_valid_code,
+    issue_email_code,
 )
 
 auth_router = APIRouter(tags=["user"], dependencies=[Depends(require_app_user)])
@@ -96,13 +122,14 @@ log = get_logger(__name__)
 _FOLLOWEE_FEED_CAP = 500
 
 
-def _profile_body(db: Session, user: User) -> ProfileBodyOut:
+def _profile_body(db: Session, settings: Settings, user: User) -> ProfileBodyOut:
     fields = to_profile_fields(user)
     following_count, follower_count = follow_counts(db, user.user_id)
     return ProfileBodyOut(
         user_id=str(fields["user_id"]),
         nickname=str(fields["nickname"]),
-        avatar_url=str(fields["avatar_url"]),
+        avatar_url=canonicalize_public_url(settings, str(fields["avatar_url"])) or "",
+        bio=str(fields["bio"]),
         email=str(fields["email"]),
         enabled=bool(fields["enabled"]),
         following_count=following_count,
@@ -111,13 +138,14 @@ def _profile_body(db: Session, user: User) -> ProfileBodyOut:
 
 
 def _public_profile_body(
-    db: Session, user: User, *, viewer_user_id: str
+    db: Session, settings: Settings, user: User, *, viewer_user_id: str
 ) -> PublicProfileBodyOut:
     following_count, follower_count = follow_counts(db, user.user_id)
     return PublicProfileBodyOut(
         user_id=user.user_id,
         nickname=user.nickname or "",
-        avatar_url=user.avatar_url or "",
+        avatar_url=canonicalize_public_url(settings, user.avatar_url) or "",
+        bio=user.bio or "",
         enabled=bool(user.enabled),
         following_count=following_count,
         follower_count=follower_count,
@@ -134,11 +162,14 @@ def _resolve_list_target(
     user = db.get(User, uid)
     if user is None or not user.enabled:
         return None
+    if uid != me_user_id and users_blocked_between(db, me_user_id, uid):
+        return None
     return user
 
 
 def _follow_list_items(
     db: Session,
+    settings: Settings,
     rows: list[Follow],
     *,
     peer_attr: str,
@@ -156,11 +187,60 @@ def _follow_list_items(
             FollowingItemOut(
                 user_id=peer_id,
                 nickname=(peer.nickname if peer is not None else "") or "",
-                avatar_url=(peer.avatar_url if peer is not None else "") or "",
+                avatar_url=(
+                    canonicalize_public_url(settings, peer.avatar_url)
+                    if peer is not None
+                    else ""
+                )
+                or "",
                 created_at=row.created_at.isoformat() if row.created_at else "",
             )
         )
     return items
+
+
+def _follow_page(
+    db: Session,
+    *,
+    filter_column,
+    target_user_id: str,
+    cursor: str | None,
+    cursor_kind: str,
+    cursor_secret: str,
+    limit: int,
+) -> tuple[list[Follow], str | None, bool]:
+    query = db.query(Follow).filter(filter_column == target_user_id)
+    if cursor:
+        values = decode_cursor(cursor=cursor, kind=cursor_kind, secret=cursor_secret)
+        created_at = datetime_from_cursor_value(values.get("created_at"))
+        row_id = values.get("id")
+        if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 1:
+            raise CursorError("cursor relation id missing")
+        query = query.filter(
+            or_(
+                Follow.created_at < created_at,
+                and_(Follow.created_at == created_at, Follow.id < row_id),
+            )
+        )
+    rows = (
+        query.order_by(Follow.created_at.desc(), Follow.id.desc())
+        .limit(limit + 1)
+        .all()
+    )
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = encode_cursor(
+            kind=cursor_kind,
+            values={
+                "created_at": datetime_to_cursor_value(last.created_at),
+                "id": last.id,
+            },
+            secret=cursor_secret,
+        )
+    return page, next_cursor, has_more
 
 
 @upload_router.post(
@@ -172,28 +252,42 @@ def _follow_list_items(
     "成功 body 与 profile 同形；非法文件 status=100；无效 token status=101。",
 )
 async def post_avatar(
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-    token: Annotated[str, Form(description="登录 token")],
-    file: UploadFile = File(..., description="头像图片文件"),
+    file: Annotated[UploadFile, File(description="头像图片文件")],
+    token: Annotated[
+        str | None,
+        Form(description="兼容旧客户端的登录 token；新客户端可使用 Authorization: Bearer"),
+    ] = None,
 ) -> AvatarResponse:
-    head = ProtocolHeadIn(act="avatar", token=token.strip())
-    me = load_app_user(db, token.strip())
+    effective_token = resolve_multipart_token(
+        request,
+        form_token=token,
+        act="avatar",
+    )
+    head = ProtocolHeadIn(act="avatar", token=effective_token)
+    me = load_app_user(db, effective_token)
     if me is None:
         return avatar_error(status=101, ver=settings.server_ver, head_in=head)
 
     try:
-        relative = await save_user_avatar(
+        raw = await file.read()
+        relative, media_object_id = store_user_avatar(
+            db,
             settings,
             user_id=me.user_id,
-            file=file,
+            raw=raw,
+            filename=file.filename,
+            content_type=file.content_type,
         )
-        user = apply_user_update(
-            db,
-            user_id=me.user_id,
-            avatar_url=relative,
-            create_if_missing=False,
-        )
+        user = db.get(User, me.user_id)
+        if user is None:
+            raise LookupError(me.user_id)
+        user.avatar_url = relative
+        user.avatar_media_object_id = media_object_id
+        db.add(user)
+        enqueue_prefetch(db, settings, [relative])
         db.commit()
         db.refresh(user)
     except AvatarStorageError:
@@ -208,7 +302,7 @@ async def post_avatar(
 
     log.info("avatar ok user_id=%s avatar_url=%s", user.user_id, user.avatar_url)
     return avatar_ok(
-        body=_profile_body(db, user),
+        body=_profile_body(db, settings, user),
         ver=settings.server_ver,
         head_in=head,
     )
@@ -237,7 +331,7 @@ def post_profile(
 
     log.info("profile ok user_id=%s", user.user_id)
     return profile_ok(
-        body=_profile_body(db, user),
+        body=_profile_body(db, settings, user),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -268,6 +362,7 @@ def post_profile_update(
             user_id=me.user_id,
             nickname=payload.body.nickname,
             avatar_url=payload.body.avatar_url,
+            bio=payload.body.bio,
             create_if_missing=False,
         )
         db.commit()
@@ -288,7 +383,7 @@ def post_profile_update(
         user.avatar_url,
     )
     return profile_update_ok(
-        body=_profile_body(db, user),
+        body=_profile_body(db, settings, user),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -317,10 +412,12 @@ def post_user_profile(
     user = db.get(User, uid) if uid else None
     if user is None or not user.enabled:
         return user_profile_error(ver=settings.server_ver, head_in=payload.head)
+    if user.user_id != me.user_id and users_blocked_between(db, me.user_id, user.user_id):
+        return user_profile_error(ver=settings.server_ver, head_in=payload.head)
 
     log.info("user_profile ok viewer=%s target=%s", me.user_id, user.user_id)
     return user_profile_ok(
-        body=_public_profile_body(db, user, viewer_user_id=me.user_id),
+        body=_public_profile_body(db, settings, user, viewer_user_id=me.user_id),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -330,9 +427,9 @@ def post_user_profile(
     "/birthday",
     response_model=BirthdayResponse,
     summary="保存生日（年龄门）",
-    description="需有效 head.token。body.birthday 为 YYYY-MM-DD；须满 13 岁（UTC）。"
-    "通过：写库并回 passed=true；未满 13：status=100、passed=false、不写库；"
-    "非法日期 status=100；无效 token status=101。",
+    description="需有效 head.token。body.birthday 为 YYYY-MM-DD。"
+    "合法日期一律持久化并返回 status=0；passed 表示按 UTC 是否已满 13 岁，"
+    "未满 13 岁时 passed=false。非法日期 status=100；无效 token status=101。",
 )
 def post_birthday(
     request: Request,
@@ -350,32 +447,20 @@ def post_birthday(
 
     try:
         normalized = normalize_birthday(payload.body.birthday)
-        assert_min_age(normalized)
         user.birthday = normalized
         db.commit()
         db.refresh(user)
-    except ValueError as exc:
+    except ValueError:
         db.rollback()
-        msg = str(exc)
-        if msg == "age below minimum":
-            log.info("birthday age gate fail user_id=%s", me.user_id)
-            return birthday_error(
-                ver=settings.server_ver,
-                head_in=payload.head,
-                body=BirthdayBodyOut(
-                    birthday="",
-                    needs_birthday=True,
-                    passed=False,
-                ),
-            )
         return birthday_error(ver=settings.server_ver, head_in=payload.head)
 
+    under_13 = bool(is_under_13(user))
     log.info("birthday ok user_id=%s birthday=%s", user.user_id, user.birthday)
     return birthday_ok(
         body=BirthdayBodyOut(
             birthday=user.birthday,
             needs_birthday=needs_birthday(user),
-            passed=True,
+            passed=not under_13,
         ),
         ver=settings.server_ver,
         head_in=payload.head,
@@ -383,12 +468,65 @@ def post_birthday(
 
 
 @auth_router.post(
+    "/deactivate/send_code",
+    response_model=DeactivateSendCodeResponse,
+    summary="发送账号注销验证码",
+    description="需登录。验证码用途与登录完全隔离，不共享频控或校验范围。",
+)
+def post_deactivate_send_code(
+    request: Request,
+    payload: DeactivateSendCodeRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DeactivateSendCodeResponse:
+    me = resolve_current_user(request, db, resolve_token(payload.head))
+    if me is None:
+        return deactivate_send_code_error(
+            status=101,
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code="AUTH_REQUIRED",
+            message="Please sign in again.",
+        )
+    user = db.get(User, me.user_id)
+    if user is None or user.provider != "email" or not user.subject.strip():
+        return deactivate_send_code_error(
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code="EMAIL_ACCOUNT_REQUIRED",
+            message="This account doesn’t use email sign-in.",
+        )
+
+    result = issue_email_code(
+        db,
+        settings,
+        email=user.subject.strip().lower(),
+        purpose=PURPOSE_DEACTIVATE,
+    )
+    if result.ok:
+        return deactivate_send_code_ok(ver=settings.server_ver, head_in=payload.head)
+    if result.error_code == "CODE_RATE_LIMITED":
+        return deactivate_send_code_error(
+            ver=settings.server_ver,
+            head_in=payload.head,
+            error_code=result.error_code,
+            message="A code was just sent. Please wait a moment and try again.",
+            retry_after_seconds=result.retry_after_seconds,
+        )
+    return deactivate_send_code_error(
+        ver=settings.server_ver,
+        head_in=payload.head,
+        error_code=result.error_code,
+        message="We couldn’t send the email. Please try again shortly.",
+    )
+
+
+@auth_router.post(
     "/deactivate",
     response_model=DeactivateResponse,
-    summary="申请删除账号（验证码 + 软删）",
-    description="需有效 head.token。body.code 为邮箱验证码（先 /send_code）。"
-    "仅邮箱账号；通过后 enabled=false、清 token，并写 scheduled_delete_at（默认 +30 天）。"
-    "成功回 scheduled_delete_at；验证码错误/非邮箱 status=100；无效 token status=101。",
+    summary="立即删除账号（兼容旧客户端）",
+    description="需有效 head.token。邮箱账号验证码通过后立即永久删除账号及关联数据。"
+    "Google 账号请使用新版 DELETE /api/v1/account。",
 )
 def post_deactivate(
     request: Request,
@@ -417,52 +555,28 @@ def post_deactivate(
         return deactivate_error(ver=settings.server_ver, head_in=payload.head)
 
     now = datetime.now(timezone.utc)
-    row = (
-        db.query(EmailCode)
-        .filter(
-            EmailCode.email == email,
-            EmailCode.code == code,
-            EmailCode.used_at.is_(None),
-        )
-        .order_by(EmailCode.created_at.desc())
-        .first()
+    row = find_valid_code(
+        db,
+        email=email,
+        code=code,
+        purpose=PURPOSE_DEACTIVATE,
+        now=now,
     )
     if row is None:
         log.warning("deactivate bad code user_id=%s", me.user_id)
         return deactivate_error(ver=settings.server_ver, head_in=payload.head)
-    expires = row.expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires <= now:
-        log.warning("deactivate expired code user_id=%s", me.user_id)
-        return deactivate_error(ver=settings.server_ver, head_in=payload.head)
-
     row.used_at = now
-    scheduled = now + timedelta(days=settings.account_deletion_buffer_days)
     try:
-        apply_user_update(
-            db,
-            user_id=me.user_id,
-            enabled=False,
-            create_if_missing=False,
-        )
-        user.deletion_requested_at = now
-        user.scheduled_delete_at = scheduled
-        db.query(UserToken).filter(UserToken.user_id == me.user_id).delete()
-        db.commit()
-    except LookupError:
+        delete_account_data(db, settings, user_id=me.user_id)
+    except AccountDeletionUnavailable:
         db.rollback()
         return deactivate_error(
-            status=101, ver=settings.server_ver, head_in=payload.head
+            ver=settings.server_ver, head_in=payload.head
         )
 
-    log.info(
-        "deactivate ok user_id=%s scheduled_delete_at=%s",
-        me.user_id,
-        scheduled.isoformat(),
-    )
+    log.info("deactivate immediate-delete ok user_id=%s", me.user_id)
     return deactivate_ok(
-        body=DeactivateBodyOut(scheduled_delete_at=scheduled.isoformat()),
+        body=DeactivateBodyOut(scheduled_delete_at=now.isoformat()),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -488,8 +602,11 @@ def post_follow(
     followee_id = payload.body.user_id.strip()
     if not followee_id or followee_id == me.user_id:
         return follow_error(ver=settings.server_ver, head_in=payload.head)
-    if db.get(User, followee_id) is None:
+    followee = db.get(User, followee_id)
+    if followee is None or not followee.enabled:
         log.warning("follow unknown user_id=%s by=%s", followee_id, me.user_id)
+        return follow_error(ver=settings.server_ver, head_in=payload.head)
+    if users_blocked_between(db, me.user_id, followee_id):
         return follow_error(ver=settings.server_ver, head_in=payload.head)
 
     exists = (
@@ -564,14 +681,19 @@ def post_following(
     if target is None:
         return following_error(ver=settings.server_ver, head_in=payload.head)
 
-    rows = (
-        db.query(Follow)
-        .filter(Follow.follower_user_id == target.user_id)
-        .order_by(Follow.created_at.desc())
-        .limit(payload.body.limit)
-        .all()
-    )
-    items = _follow_list_items(db, rows, peer_attr="followee_user_id")
+    try:
+        rows, next_cursor, has_more = _follow_page(
+            db,
+            filter_column=Follow.follower_user_id,
+            target_user_id=target.user_id,
+            cursor=payload.body.cursor,
+            cursor_kind=f"following:{target.user_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            limit=payload.body.limit,
+        )
+    except CursorError:
+        return following_error(ver=settings.server_ver, head_in=payload.head)
+    items = _follow_list_items(db, settings, rows, peer_attr="followee_user_id")
     log.info(
         "following ok viewer=%s target=%s count=%d",
         me.user_id,
@@ -579,7 +701,11 @@ def post_following(
         len(items),
     )
     return following_ok(
-        body=FollowingBodyOut(items=items),
+        body=FollowingBodyOut(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        ),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -607,14 +733,19 @@ def post_followers(
     if target is None:
         return followers_error(ver=settings.server_ver, head_in=payload.head)
 
-    rows = (
-        db.query(Follow)
-        .filter(Follow.followee_user_id == target.user_id)
-        .order_by(Follow.created_at.desc())
-        .limit(payload.body.limit)
-        .all()
-    )
-    items = _follow_list_items(db, rows, peer_attr="follower_user_id")
+    try:
+        rows, next_cursor, has_more = _follow_page(
+            db,
+            filter_column=Follow.followee_user_id,
+            target_user_id=target.user_id,
+            cursor=payload.body.cursor,
+            cursor_kind=f"followers:{target.user_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            limit=payload.body.limit,
+        )
+    except CursorError:
+        return followers_error(ver=settings.server_ver, head_in=payload.head)
+    items = _follow_list_items(db, settings, rows, peer_attr="follower_user_id")
     log.info(
         "followers ok viewer=%s target=%s count=%d",
         me.user_id,
@@ -622,7 +753,11 @@ def post_followers(
         len(items),
     )
     return followers_ok(
-        body=FollowersBodyOut(items=items),
+        body=FollowersBodyOut(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        ),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -652,18 +787,35 @@ def post_user_videos(
     author = db.get(User, uid) if uid else None
     if author is None or not author.enabled:
         return user_videos_error(ver=settings.server_ver, head_in=payload.head)
+    if author.user_id != me.user_id and users_blocked_between(db, me.user_id, author.user_id):
+        return user_videos_error(ver=settings.server_ver, head_in=payload.head)
 
-    items = list_published_items(
-        db, author_user_ids=[author.user_id], limit=payload.body.limit
-    )
+    try:
+        page = list_published_items(
+            db,
+            settings=settings,
+            author_user_ids=[author.user_id],
+            viewer_user_id=me.user_id,
+            limit=payload.body.limit,
+            cursor=payload.body.cursor,
+            cursor_kind=f"user_videos:{author.user_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            public_share_base_url=settings.public_share_base_url,
+        )
+    except CursorError:
+        return user_videos_error(ver=settings.server_ver, head_in=payload.head)
     log.info(
         "user_videos ok viewer=%s author=%s count=%d",
         me.user_id,
         author.user_id,
-        len(items),
+        len(page.items),
     )
     return user_videos_ok(
-        body=VideoBodyOut(items=items),
+        body=VideoBodyOut(
+            items=page.items,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+        ),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -686,12 +838,27 @@ def post_my_videos(
     if me is None:
         return my_videos_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
-    items = list_published_items(
-        db, author_user_ids=[me.user_id], limit=payload.body.limit
-    )
-    log.info("my_videos ok user_id=%s count=%d", me.user_id, len(items))
+    try:
+        page = list_published_items(
+            db,
+            settings=settings,
+            author_user_ids=[me.user_id],
+            viewer_user_id=me.user_id,
+            limit=payload.body.limit,
+            cursor=payload.body.cursor,
+            cursor_kind=f"my_videos:{me.user_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            public_share_base_url=settings.public_share_base_url,
+        )
+    except CursorError:
+        return my_videos_error(ver=settings.server_ver, head_in=payload.head)
+    log.info("my_videos ok user_id=%s count=%d", me.user_id, len(page.items))
     return my_videos_ok(
-        body=VideoBodyOut(items=items),
+        body=VideoBodyOut(
+            items=page.items,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+        ),
         ver=settings.server_ver,
         head_in=payload.head,
     )
@@ -727,17 +894,32 @@ def post_following_feed(
             .all()
         )
     ]
-    items = list_published_items(
-        db, author_user_ids=followee_ids, limit=payload.body.limit
-    )
+    try:
+        page = list_published_items(
+            db,
+            settings=settings,
+            author_user_ids=followee_ids,
+            viewer_user_id=me.user_id,
+            limit=payload.body.limit,
+            cursor=payload.body.cursor,
+            cursor_kind=f"following_feed:{me.user_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            public_share_base_url=settings.public_share_base_url,
+        )
+    except CursorError:
+        return following_feed_error(ver=settings.server_ver, head_in=payload.head)
     log.info(
         "following_feed ok user_id=%s followees=%d items=%d",
         me.user_id,
         len(followee_ids),
-        len(items),
+        len(page.items),
     )
     return following_feed_ok(
-        body=VideoBodyOut(items=items),
+        body=VideoBodyOut(
+            items=page.items,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+        ),
         ver=settings.server_ver,
         head_in=payload.head,
     )

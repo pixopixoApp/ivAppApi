@@ -1,0 +1,9 @@
+services:
+  api:
+    volumes:
+      - ./volumes/media:/volumes/media:ro
+      - ./migration-manifests:/migration-manifests
+  worker:
+    volumes:
+      - ./volumes/media:/volumes/media:ro
+      - ./migration-manifests:/migration-manifests

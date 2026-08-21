@@ -7,7 +7,7 @@ if [[ -f "$ROOT_DIR/.deploy.env" ]]; then
   source "$ROOT_DIR/.deploy.env"
 fi
 
-DEPLOY_HOST="${DEPLOY_HOST:-182.92.102.61}"
+DEPLOY_HOST="${DEPLOY_HOST:-123.56.218.5}"
 DEPLOY_USER="${DEPLOY_USER:-root}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/play_video/ivapp}"
@@ -52,7 +52,17 @@ find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf 'backup  %f\n' 2>/de
 find "$release_root" -mindepth 1 -maxdepth 1 -type d -printf 'release %f\n' 2>/dev/null | sort | tail -n 5 || true
 
 if [[ "$log_lines" -gt 0 ]]; then
-  echo "== API logs (last $log_lines lines) =="
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" logs --tail "$log_lines" api
+  echo "== API/Worker logs (last $log_lines lines) =="
+  services=(api)
+  if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+    | grep -qx worker; then
+    services+=(worker)
+  fi
+  if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+    | grep -qx cdn-worker; then
+    services+=(cdn-worker)
+  fi
+  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" logs \
+    --tail "$log_lines" "${services[@]}"
 fi
 REMOTE

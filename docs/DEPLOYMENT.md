@@ -4,14 +4,15 @@
 
 默认配置与 2026-08-08 的线上环境一致：
 
-- SSH：`root@182.92.102.61:22`
+- SSH：`root@123.56.218.5:22`
 - 项目：`/opt/play_video/ivapp`
 - Compose project：`ivapp`
 - API service：`api`
+- 创作协调 Worker service：`worker`（单实例、全局并发 1；只调用 ivadmin 私有 API）
 - 健康检查：`http://127.0.0.1:8100/health`
 - Compose 命令：`docker-compose`（不是 `docker compose`）
 
-服务器必须已有真实 `/opt/play_video/ivapp/.env` 和 `volumes/`。脚本不会创建、覆盖、下载、打印或备份到源码快照中。
+服务器必须已有真实 `/opt/play_video/ivapp/.env` 和数据库/Redis `volumes/`。媒体切换严格按 [OSS 手册](OSS_MEDIA_MIGRATION.md) 执行。
 
 ## 2. 本地配置
 
@@ -38,6 +39,14 @@ cp .deploy.env.example .deploy.env
 ./scripts/deploy.sh
 ```
 
+首次引入 `runtime_spec` 或明确需要重编译全部历史作品时使用：
+
+```bash
+./scripts/deploy.sh --backfill-runtime-specs
+```
+
+该开关会在切换 API 前依次执行 dry-run 与 apply。普通发布不会自动重编译旧作品，避免编译规则变化悄悄改变线上内容。
+
 脚本顺序：
 
 1. 本地 Python/Shell/Compose 基础检查。
@@ -46,8 +55,9 @@ cp .deploy.env.example .deploy.env
 4. 在 release 目录中读取线上 `.env`，先校验 Compose 并构建 `api` 镜像；此时线上容器未改变。
 5. 把当前线上源码复制到 `/opt/play_video/backups/ivapp/<同一ID>`，并保存部署前 MySQL dump。
 6. 同步新源码到线上目录；`.env`、`.git`、`volumes` 和缓存均被排除。
-7. 只强制重建 `api` 容器，不触碰 MySQL、Redis、phpMyAdmin。
-8. 轮询健康检查；失败时自动恢复源码快照、重建旧镜像并重启 API。
+7. 使用新镜像执行 `alembic upgrade head`；可选显式回填历史 runtime spec。
+8. 强制重建 `api`，轮询健康检查，再强制重建单实例 `worker`；不重建 MySQL、Redis、phpMyAdmin。
+9. API 失败时自动恢复源码快照、重建旧镜像并重启 API。
 
 纯源码变化可使用：
 
@@ -55,7 +65,7 @@ cp .deploy.env.example .deploy.env
 ./scripts/deploy.sh --no-build
 ```
 
-只有在确认 `requirements.txt`、Dockerfile、系统依赖和 Python 依赖均未变化时才应使用。
+只有在确认 `requirements.txt`、Dockerfile、系统依赖、Compose 服务和 Python 依赖均未变化时才应使用；首次新增 worker 时不可使用。
 
 ## 5. 查看状态和日志
 
@@ -86,9 +96,9 @@ cp .deploy.env.example .deploy.env
 
 每次正式部署前会在对应 backup 目录保存 `database.sql.gz`。只有在确认新版本执行了不兼容迁移、评估停机窗口并备份当前故障现场后，才人工恢复。恢复步骤应由两人复核，且先在临时数据库验证 dump。
 
-当前脚本没有备份媒体和 Redis。应另外建立：
+当前脚本没有备份 OSS 媒体和 Redis。应另外建立：
 
-- `volumes/media` 的对象存储/异机增量备份；
+- `ivapp-media/v1/` 的跨 bucket 校验复制（对象永久保留）；
 - MySQL 每日全量 + binlog/PITR；
 - Redis AOF 备份（曝光数据可按业务容忍度决定）；
 - 定期恢复演练和保留策略。
@@ -98,5 +108,6 @@ cp .deploy.env.example .deploy.env
 - 线上 `.env` 必须为 `0600`；正式发布会修正权限，但第一次发布前也应手工处理。
 - 不要把服务器旧 `.git`、真实 `.env` 或 `volumes` 拷回本地仓库。
 - 8101 的 phpMyAdmin 不应公开到互联网；优先绑定 `127.0.0.1` 或通过 VPN/SSH 隧道访问。
+- ivapp 只保存访问 ivadmin 私有创作接口的 `CREATOR_INTERNAL_KEY`；Dify 与模型密钥仅属于 ivadmin，不得进入 ivapp 配置、响应、日志或源码。
 - `X-Publish-Key` 只能通过 TLS 传输，并应定期轮换。
 - release 和 backup 默认不自动删除；启用清理策略前必须同时满足保留数量、最近成功恢复点和异机备份要求。
