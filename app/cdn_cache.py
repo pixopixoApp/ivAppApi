@@ -192,6 +192,7 @@ def active_public_urls(db: Session, settings: Settings) -> list[str]:
             ),
         )
         .filter(
+            PublishedVideo.is_deleted == 0,
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
@@ -205,6 +206,7 @@ def active_public_urls(db: Session, settings: Settings) -> list[str]:
         .join(HtmlPackageAsset, HtmlPackageAsset.media_object_id == MediaObject.id)
         .join(PublishedVideo, PublishedVideo.html_package_id == HtmlPackageAsset.package_id)
         .filter(
+            PublishedVideo.is_deleted == 0,
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),

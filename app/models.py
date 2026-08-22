@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -92,6 +93,10 @@ class PublishedVideo(Base):
     review_note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     cover_media_object_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     is_tutorial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 是否已删除（标记删除）：0=未删除，1=已删除。deleted_at 仅记录删除时间。
+    is_deleted: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0, server_default="0", index=True
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
     )

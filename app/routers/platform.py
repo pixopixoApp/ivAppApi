@@ -1275,7 +1275,8 @@ def delete_published_video(
     video = db.get(PublishedVideo, video_id)
     if video is None or video.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="published video not found")
-    if video.deleted_at is None:
+    if not bool(video.is_deleted) or video.deleted_at is None:
+        video.is_deleted = 1
         video.deleted_at = _now()
         creation = db.get(CreatorCreation, video_id)
         if creation is not None and creation.user_id == user.user_id:
@@ -1301,7 +1302,8 @@ def restore_published_video(
     video = db.get(PublishedVideo, video_id)
     if video is None or video.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="published video not found")
-    if video.deleted_at is not None:
+    if bool(video.is_deleted) or video.deleted_at is not None:
+        video.is_deleted = 0
         video.deleted_at = None
         video.updated_at = _now()
         creation = db.get(CreatorCreation, video_id)
@@ -1322,7 +1324,12 @@ def creator_share_page(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
     video = db.get(PublishedVideo, video_id)
-    if video is None or video.deleted_at is not None or not video.distribution_enabled:
+    if (
+        video is None
+        or video.is_deleted != 0
+        or video.deleted_at is not None
+        or not video.distribution_enabled
+    ):
         raise HTTPException(status_code=404, detail="video not found")
     title = html.escape(video.title or "Pixo interactive video")
     description = html.escape(video.description or "Play this interactive video on Pixo")

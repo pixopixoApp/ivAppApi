@@ -114,7 +114,7 @@ def _item_from_published(
     viewer_user_id: str | None = None,
     public_share_base_url: str = "",
 ) -> FeedItemOut | None:
-    if row.deleted_at is not None:
+    if getattr(row, "is_deleted", 0) != 0 or row.deleted_at is not None:
         return None
     if not bool(getattr(row, "distribution_enabled", True)):
         return None
@@ -244,6 +244,7 @@ def list_published_items(
                     PublishedVideo.bridge_version == HTML_BRIDGE_VERSION,
                 ),
             ),
+            PublishedVideo.is_deleted == 0,
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
@@ -337,6 +338,7 @@ def _ordered_pool(db: Session, *, viewer_user_id: str | None = None) -> tuple[li
                     PublishedVideo.bridge_version == HTML_BRIDGE_VERSION,
                 ),
             ),
+            PublishedVideo.is_deleted == 0,
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
@@ -710,8 +712,8 @@ def post_video(
     items: list[FeedItemOut] = []
     for vid in video_ids:
         row = db.get(PublishedVideo, vid)
-        if row is None:
-            log.warning("video feed skip missing id=%s", vid)
+        if row is None or row.is_deleted != 0:
+            log.warning("video feed skip missing/deleted id=%s", vid)
             continue
         item = _item_from_published(
             db,
@@ -758,6 +760,7 @@ def post_video_detail(
     row = db.get(PublishedVideo, video_id)
     if (
         row is None
+        or row.is_deleted != 0
         or row.deleted_at is not None
         or row.review_status != "approved"
         or not row.distribution_enabled
@@ -822,6 +825,7 @@ def post_track(
     tracked = db.get(PublishedVideo, video_id)
     if (
         tracked is None
+        or tracked.is_deleted != 0
         or tracked.deleted_at is not None
         or tracked.review_status != "approved"
         or not tracked.distribution_enabled
@@ -860,7 +864,8 @@ def post_impression(
 
     video_id = payload.body.video_id.strip()
     impression_video = db.get(PublishedVideo, video_id) if video_id else None
-    if (not video_id or impression_video is None or impression_video.deleted_at is not None
+    if (not video_id or impression_video is None or impression_video.is_deleted != 0
+            or impression_video.deleted_at is not None
             or impression_video.review_status != "approved"
             or not impression_video.distribution_enabled):
         log.warning(

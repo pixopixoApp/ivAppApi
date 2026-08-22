@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -172,6 +173,9 @@ class RuntimeObjectPublishRequest(BaseModel):
     description: str = Field(default="", max_length=1200)
     feed_weight: int | None = None
     is_tutorial: bool | None = None
+    # Optional source timestamp supplied by ivadmin (runs.created_at). When set,
+    # it becomes the published_videos.created_at so admin list ordering is stable.
+    created_at: datetime | None = None
 
 
 class RuntimePreviewRequest(BaseModel):

@@ -131,6 +131,7 @@ def _clear_other_tutorials(db: Session, *, keep_video_id: str) -> None:
         db.query(PublishedVideo)
         .filter(
             PublishedVideo.is_tutorial.is_(True),
+            PublishedVideo.is_deleted == 0,
             PublishedVideo.id != keep_video_id,
         )
         .update({PublishedVideo.is_tutorial: False}, synchronize_session=False)
@@ -535,6 +536,10 @@ async def publish(
         str | None,
         Form(description="是否教学片；true/false；不传则新建 false、更新保持原值"),
     ] = None,
+    created_at: Annotated[
+        str | None,
+        Form(description="可选：源 runs.created_at（ISO8601），用于 published_videos.created_at"),
+    ] = None,
     timeline: Annotated[
         str | None, Form(description="single 模式：timeline JSON 字符串")
     ] = None,
@@ -663,6 +668,14 @@ async def publish(
         detail = f"interactions={n_interactions} bytes={len(raw)}"
 
     now = datetime.now(timezone.utc)
+    source_created_at = None
+    if created_at:
+        try:
+            source_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="created_at must be ISO8601")
+        if source_created_at.tzinfo is None:
+            source_created_at = source_created_at.replace(tzinfo=timezone.utc)
     weight = 0 if feed_weight is None else int(feed_weight)
     tutorial_flag = _parse_form_bool(is_tutorial)
     row = existing_row
@@ -688,7 +701,7 @@ async def publish(
                 content_source="pgc",
                 review_status="approved",
                 is_tutorial=tutorial_value,
-                created_at=now,
+                created_at=source_created_at or now,
                 updated_at=now,
             )
         )
@@ -856,10 +869,13 @@ def publish_assets(
 
     now = datetime.now(timezone.utc)
     updated = existing is not None
+    source_created_at = payload.created_at
+    if source_created_at is not None and source_created_at.tzinfo is None:
+        source_created_at = source_created_at.replace(tzinfo=timezone.utc)
     row = existing or PublishedVideo(
         id=item_id,
         content_type=CONTENT_TYPE_RUNTIME,
-        created_at=now,
+        created_at=source_created_at or now,
     )
     tutorial = bool(payload.is_tutorial) if payload.is_tutorial is not None else bool(row.is_tutorial)
     if tutorial:
@@ -884,6 +900,7 @@ def publish_assets(
     row.content_source = "pgc"
     row.review_status = "approved"
     row.is_tutorial = tutorial
+    row.is_deleted = 0
     row.deleted_at = None
     row.updated_at = now
     db.add(row)
@@ -1199,7 +1216,9 @@ def list_content_management(
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    q = db.query(PublishedVideo).filter(PublishedVideo.deleted_at.is_(None))
+    q = db.query(PublishedVideo).filter(
+        PublishedVideo.is_deleted == 0, PublishedVideo.deleted_at.is_(None)
+    )
     if source != "all":
         q = q.filter(PublishedVideo.content_source == source)
     if status != "all":
@@ -1217,7 +1236,7 @@ def get_content_management_detail(
     _: Annotated[None, Depends(require_publish_key)],
 ) -> dict[str, Any]:
     row = db.get(PublishedVideo, video_id)
-    if row is None or row.deleted_at is not None:
+    if row is None or row.is_deleted != 0 or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="video not found")
     detail = _content_management_out(db, settings, row)
     # This private endpoint is for operations only. It returns metadata/configuration, never media
@@ -1252,7 +1271,7 @@ def patch_content_management_detail(
     accidentally put an unfinished work back into the Feed.
     """
     row = db.get(PublishedVideo, video_id)
-    if row is None or row.deleted_at is not None:
+    if row is None or row.is_deleted != 0 or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="video not found")
     changed = payload.model_fields_set
     if not changed:
@@ -1331,7 +1350,7 @@ def get_video_metrics(
 ) -> dict[str, Any]:
     """Return compact operational metrics; raw client events stay out of normal UI reads."""
     row = db.get(PublishedVideo, video_id)
-    if row is None or row.deleted_at is not None:
+    if row is None or row.is_deleted != 0 or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="video not found")
 
     unique_view_count, first_viewed_at, last_viewed_at = (
@@ -1368,7 +1387,7 @@ def review_video(
     _: Annotated[None, Depends(require_publish_key)],
 ) -> dict[str, Any]:
     row = db.get(PublishedVideo, video_id)
-    if row is None or row.deleted_at is not None:
+    if row is None or row.is_deleted != 0 or row.deleted_at is not None:
         raise HTTPException(status_code=404, detail="video not found")
     if row.content_source != "ugc":
         raise HTTPException(status_code=409, detail="only UGC content requires review")
@@ -1491,7 +1510,7 @@ def get_video(
         raise HTTPException(status_code=400, detail="invalid video_id")
 
     row = db.get(PublishedVideo, video_id)
-    if row is None:
+    if row is None or row.is_deleted != 0:
         raise HTTPException(status_code=404, detail="video not found")
 
     log.info("get video video_id=%s version=%s", video_id, row.version)
@@ -1524,7 +1543,7 @@ def update_video_feed_weight(
         )
 
     row = db.get(PublishedVideo, video_id)
-    if row is None:
+    if row is None or row.is_deleted != 0:
         raise HTTPException(status_code=404, detail="video not found")
 
     if payload.feed_weight is not None:
@@ -1606,6 +1625,63 @@ def unpublish_video(
 
 
 @router.post(
+    "/videos/{video_id}/trash",
+    response_model=UnpublishResponse,
+    summary="标记删除（移入回收站）",
+    description="Header 需 X-Publish-Key。将 published_videos 对应记录标记为删除（软删除，写入 deleted_at），"
+    "不删除媒体文件，可恢复。不存在返回 HTTP 404。",
+)
+def trash_published_video(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> UnpublishResponse:
+    if not _is_valid_video_id(video_id):
+        raise HTTPException(status_code=400, detail="invalid video_id")
+
+    row = db.get(PublishedVideo, video_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="video not found")
+
+    if not bool(row.is_deleted) or row.deleted_at is None:
+        row.is_deleted = 1
+        row.deleted_at = datetime.now(timezone.utc)
+        row.distribution_enabled = False
+        row.updated_at = row.deleted_at
+        db.commit()
+    log.info("trash published video video_id=%s", video_id)
+    return UnpublishResponse(video_id=video_id, deleted=True)
+
+
+@router.post(
+    "/videos/{video_id}/restore",
+    response_model=UnpublishResponse,
+    summary="恢复已删除视频",
+    description="Header 需 X-Publish-Key。清除 published_videos 对应记录的删除标记（is_deleted/deleted_at），"
+    "并恢复分发。不存在或未删除返回 HTTP 404。",
+)
+def restore_published_video(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> UnpublishResponse:
+    if not _is_valid_video_id(video_id):
+        raise HTTPException(status_code=400, detail="invalid video_id")
+
+    row = db.get(PublishedVideo, video_id)
+    if row is None or (not bool(row.is_deleted) and row.deleted_at is None):
+        raise HTTPException(status_code=404, detail="video not found or not deleted")
+
+    row.is_deleted = 0
+    row.deleted_at = None
+    row.distribution_enabled = True
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    log.info("restore published video video_id=%s", video_id)
+    return UnpublishResponse(video_id=video_id, deleted=False)
+
+
+@router.post(
     "/videos/batch",
     response_model=BatchVideosResponse,
     summary="批量查询已发布视频",
@@ -1634,7 +1710,13 @@ def batch_videos(
     if not ordered and invalid:
         raise HTTPException(status_code=400, detail="no valid video_id")
 
-    rows = db.query(PublishedVideo).filter(PublishedVideo.id.in_(ordered)).all() if ordered else []
+    rows = (
+        db.query(PublishedVideo)
+        .filter(PublishedVideo.id.in_(ordered), PublishedVideo.is_deleted == 0)
+        .all()
+        if ordered
+        else []
+    )
     by_id = {row.id: row for row in rows}
     items = [_video_info(by_id[vid]) for vid in ordered if vid in by_id]
     missing = [vid for vid in ordered if vid not in by_id] + [v for v in invalid if v]

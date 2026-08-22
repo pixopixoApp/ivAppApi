@@ -1,5 +1,9 @@
 FROM python:3.12-slim-bookworm
 
+# Set to false to skip Playwright/Chromium (e.g. offline local builds).
+# HTML import browser QA then won't be available, but the API/worker run fine.
+ARG INSTALL_PLAYWRIGHT=true
+
 # Domestic Debian mirrors (DEB822), see apt.sources
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
 COPY apt.sources /etc/apt/sources.list.d/debian.sources
@@ -20,7 +24,10 @@ RUN pip install --no-cache-dir \
   -r /app/requirements.txt
 # The reviewed HTML import endpoint runs its browser QA before objects become
 # publishable. Chromium is installed in the image, never on the host volume.
-RUN playwright install --with-deps chromium
+# Skippable with --build-arg INSTALL_PLAYWRIGHT=false for offline local runs.
+RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then \
+      playwright install --with-deps chromium; \
+    fi
 
 COPY app /app/app
 COPY alembic.ini /app/alembic.ini
