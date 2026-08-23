@@ -68,6 +68,12 @@ def avatars_dir(settings: Settings) -> Path:
     return root
 
 
+def covers_dir(settings: Settings) -> Path:
+    root = Path(settings.media_root) / "covers"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def save_user_avatar(
     settings: Settings,
     *,
@@ -166,6 +172,101 @@ def store_user_avatar(
         )
     )
     return url, object_id
+
+
+def store_cover_image(
+    db: Session,
+    settings: Settings,
+    *,
+    raw: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> tuple[str, str]:
+    """Persist a published cover image into ivapp media storage (purpose=cover).
+
+    Returns (url, media_object_id). OSS mode stores to OSS + MediaObject; local
+    dev mode writes under MEDIA_ROOT/covers and records a MediaObject row.
+    """
+    if not raw:
+        raise AvatarStorageError("empty cover upload")
+    if len(raw) > MAX_AVATAR_BYTES:
+        raise AvatarStorageError("cover too large (max 2MB)")
+    ext = _resolve_ext(filename=filename, content_type=content_type)
+    media_type = _EXT_CONTENT_TYPE[ext]
+    digest = hashlib.sha256(raw).hexdigest()
+    now = datetime.now(timezone.utc)
+    object_id = digest  # local mode uses sha256 as object id; OSS keeps mo_ ids
+
+    if not media_mode_is_oss(settings):
+        # local mode: write file under MEDIA_ROOT/covers, keep a MediaObject row
+        directory = covers_dir(settings)
+        dest = directory / f"{object_id}.{ext}"
+        dest.write_bytes(raw)
+        key = f"covers/{object_id}.{ext}"
+        db.add(
+            MediaObject(
+                id=object_id,
+                upload_session_id=None,
+                purpose="cover",
+                origin="server_upload",
+                visibility="public",
+                state="ready",
+                staging_key=key,
+                object_key=key,
+                original_filename=filename or f"cover.{ext}",
+                content_type=media_type,
+                size_bytes=len(raw),
+                sha256=digest,
+                etag="",
+                extra_json={},
+                verified_at=now,
+                created_at=now,
+            )
+        )
+        url = f"/media/covers/{object_id}.{ext}"
+        return url, object_id
+
+    cover_id = f"mo_{secrets.token_urlsafe(18)}"
+    key = object_key(
+        settings,
+        "public",
+        "covers",
+        cover_id[-2:],
+        f"{cover_id}.{ext}",
+    )
+    url = upload_bytes(
+        settings,
+        key=key,
+        payload=raw,
+        content_type=media_type,
+        public=True,
+        immutable=True,
+        extra_headers={
+            "x-oss-meta-pixo-object-id": cover_id,
+            "x-oss-meta-sha256": digest,
+        },
+    )
+    db.add(
+        MediaObject(
+            id=cover_id,
+            upload_session_id=None,
+            purpose="cover",
+            origin="server_upload",
+            visibility="public",
+            state="ready",
+            staging_key=key,
+            object_key=key,
+            original_filename=filename or f"cover.{ext}",
+            content_type=media_type,
+            size_bytes=len(raw),
+            sha256=digest,
+            etag="",
+            extra_json={},
+            verified_at=now,
+            created_at=now,
+        )
+    )
+    return url, cover_id
 
 
 def resolve_avatar_path(settings: Settings, filename: str) -> Path:

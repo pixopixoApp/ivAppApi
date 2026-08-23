@@ -15,6 +15,7 @@ from app.avatar_storage import (
     AvatarStorageError,
     avatar_media_type,
     resolve_avatar_path,
+    store_cover_image,
     store_user_avatar,
 )
 from app.cdn_cache import enqueue_prefetch, html_package_public_urls
@@ -507,6 +508,39 @@ async def upload_user_avatar(
 
 
 @router.post(
+    "/publish-cover",
+    summary="Upload a published cover image into ivapp media storage",
+    description="Header 需 X-Publish-Key。multipart field `file`（jpg/png/webp，最大 2MB）。"
+    "返回 cover_media_object_id，供 publish-assets 写入 published_videos。",
+)
+async def publish_cover_upload(
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+    file: Annotated[UploadFile, File(description="封面图片文件")],
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        cover_url, media_object_id = store_cover_image(
+            db,
+            settings,
+            raw=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+        if media_object_id:
+            enqueue_prefetch(db, settings, [cover_url])
+        db.commit()
+    except AvatarStorageError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"cover_media_object_id": media_object_id, "cover_url": cover_url}
+
+
+@router.post(
     "/publish",
     response_model=PublishResponse,
     summary="发布视频或 Story",
@@ -893,6 +927,9 @@ def publish_assets(
     row.version = payload.version
     row.title = payload.title.strip()
     row.description = payload.description.strip()
+    row.cover_media_object_id = (
+        (payload.cover_media_object_id or "").strip() or None
+    )
     row.user_id = author_id
     row.content_mode = payload.content_mode
     if payload.feed_weight is not None or not updated:
