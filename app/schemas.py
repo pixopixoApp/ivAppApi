@@ -190,6 +190,8 @@ class ContentManagementUpdateRequest(BaseModel):
     description: str | None = Field(default=None, max_length=1200)
     timeline: dict[str, Any] | None = None
     review_status: Literal["draft", "approved"] | None = None
+    # 封面 media object id（已通过 /internal/v1/publish-cover 上传）；发布后换封面时由 ivadmin 回填。
+    cover_media_object_id: str | None = Field(default=None, max_length=64)
 
 
 class UserImpressionsOut(BaseModel):

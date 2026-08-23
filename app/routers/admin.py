@@ -15,6 +15,7 @@ from app.avatar_storage import (
     AvatarStorageError,
     avatar_media_type,
     resolve_avatar_path,
+    store_cover_image,
     store_user_avatar,
 )
 from app.cdn_cache import enqueue_prefetch, html_package_public_urls
@@ -51,7 +52,12 @@ from app.protocol_video import (
     compile_runtime_spec,
     read_runtime_spec,
 )
-from app.public_origin import canonicalize_public_payload, canonicalize_public_url
+from app.public_origin import (
+    PublicOriginError,
+    canonical_public_url_for_key,
+    canonicalize_public_payload,
+    canonicalize_public_url,
+)
 from app.publication_service import (
     RuntimeSourceAsset,
     load_published_runtime_urls,
@@ -507,6 +513,39 @@ async def upload_user_avatar(
 
 
 @router.post(
+    "/publish-cover",
+    summary="Upload a published cover image into ivapp media storage",
+    description="Header 需 X-Publish-Key。multipart field `file`（jpg/png/webp，最大 2MB）。"
+    "返回 cover_media_object_id，供 publish-assets 写入 published_videos。",
+)
+async def publish_cover_upload(
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    _: Annotated[None, Depends(require_publish_key)],
+    file: Annotated[UploadFile, File(description="封面图片文件")],
+) -> dict[str, Any]:
+    raw = await file.read()
+    try:
+        cover_url, media_object_id = store_cover_image(
+            db,
+            settings,
+            raw=raw,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+        if media_object_id:
+            enqueue_prefetch(db, settings, [cover_url])
+        db.commit()
+    except AvatarStorageError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"cover_media_object_id": media_object_id, "cover_url": cover_url}
+
+
+@router.post(
     "/publish",
     response_model=PublishResponse,
     summary="发布视频或 Story",
@@ -893,6 +932,9 @@ def publish_assets(
     row.version = payload.version
     row.title = payload.title.strip()
     row.description = payload.description.strip()
+    row.cover_media_object_id = (
+        (payload.cover_media_object_id or "").strip() or None
+    )
     row.user_id = author_id
     row.content_mode = payload.content_mode
     if payload.feed_weight is not None or not updated:
@@ -1173,10 +1215,15 @@ def _content_management_out(db: Session, settings: Settings, row: PublishedVideo
     if row.cover_media_object_id:
         cover = db.get(MediaObject, row.cover_media_object_id)
         if cover is not None:
+            # 封面是公开的 immutable 对象，直接给 CDN / 公开 OSS 的永久 URL，
+            # 避免使用 OSS 私有签名 URL（会过期、带签名参数，不适合 <img> 直用）。
             try:
-                cover_url = sign_get_url(settings, key=cover.object_key, expires_seconds=900)
-            except OssStorageError:
-                log.warning("content cover signing failed video_id=%s", row.id)
+                cover_url = canonical_public_url_for_key(settings, cover.object_key)
+            except (OssStorageError, PublicOriginError):
+                try:
+                    cover_url = public_url(settings, cover.object_key)
+                except OssStorageError:
+                    log.warning("content cover public url failed video_id=%s", row.id)
     creation = db.query(CreatorCreation).filter(CreatorCreation.published_video_id == row.id).one_or_none()
     return {
         "id": row.id,
@@ -1286,6 +1333,15 @@ def patch_content_management_detail(
         if payload.review_status == "draft":
             row.distribution_enabled = False
             row.is_tutorial = False
+
+    if "cover_media_object_id" in changed:
+        # 校验封面 media object 存在且可用（发布后由 ivadmin 通过 publish-cover 上传）。
+        cover_id = (payload.cover_media_object_id or "").strip() or None
+        if cover_id is not None:
+            cover = db.get(MediaObject, cover_id)
+            if cover is None or cover.purpose != "cover":
+                raise HTTPException(status_code=400, detail="cover media object not found")
+        row.cover_media_object_id = cover_id
 
     if "timeline" in changed:
         if row.content_type != CONTENT_TYPE_RUNTIME:

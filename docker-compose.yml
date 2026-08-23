@@ -46,6 +46,9 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # 本地：DB 迁移已到 head（20260819_0011），跳过 alembic 规避 revision 冲突；
+    # 生产请恢复 `alembic upgrade head && ...`（见 Dockerfile）
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100"]
     depends_on:
       mysql:
         condition: service_healthy
