@@ -46,6 +46,7 @@ from app.models import (
     VideoView,
 )
 from app.oss_storage import OssStorageError, public_url, sign_get_url
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
@@ -1001,13 +1002,21 @@ def preview_runtime(
     }
     if len(media_by_id) != len(declarations) or any(row.state != "ready" for row in media_by_id.values()):
         raise HTTPException(status_code=404, detail="one or more ready media objects were not found")
-    ttl = max(30, min(3600, settings.oss_private_get_ttl_seconds))
+    ttl = max(
+        30,
+        min(
+            3600,
+            settings.private_media_cdn_ttl_seconds
+            if settings.private_media_cdn_base_url.strip()
+            else settings.oss_private_get_ttl_seconds,
+        ),
+    )
     try:
         urls = {
             item.clip_id or "single": (
                 public_url(settings, media_by_id[item.media_object_id].object_key)
                 if media_by_id[item.media_object_id].visibility == "public"
-                else sign_get_url(
+                else sign_private_media_url(
                     settings,
                     key=media_by_id[item.media_object_id].object_key,
                     expires_seconds=ttl,

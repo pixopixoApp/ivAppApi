@@ -59,6 +59,10 @@ services:
     environment:
       DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MEDIA_CACHE_ENABLED: ${MEDIA_CACHE_ENABLED:-true}
+      MEDIA_CACHE_ROOT: /data/media-cache
+      CREATOR_LOCAL_UPLOAD_ENABLED: ${CREATOR_LOCAL_UPLOAD_ENABLED:-true}
+      CREATOR_LEGACY_OSS_UPLOAD_ENABLED: ${CREATOR_LEGACY_OSS_UPLOAD_ENABLED:-true}
     ports:
       - "${API_PORT:-8100}:8100"
     volumes:
@@ -66,6 +70,7 @@ services:
       - ./app:/app/app:ro
       - ./scripts:/app/scripts:ro
       - ${HTML_IMPORT_SPOOL_HOST_PATH:-./volumes/html-imports}:/data/html-imports
+      - ${MEDIA_CACHE_HOST_PATH:-/opt/play_video/shared/media-cache}:/data/media-cache
     networks:
       default:
       pixo-backend:

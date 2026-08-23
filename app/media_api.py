@@ -19,6 +19,7 @@ class InternalUploadSessionRequest(BaseModel):
     purpose: Literal[
         "admin_source",
         "admin_artifact",
+        "creator_video",
         "runtime_asset",
         "html_asset",
         "html_import_source",
@@ -45,6 +46,7 @@ class CreatorDirectUploadRequest(BaseModel):
     content_type: str = Field(default="video/mp4", min_length=1, max_length=128)
     size_bytes: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    supported_transports: list[str] = Field(default_factory=list, max_length=8)
 
 
 class DirectUploadPolicy(BaseModel):
@@ -56,12 +58,22 @@ class DirectUploadPolicy(BaseModel):
     expires_at: str
 
 
+class LocalResumableUploadPolicy(BaseModel):
+    method: Literal["PATCH"] = "PATCH"
+    url: str
+    chunk_size: int
+    offset: int = 0
+    expires_at: str
+
+
 class UploadSessionOut(BaseModel):
     session_id: str
     purpose: str
     state: str
     expires_at: str
-    uploads: list[DirectUploadPolicy]
+    transport: Literal["oss", "local-resumable-v1"] = "oss"
+    uploads: list[DirectUploadPolicy] = Field(default_factory=list)
+    upload: LocalResumableUploadPolicy | None = None
 
 
 class FinalizeUploadSessionRequest(BaseModel):

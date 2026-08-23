@@ -35,8 +35,12 @@ class AccountDeletionUnavailable(RuntimeError):
     """Deletion cannot complete without leaving remote creator data behind."""
 
 
-def _purge_remote_creations(settings: Settings, creation_ids: list[str]) -> None:
-    if not creation_ids:
+def _purge_remote_creations(
+    settings: Settings,
+    creation_ids: list[str],
+    upload_ids: list[str] | None = None,
+) -> None:
+    if not creation_ids and not upload_ids:
         return
     key = settings.creator_internal_key.strip()
     if not key:
@@ -52,6 +56,15 @@ def _purge_remote_creations(settings: Settings, creation_ids: list[str]) -> None
                 if response.status_code >= 400:
                     raise AccountDeletionUnavailable(
                         f"creator data cleanup failed with HTTP {response.status_code}"
+                    )
+            for upload_id in upload_ids or []:
+                response = client.delete(
+                    f"{base}/internal/v1/mobile-creator/normalizations/owners/creator_upload/{upload_id}",
+                    headers={"X-Creator-Internal-Key": key},
+                )
+                if response.status_code >= 400:
+                    raise AccountDeletionUnavailable(
+                        f"creator media cleanup failed with HTTP {response.status_code}"
                     )
     except httpx.HTTPError as exc:
         raise AccountDeletionUnavailable("creator data cleanup is temporarily unavailable") from exc
@@ -82,9 +95,8 @@ def delete_account_data(
         row.id
         for row in db.query(CreatorCreation.id).filter(CreatorCreation.user_id == user_id).all()
     ]
-    _purge_remote_creations(settings, creation_ids)
-
     upload_rows = db.query(CreatorUpload).filter(CreatorUpload.user_id == user_id).all()
+    _purge_remote_creations(settings, creation_ids, [row.id for row in upload_rows])
     video_ids = [
         row.id
         for row in db.query(PublishedVideo.id).filter(PublishedVideo.user_id == user_id).all()

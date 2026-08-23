@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
 from app.main import app
 from app.models import (
     CreatorAccessGrant,
@@ -82,6 +85,66 @@ def test_single_use_invite_permanently_grants_creator_access(db) -> None:
     assert redeemed.status_code == 200
     assert access.json()["granted"] is True
     assert access.json()["source"] == "invite"
+
+
+def test_creator_upload_uses_resumable_shared_local_cache(db, monkeypatch, tmp_path) -> None:
+    token = _login(db, user_id="local-upload-creator")
+    now = datetime.now(timezone.utc)
+    db.add(CreatorAccessGrant(user_id="local-upload-creator", source="test", granted_at=now))
+    db.commit()
+    payload = b"local-first-video"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setenv("MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MEDIA_CACHE_ROOT", str(tmp_path / "media-cache"))
+    monkeypatch.setenv("CREATOR_LOCAL_UPLOAD_ENABLED", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "app.routers.media_storage.probe_video",
+        lambda _path: SimpleNamespace(duration_ms=2_000),
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with TestClient(app) as client:
+        initialized = client.post(
+            "/api/v1/creator/uploads/init",
+            headers=headers,
+            json={
+                "filename": "clip.mp4",
+                "content_type": "video/mp4",
+                "size_bytes": len(payload),
+                "sha256": digest,
+                "supported_transports": ["local-resumable-v1"],
+            },
+        )
+        assert initialized.status_code == 201
+        policy = initialized.json()["upload"]
+        assert initialized.json()["transport"] == "local-resumable-v1"
+        first = client.patch(
+            policy["url"],
+            headers={**headers, "Upload-Offset": "0"},
+            content=payload[:5],
+        )
+        assert first.status_code == 204
+        resumed = client.head(policy["url"], headers=headers)
+        assert resumed.headers["Upload-Offset"] == "5"
+        second = client.patch(
+            policy["url"],
+            headers={**headers, "Upload-Offset": "5"},
+            content=payload[5:],
+        )
+        assert second.status_code == 204
+        finalized = client.post(
+            f"/api/v1/creator/uploads/{initialized.json()['session_id']}/finalize",
+            headers=headers,
+            json={},
+        )
+
+    assert finalized.status_code == 201
+    assert finalized.json()["upload_transport"] == "local-resumable-v1"
+    assert finalized.json()["normalization_status"] == "pending"
+    stored = tmp_path / "media-cache" / "objects" / digest[:2] / f"{digest}.cache"
+    assert stored.read_bytes() == payload
+    get_settings.cache_clear()
 
 
 def test_single_character_invite_code_can_grant_creator_access(db) -> None:
@@ -209,7 +272,7 @@ def test_creator_session_persists_version_fifo_and_restores_active_state(db) -> 
     assert [row.request_id for row in rows] == ["request-1", "request-2", "request-3"]
 
 
-def test_ready_creation_requires_confirmation_then_persists_final_runtime(db) -> None:
+def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, monkeypatch) -> None:
     token = _login(db)
     now = datetime.now(timezone.utc)
     db.add(CreatorAccessGrant(user_id="creator", source="test", granted_at=now))
@@ -218,6 +281,13 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db) ->
     private.mkdir(parents=True, exist_ok=True)
     source = private / "up_test.mp4"
     source.write_bytes(b"source-video")
+    playable_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    cache_root = media_root / "media-cache"
+    playable = cache_root / "objects" / playable_sha[:2] / f"{playable_sha}.cache"
+    playable.parent.mkdir(parents=True, exist_ok=True)
+    playable.write_bytes(source.read_bytes())
+    monkeypatch.setenv("MEDIA_CACHE_ROOT", str(cache_root))
+    get_settings.cache_clear()
     db.add(
         CreatorUpload(
             id="up_test",
@@ -226,6 +296,9 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db) ->
             original_filename="video.mp4",
             size_bytes=12,
             duration_ms=5000,
+            normalization_status="ready",
+            playable_sha256=playable_sha,
+            playable_size_bytes=source.stat().st_size,
             created_at=now,
         )
     )

@@ -10,6 +10,7 @@ from app.auth_user import AppAuthError
 from app.cdn_cache import validate_cdn_config
 from app.config import get_settings
 from app.logging_config import get_logger, setup_logging
+from app.media_cache import initialize_cache
 from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
 from app.routers import admin, feed, media_storage, platform, safety, user
@@ -29,6 +30,8 @@ async def lifespan(_app: FastAPI):
         Path(settings.media_root).mkdir(parents=True, exist_ok=True)
     else:
         validate_oss_config(settings)
+    if settings.media_cache_enabled:
+        initialize_cache(settings)
     validate_cdn_config(settings)
     log.info(
         "database migrations are managed by Alembic media_storage_mode=%s media_root=%s",

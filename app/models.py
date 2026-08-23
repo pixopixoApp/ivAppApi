@@ -323,6 +323,25 @@ class CreatorUpload(Base):
     media_object_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, unique=True, index=True
     )
+    source_local_uri: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    upload_transport: Mapped[str] = mapped_column(String(32), nullable=False, default="oss")
+    normalization_job_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", index=True
+    )
+    normalization_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", index=True
+    )
+    normalization_profile: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="mobile-v1"
+    )
+    normalization_error: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    playable_local_uri: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    playable_media_object_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    playable_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    playable_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -97,6 +97,12 @@ def test_creator_coordinator_uses_private_ivadmin_contract_for_initial_and_fifo_
         original_filename="video.mp4",
         size_bytes=source.stat().st_size,
         duration_ms=5_000,
+        source_sha256="a" * 64,
+        normalization_job_id="mnj-contract",
+        normalization_status="ready",
+        playable_local_uri="local-cache://sha256/" + "b" * 64,
+        playable_sha256="b" * 64,
+        playable_size_bytes=source.stat().st_size,
         created_at=now,
     )
     creation = CreatorCreation(
@@ -170,10 +176,14 @@ def test_creator_coordinator_uses_private_ivadmin_contract_for_initial_and_fifo_
     process_creator_version(db, settings, second)
 
     assert requests[0]["method"] == "POST"
-    assert requests[0]["url"].endswith("/internal/v1/mobile-creator/jobs")
+    assert requests[0]["url"].endswith("/internal/v1/mobile-creator/jobs/from-normalization")
     assert requests[0]["headers"]["X-Creator-Internal-Key"] == "creator-contract-key"
-    assert requests[0]["data"]["request_id"] == "contract-request-1"
-    assert requests[0]["files"]["video"][2] == "video/mp4"
+    assert requests[0]["json"] == {
+        "request_id": "contract-request-1",
+        "creation_id": "cr_contract",
+        "brief": "Add a tap",
+        "normalization_job_id": "mnj-contract",
+    }
     assert requests[1]["url"].endswith(
         "/internal/v1/mobile-creator/runs/run-contract/versions"
     )

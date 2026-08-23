@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import get_settings
-from app.media_api import DirectUploadObjectRequest
+from app.media_api import DirectUploadObjectRequest, InternalUploadSessionRequest
 from app.media_service import (
     MediaServiceError,
     create_upload_session,
@@ -47,6 +47,23 @@ def _oss_settings(monkeypatch):
     monkeypatch.setenv("OSS_ROOT_PREFIX", "ivapp-media/v1")
     get_settings.cache_clear()
     return get_settings()
+
+
+def test_internal_backup_contract_accepts_creator_original_and_playable() -> None:
+    request = InternalUploadSessionRequest(
+        purpose="creator_video",
+        target_id="upload_123",
+        objects=[
+            DirectUploadObjectRequest(
+                client_ref="playable.mp4",
+                filename="playable.mp4",
+                content_type="video/mp4",
+                size_bytes=1234,
+                sha256="a" * 64,
+            )
+        ],
+    )
+    assert request.purpose == "creator_video"
 
 
 def test_post_policy_is_exact_key_size_type_and_never_exposes_secret(monkeypatch) -> None:

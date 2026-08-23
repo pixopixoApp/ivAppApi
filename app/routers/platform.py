@@ -19,6 +19,7 @@ from app.cdn_cache import enqueue_prefetch
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
+from app.media_cache import local_path_for_sha256
 from app.media_service import MediaServiceError, media_mode_is_oss
 from app.models import (
     AppVersion,
@@ -32,7 +33,8 @@ from app.models import (
     PublishedVideo,
     User,
 )
-from app.oss_storage import OssStorageError, sign_get_url
+from app.oss_storage import OssStorageError
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
@@ -727,16 +729,18 @@ def public_creator_preview(
     row = db.get(CreatorUpload, upload_id)
     if row is None:
         raise HTTPException(status_code=404, detail="preview not found")
-    if row.media_object_id:
-        media = db.get(MediaObject, row.media_object_id)
+    if row.normalization_status != "ready" or not row.playable_sha256:
+        raise HTTPException(status_code=425, detail="preview is still being prepared")
+    if row.playable_media_object_id:
+        media = db.get(MediaObject, row.playable_media_object_id)
         if media is None or media.state != "ready":
             raise HTTPException(status_code=404, detail="preview not found")
         try:
             return RedirectResponse(
-                sign_get_url(
+                sign_private_media_url(
                     settings,
                     key=media.object_key,
-                    expires_seconds=settings.oss_private_get_ttl_seconds,
+                    expires_seconds=settings.private_media_cdn_ttl_seconds,
                     filename=row.original_filename,
                 ),
                 status_code=307,
@@ -744,13 +748,12 @@ def public_creator_preview(
             )
         except OssStorageError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if media_mode_is_oss(settings) and not settings.media_read_fallback_local:
-        raise HTTPException(status_code=404, detail="preview not found")
-    try:
-        path = LocalMediaStorage(settings).resolve(row.storage_key)
-    except StorageError as exc:
-        raise HTTPException(status_code=404, detail="preview not found") from exc
-    if not path.is_file():
+    path = local_path_for_sha256(
+        settings,
+        row.playable_sha256,
+        expected_size=row.playable_size_bytes,
+    )
+    if path is None:
         raise HTTPException(status_code=404, detail="preview not found")
     return FileResponse(
         path,
@@ -769,16 +772,18 @@ def preview_creator_upload(
     row = db.get(CreatorUpload, upload_id)
     if row is None or row.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="upload not found")
-    if row.media_object_id:
-        media = db.get(MediaObject, row.media_object_id)
+    if row.normalization_status != "ready" or not row.playable_sha256:
+        raise HTTPException(status_code=425, detail="upload media is still being prepared")
+    if row.playable_media_object_id:
+        media = db.get(MediaObject, row.playable_media_object_id)
         if media is None or media.state != "ready":
             raise HTTPException(status_code=404, detail="upload media missing")
         try:
             return RedirectResponse(
-                sign_get_url(
+                sign_private_media_url(
                     settings,
                     key=media.object_key,
-                    expires_seconds=settings.oss_private_get_ttl_seconds,
+                    expires_seconds=settings.private_media_cdn_ttl_seconds,
                     filename=row.original_filename,
                 ),
                 status_code=307,
@@ -786,13 +791,12 @@ def preview_creator_upload(
             )
         except OssStorageError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if media_mode_is_oss(settings) and not settings.media_read_fallback_local:
-        raise HTTPException(status_code=404, detail="upload media missing")
-    try:
-        path = LocalMediaStorage(settings).resolve(row.storage_key)
-    except StorageError as exc:
-        raise HTTPException(status_code=404, detail="upload not found") from exc
-    if not path.is_file():
+    path = local_path_for_sha256(
+        settings,
+        row.playable_sha256,
+        expected_size=row.playable_size_bytes,
+    )
+    if path is None:
         raise HTTPException(status_code=404, detail="upload media missing")
     return FileResponse(path, media_type="video/mp4", filename=row.original_filename)
 
@@ -1155,19 +1159,21 @@ def publish_creation(
         raise HTTPException(status_code=409, detail="source upload is missing")
     if db.get(PublishedVideo, row.id) is not None:
         raise HTTPException(status_code=409, detail="published video id already exists")
+    if upload.normalization_status != "ready" or not upload.playable_sha256:
+        raise HTTPException(status_code=409, detail="source video is still being normalized")
 
     final_url = f"/media/{row.id}.mp4"
     publication_id = None
     prefetch_urls: list[str] = []
     if media_mode_is_oss(settings):
-        if not upload.media_object_id:
+        if not upload.playable_media_object_id:
             raise HTTPException(
                 status_code=409,
-                detail="source upload has not been migrated to OSS",
+                detail="playable video backup is still in progress",
             )
-        source_media = db.get(MediaObject, upload.media_object_id)
+        source_media = db.get(MediaObject, upload.playable_media_object_id)
         if source_media is None:
-            raise HTTPException(status_code=409, detail="source media object is missing")
+            raise HTTPException(status_code=409, detail="playable media object is missing")
         try:
             published_assets = publish_runtime_assets(
                 db,
@@ -1204,10 +1210,14 @@ def publish_creation(
     try:
         copied_url = final_url
         if storage is not None:
-            destination, copied_url = storage.publish_copy(
-                source_key=upload.storage_key,
-                item_id=row.id,
+            playable_path = local_path_for_sha256(
+                settings,
+                upload.playable_sha256,
+                expected_size=upload.playable_size_bytes,
             )
+            if playable_path is None:
+                raise StorageError("normalized video is missing")
+            destination, copied_url = storage.publish_file(source=playable_path, item_id=row.id)
         published = PublishedVideo(
             id=row.id,
             content_type="runtime",

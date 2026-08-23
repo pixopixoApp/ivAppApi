@@ -129,6 +129,12 @@ class CreatorUploadOut(BaseModel):
     duration_ms: int
     preview_url: str
     created_at: str
+    upload_transport: str = "oss"
+    normalization_status: str = "pending"
+    normalization_progress_percent: int = 0
+    normalization_profile: str = "mobile-v1"
+    playable_size_bytes: int | None = None
+    normalization_error: str = ""
 
 
 class CreatorCreationRequest(BaseModel):

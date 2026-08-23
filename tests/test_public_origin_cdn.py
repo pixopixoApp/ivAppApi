@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 
 import pytest
@@ -21,6 +22,7 @@ from app.models import (
     PublishedVideo,
     User,
 )
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
 from app.public_origin import (
     PublicOriginError,
@@ -82,12 +84,33 @@ def test_public_url_canonicalizer_is_allowlisted_and_signature_safe(monkeypatch)
         settings,
         "https://third-party.example/ivapp-media/v1/public/video.mp4",
     ).startswith("https://third-party.example")
-
     payload = {"video": [{"video": old_video}], "external": "https://example.test/a"}
     replacement = canonicalize_public_payload(settings, payload)
     assert replacement["video"][0]["video"].startswith(CDN)
     assert replacement["external"] == payload["external"]
     assert payload["video"][0]["video"].startswith(OLD_OSS)
+
+
+def test_private_media_url_uses_short_lived_cdn_type_a_signature(monkeypatch) -> None:
+    settings = _settings(monkeypatch)
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_BASE_URL", "https://private-video.pixopixo.cn")
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_AUTH_KEY", "cdn-secret")
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_AUTH_UID", "0")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr("app.private_cdn.time.time", lambda: 1_700_000_000)
+    monkeypatch.setattr("app.private_cdn.secrets.token_hex", lambda _length: "nonce")
+    key = "ivapp-media/v1/private/creator-sources/aa/source.mp4"
+    timestamp = 1_700_000_000
+    path = f"/{key}"
+    digest = hashlib.md5(
+        f"{path}-{timestamp}-nonce-0-cdn-secret".encode()
+    ).hexdigest()
+
+    assert sign_private_media_url(settings, key=key, expires_seconds=120) == (
+        f"https://private-video.pixopixo.cn{path}"
+        f"?auth_key={timestamp}-nonce-0-{digest}"
+    )
 
 
 def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, db) -> None:
