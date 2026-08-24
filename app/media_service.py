@@ -22,6 +22,7 @@ from app.media_api import (
     FinalizedUploadSessionOut,
     UploadSessionOut,
 )
+from app.media_cache import local_path_for_sha256, valid_sha256
 from app.models import MediaObject, MediaUploadSession
 from app.oss_storage import (
     OssImmutableConflictError,
@@ -601,6 +602,25 @@ def _verify_and_promote(
     return item, metadata.etag or "", updates
 
 
+def _matches_shared_local_cache(
+    settings: Settings,
+    session_context: dict,
+    item: MediaObject,
+) -> bool:
+    """Verify an internal backup against the cache mounted by both services."""
+    if not settings.media_cache_enabled:
+        return False
+    declared = valid_sha256(str(session_context.get("local_sha256") or ""))
+    if declared is None or declared != item.sha256:
+        return False
+    path = local_path_for_sha256(
+        settings,
+        declared,
+        expected_size=item.size_bytes,
+    )
+    return path is not None and _sha256_file(path) == declared
+
+
 def finalize_upload_session(
     db: Session,
     settings: Settings,
@@ -661,6 +681,10 @@ def finalize_upload_session(
                     )
                 )
             )
+            locally_verified = {
+                item.id: _matches_shared_local_cache(settings, context, item)
+                for item in pending
+            }
             concurrency = max(1, min(settings.oss_max_concurrency, len(pending) or 1))
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [
@@ -670,7 +694,7 @@ def finalize_upload_session(
                         context,
                         root,
                         item,
-                        not trusted_server_upload,
+                        not trusted_server_upload and not locally_verified[item.id],
                     )
                     for item in pending
                 ]
