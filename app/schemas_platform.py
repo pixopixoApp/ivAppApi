@@ -196,6 +196,7 @@ class CreatorPublishResponse(BaseModel):
     status: Literal["published", "pending_review"]
     runtime_spec_version: str
     share_url: str
+    cdn_status: Literal["ready", "warming", "failed"] = "ready"
 
 
 class CreatorPublishedMutationOut(BaseModel):

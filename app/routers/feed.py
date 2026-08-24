@@ -118,6 +118,8 @@ def _item_from_published(
         return None
     if not bool(getattr(row, "distribution_enabled", True)):
         return None
+    if not bool(getattr(row, "cdn_ready", True)):
+        return None
     avatar_url = ""
     nickname = ""
     if row.user_id:
@@ -248,6 +250,7 @@ def list_published_items(
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
+            PublishedVideo.cdn_ready.is_(True),
             or_(
                 PublishedVideo.user_id.is_(None),
                 PublishedVideo.user_id == "",
@@ -342,6 +345,7 @@ def _ordered_pool(db: Session, *, viewer_user_id: str | None = None) -> tuple[li
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
+            PublishedVideo.cdn_ready.is_(True),
         )
         .order_by(PublishedVideo.feed_weight.desc(), PublishedVideo.created_at.desc(), PublishedVideo.id.asc())
         .all()
@@ -764,6 +768,7 @@ def post_video_detail(
         or row.deleted_at is not None
         or row.review_status != "approved"
         or not row.distribution_enabled
+        or not row.cdn_ready
     ):
         log.warning("video_detail missing video_id=%s", video_id)
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
@@ -829,6 +834,7 @@ def post_track(
         or tracked.deleted_at is not None
         or tracked.review_status != "approved"
         or not tracked.distribution_enabled
+        or not tracked.cdn_ready
     ):
         log.warning("track unknown video_id=%s token=%s", video_id, token)
         return track_error(ver=settings.server_ver, head_in=payload.head)
@@ -867,7 +873,8 @@ def post_impression(
     if (not video_id or impression_video is None or impression_video.is_deleted != 0
             or impression_video.deleted_at is not None
             or impression_video.review_status != "approved"
-            or not impression_video.distribution_enabled):
+            or not impression_video.distribution_enabled
+            or not impression_video.cdn_ready):
         log.warning(
             "impression invalid video_id=%s user_id=%s",
             video_id,

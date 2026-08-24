@@ -79,6 +79,12 @@ class PublishedVideo(Base):
     distribution_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, index=True
     )
+    # Runtime objects are never exposed to public read paths until Alibaba CDN
+    # reports that the immutable publication URL has finished prefetching.
+    # Existing rows are ready by definition; newly staged rows start false.
+    cdn_ready: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1", index=True
+    )
     # Origin and review state are deliberately stored on the published unit rather
     # than inferred from users/runs.  A user may later change identity and an HTML
     # package has no Run, while the feed must make one cheap, authoritative query.
@@ -579,4 +585,39 @@ class CdnCacheJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CdnPublicationGate(Base):
+    """Stage an immutable runtime publication until every CDN URL is warm."""
+
+    __tablename__ = "cdn_publication_gates"
+    __table_args__ = (
+        Index("ix_cdn_publication_gates_video", "video_id", "state"),
+        CheckConstraint(
+            "state IN ('warming', 'active', 'failed', 'superseded')",
+            name="ck_cdn_publication_gates_state",
+        ),
+    )
+
+    publication_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    urls: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    staged_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="warming", index=True
+    )
+    error_message: Mapped[str] = mapped_column(
+        String(500), nullable=False, default=""
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

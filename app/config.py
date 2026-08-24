@@ -135,12 +135,18 @@ class Settings(BaseSettings):
     html_import_progress_timeout_seconds: float = 10.0
 
     # CDN cache work is persisted in MySQL and submitted asynchronously. The
-    # worker uses an ECS RAM role; long-lived OSS keys are never reused here.
+    # worker uses an ECS RAM role or an explicitly configured CDN-capable RAM
+    # key. A dedicated least-privilege principal remains preferred.
     cdn_cache_enabled: bool = False
     cdn_prefetch_on_publish: bool = True
     cdn_domain: str = ""
     cdn_api_region: str = "cn-hangzhou"
+    # Prefer an ECS RAM role. These optional keys also support an existing
+    # runtime RAM principal after operations intentionally grants CDN access.
+    aliyun_cdn_access_key_id: str = ""
+    aliyun_cdn_access_key_secret: str = ""
     cdn_worker_poll_seconds: float = 2.0
+    cdn_provider_poll_seconds: float = 10.0
     cdn_worker_batch_size: int = 50
     cdn_worker_max_attempts: int = 6
     cdn_worker_lease_seconds: int = 300
