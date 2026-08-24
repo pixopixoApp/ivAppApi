@@ -16,12 +16,21 @@ from sqlalchemy.orm import Session
 from app.account_deletion import AccountDeletionUnavailable, delete_account_data
 from app.auth_user import AppUser, require_bearer_user
 from app.cdn_cache import enqueue_prefetch
+from app.cdn_publication import (
+    CdnPublicationError,
+    activate_ready_publications,
+    cancel_warming_publications,
+    require_runtime_cdn_gate,
+    stage_publication_gate,
+)
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
+from app.media_cache import local_path_for_sha256
 from app.media_service import MediaServiceError, media_mode_is_oss
 from app.models import (
     AppVersion,
+    CdnPublicationGate,
     CreatorAccessGrant,
     CreatorApplication,
     CreatorCreation,
@@ -32,7 +41,8 @@ from app.models import (
     PublishedVideo,
     User,
 )
-from app.oss_storage import OssStorageError, sign_get_url
+from app.oss_storage import OssStorageError
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
@@ -727,16 +737,18 @@ def public_creator_preview(
     row = db.get(CreatorUpload, upload_id)
     if row is None:
         raise HTTPException(status_code=404, detail="preview not found")
-    if row.media_object_id:
-        media = db.get(MediaObject, row.media_object_id)
+    if row.normalization_status != "ready" or not row.playable_sha256:
+        raise HTTPException(status_code=425, detail="preview is still being prepared")
+    if row.playable_media_object_id:
+        media = db.get(MediaObject, row.playable_media_object_id)
         if media is None or media.state != "ready":
             raise HTTPException(status_code=404, detail="preview not found")
         try:
             return RedirectResponse(
-                sign_get_url(
+                sign_private_media_url(
                     settings,
                     key=media.object_key,
-                    expires_seconds=settings.oss_private_get_ttl_seconds,
+                    expires_seconds=settings.private_media_cdn_ttl_seconds,
                     filename=row.original_filename,
                 ),
                 status_code=307,
@@ -744,13 +756,12 @@ def public_creator_preview(
             )
         except OssStorageError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if media_mode_is_oss(settings) and not settings.media_read_fallback_local:
-        raise HTTPException(status_code=404, detail="preview not found")
-    try:
-        path = LocalMediaStorage(settings).resolve(row.storage_key)
-    except StorageError as exc:
-        raise HTTPException(status_code=404, detail="preview not found") from exc
-    if not path.is_file():
+    path = local_path_for_sha256(
+        settings,
+        row.playable_sha256,
+        expected_size=row.playable_size_bytes,
+    )
+    if path is None:
         raise HTTPException(status_code=404, detail="preview not found")
     return FileResponse(
         path,
@@ -769,16 +780,18 @@ def preview_creator_upload(
     row = db.get(CreatorUpload, upload_id)
     if row is None or row.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="upload not found")
-    if row.media_object_id:
-        media = db.get(MediaObject, row.media_object_id)
+    if row.normalization_status != "ready" or not row.playable_sha256:
+        raise HTTPException(status_code=425, detail="upload media is still being prepared")
+    if row.playable_media_object_id:
+        media = db.get(MediaObject, row.playable_media_object_id)
         if media is None or media.state != "ready":
             raise HTTPException(status_code=404, detail="upload media missing")
         try:
             return RedirectResponse(
-                sign_get_url(
+                sign_private_media_url(
                     settings,
                     key=media.object_key,
-                    expires_seconds=settings.oss_private_get_ttl_seconds,
+                    expires_seconds=settings.private_media_cdn_ttl_seconds,
                     filename=row.original_filename,
                 ),
                 status_code=307,
@@ -786,13 +799,12 @@ def preview_creator_upload(
             )
         except OssStorageError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if media_mode_is_oss(settings) and not settings.media_read_fallback_local:
-        raise HTTPException(status_code=404, detail="upload media missing")
-    try:
-        path = LocalMediaStorage(settings).resolve(row.storage_key)
-    except StorageError as exc:
-        raise HTTPException(status_code=404, detail="upload not found") from exc
-    if not path.is_file():
+    path = local_path_for_sha256(
+        settings,
+        row.playable_sha256,
+        expected_size=row.playable_size_bytes,
+    )
+    if path is None:
         raise HTTPException(status_code=404, detail="upload media missing")
     return FileResponse(path, media_type="video/mp4", filename=row.original_filename)
 
@@ -1132,12 +1144,25 @@ def publish_creation(
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="preview confirmation is required")
     row = _owned_creation(db, creation_id, user.user_id)
-    if row.status == "published" and row.published_video_id:
+    if row.status in {"published", "pending_review"} and row.published_video_id:
+        existing_video = db.get(PublishedVideo, row.published_video_id)
+        gate = (
+            db.query(CdnPublicationGate)
+            .filter(CdnPublicationGate.video_id == row.published_video_id)
+            .order_by(CdnPublicationGate.created_at.desc())
+            .first()
+        )
+        cdn_status = (
+            "ready"
+            if existing_video is not None and bool(existing_video.cdn_ready)
+            else ("failed" if gate is not None and gate.state == "failed" else "warming")
+        )
         return CreatorPublishResponse(
             video_id=row.published_video_id,
-            status="published",
+            status=("published" if row.status == "published" else "pending_review"),
             runtime_spec_version=row.runtime_spec_version or RUNTIME_SPEC_VERSION,
             share_url=_share_url(settings, row.published_video_id),
+            cdn_status=cdn_status,
         )
     versions = _creation_versions(db, row.id)
     version = (
@@ -1155,19 +1180,27 @@ def publish_creation(
         raise HTTPException(status_code=409, detail="source upload is missing")
     if db.get(PublishedVideo, row.id) is not None:
         raise HTTPException(status_code=409, detail="published video id already exists")
+    if upload.normalization_status != "ready" or not upload.playable_sha256:
+        raise HTTPException(status_code=409, detail="source video is still being normalized")
+
+    if media_mode_is_oss(settings):
+        try:
+            require_runtime_cdn_gate(settings)
+        except CdnPublicationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     final_url = f"/media/{row.id}.mp4"
     publication_id = None
     prefetch_urls: list[str] = []
     if media_mode_is_oss(settings):
-        if not upload.media_object_id:
+        if not upload.playable_media_object_id:
             raise HTTPException(
                 status_code=409,
-                detail="source upload has not been migrated to OSS",
+                detail="playable video backup is still in progress",
             )
-        source_media = db.get(MediaObject, upload.media_object_id)
+        source_media = db.get(MediaObject, upload.playable_media_object_id)
         if source_media is None:
-            raise HTTPException(status_code=409, detail="source media object is missing")
+            raise HTTPException(status_code=409, detail="playable media object is missing")
         try:
             published_assets = publish_runtime_assets(
                 db,
@@ -1204,10 +1237,14 @@ def publish_creation(
     try:
         copied_url = final_url
         if storage is not None:
-            destination, copied_url = storage.publish_copy(
-                source_key=upload.storage_key,
-                item_id=row.id,
+            playable_path = local_path_for_sha256(
+                settings,
+                upload.playable_sha256,
+                expected_size=upload.playable_size_bytes,
             )
+            if playable_path is None:
+                raise StorageError("normalized video is missing")
+            destination, copied_url = storage.publish_file(source=playable_path, item_id=row.id)
         published = PublishedVideo(
             id=row.id,
             content_type="runtime",
@@ -1225,6 +1262,7 @@ def publish_creation(
             user_id=user.user_id,
             content_mode="single",
             feed_weight=0,
+            cdn_ready=not media_mode_is_oss(settings),
             content_source="ugc",
             review_status="pending",
             is_tutorial=False,
@@ -1248,6 +1286,22 @@ def publish_creation(
             db.add(version)
         row.updated_at = now
         enqueue_prefetch(db, settings, prefetch_urls)
+        gate = None
+        if media_mode_is_oss(settings):
+            if not publication_id:
+                raise CdnPublicationError("runtime publication id is missing")
+            gate = stage_publication_gate(
+                db,
+                video_id=row.id,
+                publication_id=publication_id,
+                urls=prefetch_urls,
+                # Moderation may change review fields while the CDN warms. The
+                # creator row already has its final runtime payload, so only
+                # the readiness bit is released by the gate.
+                staged_payload={},
+            )
+            db.flush()
+            activate_ready_publications(db, publication_ids=[publication_id])
         db.commit()
     except Exception:
         db.rollback()
@@ -1259,6 +1313,11 @@ def publish_creation(
         status="pending_review",
         runtime_spec_version=RUNTIME_SPEC_VERSION,
         share_url=_share_url(settings, row.id),
+        cdn_status=(
+            "ready"
+            if not media_mode_is_oss(settings) or (gate is not None and gate.state == "active")
+            else ("failed" if gate is not None and gate.state == "failed" else "warming")
+        ),
     )
 
 
@@ -1278,6 +1337,11 @@ def delete_published_video(
     if not bool(video.is_deleted) or video.deleted_at is None:
         video.is_deleted = 1
         video.deleted_at = _now()
+        cancel_warming_publications(
+            db,
+            video_id=video_id,
+            reason="creator deleted the publication while CDN was warming",
+        )
         creation = db.get(CreatorCreation, video_id)
         if creation is not None and creation.user_id == user.user_id:
             creation.status = "deleted"
@@ -1329,6 +1393,7 @@ def creator_share_page(
         or video.is_deleted != 0
         or video.deleted_at is not None
         or not video.distribution_enabled
+        or not video.cdn_ready
     ):
         raise HTTPException(status_code=404, detail="video not found")
     title = html.escape(video.title or "Pixo interactive video")

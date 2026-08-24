@@ -129,6 +129,12 @@ class CreatorUploadOut(BaseModel):
     duration_ms: int
     preview_url: str
     created_at: str
+    upload_transport: str = "oss"
+    normalization_status: str = "pending"
+    normalization_progress_percent: int = 0
+    normalization_profile: str = "mobile-v1"
+    playable_size_bytes: int | None = None
+    normalization_error: str = ""
 
 
 class CreatorCreationRequest(BaseModel):
@@ -190,6 +196,7 @@ class CreatorPublishResponse(BaseModel):
     status: Literal["published", "pending_review"]
     runtime_spec_version: str
     share_url: str
+    cdn_status: Literal["ready", "warming", "failed"] = "ready"
 
 
 class CreatorPublishedMutationOut(BaseModel):

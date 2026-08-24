@@ -43,12 +43,20 @@ class CdnSubmission:
     request_id: str
 
 
+@dataclass(frozen=True)
+class CdnTaskResult:
+    state: Literal["pending", "succeeded", "failed"]
+    error_message: str = ""
+
+
 class CdnProvider(Protocol):
     def submit(
         self,
         operation: CacheOperation,
         urls: list[str],
     ) -> CdnSubmission: ...
+
+    def status(self, task_id: str) -> CdnTaskResult: ...
 
 
 def _now() -> datetime:
@@ -65,6 +73,14 @@ def validate_cdn_config(settings: Settings) -> None:
         raise CdnCacheError("CDN_WORKER_BATCH_SIZE must be between 1 and 100")
     if int(settings.cdn_worker_max_attempts) < 1:
         raise CdnCacheError("CDN_WORKER_MAX_ATTEMPTS must be positive")
+    if float(settings.cdn_provider_poll_seconds) <= 0:
+        raise CdnCacheError("CDN_PROVIDER_POLL_SECONDS must be positive")
+    if bool(settings.aliyun_cdn_access_key_id) != bool(
+        settings.aliyun_cdn_access_key_secret
+    ):
+        raise CdnCacheError(
+            "ALIYUN_CDN_ACCESS_KEY_ID and ALIYUN_CDN_ACCESS_KEY_SECRET must be set together"
+        )
 
 
 def _job_id(operation: CacheOperation, url_hash: str) -> str:
@@ -196,6 +212,7 @@ def active_public_urls(db: Session, settings: Settings) -> list[str]:
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
+            PublishedVideo.cdn_ready.is_(True),
             MediaObject.visibility == "public",
             MediaObject.state == "ready",
         )
@@ -210,6 +227,7 @@ def active_public_urls(db: Session, settings: Settings) -> list[str]:
             PublishedVideo.deleted_at.is_(None),
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
+            PublishedVideo.cdn_ready.is_(True),
             MediaObject.visibility == "public",
             MediaObject.state == "ready",
         )
@@ -245,13 +263,19 @@ class AlibabaCdnProvider:
             raise CdnCacheError("Alibaba Cloud CDN SDK is not installed") from exc
 
         role_name = os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "").strip()
-        credentials = CredentialsClient(
-            CredentialsConfig(
+        if settings.aliyun_cdn_access_key_id:
+            credentials_config = CredentialsConfig(
+                type="access_key",
+                access_key_id=settings.aliyun_cdn_access_key_id,
+                access_key_secret=settings.aliyun_cdn_access_key_secret,
+            )
+        else:
+            credentials_config = CredentialsConfig(
                 type="ecs_ram_role",
                 role_name=role_name or None,
                 disable_imds_v1=True,
             )
-        )
+        credentials = CredentialsClient(credentials_config)
         self._client = CdnClient(
             OpenApiConfig(
                 credential=credentials,
@@ -295,6 +319,39 @@ class AlibabaCdnProvider:
             )
         raise CdnCacheError("unsupported CDN cache operation")
 
+    def status(self, task_id: str) -> CdnTaskResult:
+        if not task_id.strip():
+            raise CdnCacheError("CDN task id is empty")
+        from alibabacloud_cdn20180510 import models
+
+        response = self._client.describe_refresh_task_by_id(
+            models.DescribeRefreshTaskByIdRequest(task_id=task_id)
+        )
+        tasks = list(response.body.tasks or [])
+        # The task can be briefly absent immediately after PushObjectCache
+        # returns. Treat that provider consistency window as still pending.
+        if not tasks:
+            return CdnTaskResult(state="pending")
+        statuses = {str(item.status or "").strip().lower() for item in tasks}
+        terminal_failures = {"failed", "timeout", "canceled"}
+        failed_statuses = statuses & terminal_failures
+        if failed_statuses:
+            details = [
+                str(item.description or "").strip()
+                for item in tasks
+                if str(item.status or "").strip().lower() in terminal_failures
+            ]
+            return CdnTaskResult(
+                state="failed",
+                error_message=next(
+                    (item for item in details if item),
+                    f"CDN task ended with {','.join(sorted(failed_statuses))}",
+                ),
+            )
+        if statuses == {"complete"}:
+            return CdnTaskResult(state="succeeded")
+        return CdnTaskResult(state="pending")
+
 
 def _claim_jobs(db: Session, settings: Settings) -> list[str]:
     now = _now()
@@ -302,7 +359,10 @@ def _claim_jobs(db: Session, settings: Settings) -> list[str]:
     rows = (
         db.query(CdnCacheJob)
         .filter(
-            CdnCacheJob.attempts < settings.cdn_worker_max_attempts,
+            or_(
+                CdnCacheJob.provider_task_id != "",
+                CdnCacheJob.attempts < settings.cdn_worker_max_attempts,
+            ),
             or_(
                 and_(
                     CdnCacheJob.state == "pending",
@@ -322,7 +382,9 @@ def _claim_jobs(db: Session, settings: Settings) -> list[str]:
     )
     for row in rows:
         row.state = "running"
-        row.attempts += 1
+        # Attempts count provider submissions, not harmless status polls.
+        if not row.provider_task_id:
+            row.attempts += 1
         row.lease_expires_at = lease_until
         row.updated_at = now
         db.add(row)
@@ -330,7 +392,7 @@ def _claim_jobs(db: Session, settings: Settings) -> list[str]:
     return [row.id for row in rows]
 
 
-def _finish_group(
+def _record_submission(
     db: Session,
     settings: Settings,
     job_ids: list[str],
@@ -345,19 +407,71 @@ def _finish_group(
             continue
         row.lease_expires_at = None
         if error is None and submission is not None:
-            row.state = "succeeded"
-            row.provider_task_id = submission.task_id[:255]
-            row.request_id = submission.request_id[:128]
-            row.error_message = ""
-        else:
+            if not submission.task_id.strip():
+                error = CdnCacheError("CDN provider returned an empty task id")
+            else:
+                row.state = "pending"
+                row.provider_task_id = submission.task_id[:255]
+                row.request_id = submission.request_id[:128]
+                row.error_message = ""
+                row.next_attempt_at = now + timedelta(
+                    seconds=max(1.0, float(settings.cdn_provider_poll_seconds))
+                )
+        if error is not None or submission is None:
             message = str(error or "unknown CDN provider failure")[:500]
             row.error_message = message
+            row.provider_task_id = ""
             if row.attempts >= settings.cdn_worker_max_attempts:
                 row.state = "failed"
             else:
                 row.state = "pending"
                 delay = min(3600, 5 * (2 ** max(0, row.attempts - 1)))
                 row.next_attempt_at = now + timedelta(seconds=delay)
+        row.updated_at = now
+        db.add(row)
+    db.commit()
+
+
+def _record_task_status(
+    db: Session,
+    settings: Settings,
+    job_ids: list[str],
+    *,
+    result: CdnTaskResult | None,
+    error: Exception | None,
+) -> None:
+    now = _now()
+    for job_id in job_ids:
+        row = db.get(CdnCacheJob, job_id)
+        if row is None:
+            continue
+        row.lease_expires_at = None
+        if error is not None or result is None:
+            # A DescribeRefreshTaskById transport failure does not mean that
+            # the already accepted prefetch failed. Keep polling the same task.
+            row.state = "pending"
+            row.error_message = str(error or "CDN task status unavailable")[:500]
+            row.next_attempt_at = now + timedelta(
+                seconds=max(5.0, float(settings.cdn_provider_poll_seconds))
+            )
+        elif result.state == "succeeded":
+            row.state = "succeeded"
+            row.error_message = ""
+        elif result.state == "failed":
+            row.error_message = (result.error_message or "CDN prefetch failed")[:500]
+            row.provider_task_id = ""
+            if row.attempts >= settings.cdn_worker_max_attempts:
+                row.state = "failed"
+            else:
+                row.state = "pending"
+                delay = min(3600, 5 * (2 ** max(0, row.attempts - 1)))
+                row.next_attempt_at = now + timedelta(seconds=delay)
+        else:
+            row.state = "pending"
+            row.error_message = ""
+            row.next_attempt_at = now + timedelta(
+                seconds=max(1.0, float(settings.cdn_provider_poll_seconds))
+            )
         row.updated_at = now
         db.add(row)
     db.commit()
@@ -373,11 +487,31 @@ def process_once(
         return 0
     job_ids = _claim_jobs(db, settings)
     if not job_ids:
-        return 0
+        from app.cdn_publication import activate_ready_publications
+
+        activated = activate_ready_publications(db)
+        if activated:
+            db.commit()
+        return activated
     rows = [row for job_id in job_ids if (row := db.get(CdnCacheJob, job_id))]
     client = provider or AlibabaCdnProvider(settings)
+    submitted = [row for row in rows if row.provider_task_id]
+    unsubmitted = [row for row in rows if not row.provider_task_id]
+    by_task: dict[str, list[CdnCacheJob]] = {}
+    for row in submitted:
+        by_task.setdefault(row.provider_task_id, []).append(row)
+    for task_id, group in by_task.items():
+        ids = [row.id for row in group]
+        try:
+            result = client.status(task_id)
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            _record_task_status(db, settings, ids, result=None, error=exc)
+        else:
+            _record_task_status(db, settings, ids, result=result, error=None)
+
     for operation in ("prefetch", "refresh"):
-        group = [row for row in rows if row.operation == operation]
+        group = [row for row in unsubmitted if row.operation == operation]
         if not group:
             continue
         ids = [row.id for row in group]
@@ -387,10 +521,16 @@ def process_once(
         # The durable outbox is the boundary that retries all of them safely.
         except Exception as exc:  # noqa: BLE001
             db.rollback()
-            _finish_group(db, settings, ids, submission=None, error=exc)
+            _record_submission(db, settings, ids, submission=None, error=exc)
         else:
-            _finish_group(db, settings, ids, submission=submission, error=None)
-    return len(rows)
+            _record_submission(db, settings, ids, submission=submission, error=None)
+
+    from app.cdn_publication import activate_ready_publications
+
+    activated = activate_ready_publications(db)
+    if activated:
+        db.commit()
+    return len(rows) + activated
 
 
 def _status(db: Session) -> dict[str, int]:

@@ -132,8 +132,10 @@ POST /internal/v1/creator/applications/{user_id}/decision
 ## 创作、预览与发布
 
 ```text
-POST /api/v1/creator/uploads/init                    申请精确 OSS 直传策略
-POST /api/v1/creator/uploads/{session_id}/finalize   校验 SHA-256/时长并固化
+POST /api/v1/creator/uploads/init                    协商本机断点续传（旧版回退 OSS）
+HEAD/PATCH /api/v1/creator/uploads/{session_id}/source 查询偏移/续传分片
+POST /api/v1/creator/uploads/{session_id}/finalize   校验 SHA-256/时长并原子固化
+GET  /api/v1/creator/uploads/{upload_id}             查询统一编码与备份状态
 POST /api/v1/creator/creations                       创建异步任务
 GET  /api/v1/creator/creations/active                恢复最近未发布会话
 GET  /api/v1/creator/creations/{id}                  查询进度/预览
@@ -148,13 +150,16 @@ POST /api/v1/creator/published/{id}/restore          作者恢复
 每个用户最多一个活跃创作会话；同一会话可连续提交调整请求，版本严格 FIFO。协调 Worker 串行提交和轮询 ivadmin，全局并发为 1。进度阶段固定为：
 
 1. `validate_video`
-2. `sample_frames`
-3. `find_playable_moments`
-4. `compile_preview`
+2. `normalize_video`
+3. `sample_frames`
+4. `find_playable_moments`
+5. `compile_preview`
 
 ivapp 不包含 Dify 或模型凭证，也不分析视频。Worker 只通过 `X-Creator-Internal-Key` 调用 ivadmin 私有任务 API；ivadmin/ivcore 是分析、模型配置与 Dify 调用的唯一所有者。
 
-任务 ready 后返回已经持久化的预览 runtime spec；只有用户预览后显式提交 `confirm=true` 才复制媒体并创建 `published_videos`。正式发布时会针对最终媒体 URL 再编译并原子持久化最终 runtime spec。
+ivapp 与 ivadmin 将同一个宿主机目录挂载为 `/data/media-cache`。上传原片只写一次本机内容寻址存储；ivadmin 直接读取该文件并产出经过完整解码验收的 `mobile-v1` 播放版，分析、预览和发布只引用播放版。原片与播放版分别保留，并由后台任务异步备份到私有 OSS；正常链路不再通过 OSS 在两个服务间搬运视频。
+
+任务 ready 后返回已经持久化的预览 runtime spec；只有用户预览后显式提交 `confirm=true` 才创建 `published_videos`。私有预览优先使用短期鉴权 CDN，正式发布会把播放版复制为不可变公开对象，预热 CDN 后再原子切换 runtime spec。
 
 媒体统一进入 `ivapp-media/v1/`。客户端、ivadmin 与 HTML 工具不持有 OSS AccessKey；完整目录、全量迁移、灰度和回滚见 [OSS 媒体存储与稳定切换手册](docs/OSS_MEDIA_MIGRATION.md)。
 

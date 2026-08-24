@@ -79,6 +79,12 @@ class PublishedVideo(Base):
     distribution_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, index=True
     )
+    # Runtime objects are never exposed to public read paths until Alibaba CDN
+    # reports that the immutable publication URL has finished prefetching.
+    # Existing rows are ready by definition; newly staged rows start false.
+    cdn_ready: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1", index=True
+    )
     # Origin and review state are deliberately stored on the published unit rather
     # than inferred from users/runs.  A user may later change identity and an HTML
     # package has no Run, while the feed must make one cheap, authoritative query.
@@ -323,6 +329,25 @@ class CreatorUpload(Base):
     media_object_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, unique=True, index=True
     )
+    source_local_uri: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    upload_transport: Mapped[str] = mapped_column(String(32), nullable=False, default="oss")
+    normalization_job_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", index=True
+    )
+    normalization_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", index=True
+    )
+    normalization_profile: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="mobile-v1"
+    )
+    normalization_error: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    playable_local_uri: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    playable_media_object_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    playable_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    playable_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -560,4 +585,39 @@ class CdnCacheJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CdnPublicationGate(Base):
+    """Stage an immutable runtime publication until every CDN URL is warm."""
+
+    __tablename__ = "cdn_publication_gates"
+    __table_args__ = (
+        Index("ix_cdn_publication_gates_video", "video_id", "state"),
+        CheckConstraint(
+            "state IN ('warming', 'active', 'failed', 'superseded')",
+            name="ck_cdn_publication_gates_state",
+        ),
+    )
+
+    publication_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    urls: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    staged_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="warming", index=True
+    )
+    error_message: Mapped[str] = mapped_column(
+        String(500), nullable=False, default=""
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

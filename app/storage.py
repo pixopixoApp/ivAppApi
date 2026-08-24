@@ -21,6 +21,8 @@ class MediaStorage(Protocol):
 
     def publish_copy(self, *, source_key: str, item_id: str) -> tuple[Path, str]: ...
 
+    def publish_file(self, *, source: Path, item_id: str) -> tuple[Path, str]: ...
+
 
 def _safe_component(value: str, *, label: str) -> str:
     safe = "".join(char for char in value if char.isalnum() or char in "-_")
@@ -86,8 +88,11 @@ class LocalMediaStorage:
         self.resolve(key).unlink(missing_ok=True)
 
     def publish_copy(self, *, source_key: str, item_id: str) -> tuple[Path, str]:
-        identifier = _safe_component(item_id, label="item_id")
         source = self.resolve(source_key)
+        return self.publish_file(source=source, item_id=item_id)
+
+    def publish_file(self, *, source: Path, item_id: str) -> tuple[Path, str]:
+        identifier = _safe_component(item_id, label="item_id")
         if not source.is_file():
             raise StorageError("uploaded video is missing")
         destination = self._root / f"{identifier}.mp4"

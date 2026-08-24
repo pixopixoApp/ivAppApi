@@ -101,6 +101,12 @@ class PublishResponse(BaseModel):
     content_mode: str = Field(description="内容模式：single 或 story")
     updated: bool = Field(description="是否覆盖已有发布（false=新建）")
     runtime_spec_version: str = Field(description="已持久化的播放协议版本")
+    publication_id: str = Field(default="", description="不可变发布版本标识")
+    cdn_status: Literal["ready", "warming"] = Field(
+        default="ready",
+        description="ready 后客户端才可见；warming 时旧版本继续服务",
+    )
+    poll_after_ms: int = Field(default=0, ge=0)
     content_type: Literal["runtime"] = "runtime"
 
 

@@ -18,6 +18,7 @@ DEPLOY_CDN_WORKER_SERVICE="${DEPLOY_CDN_WORKER_SERVICE:-cdn-worker}"
 DEPLOY_DATABASE_SERVICE="${DEPLOY_DATABASE_SERVICE:-mysql}"
 DEPLOY_RELEASE_ROOT="${DEPLOY_RELEASE_ROOT:-/opt/play_video/releases/ivapp}"
 DEPLOY_BACKUP_ROOT="${DEPLOY_BACKUP_ROOT:-/opt/play_video/backups/ivapp}"
+DEPLOY_MEDIA_CACHE_ROOT="${DEPLOY_MEDIA_CACHE_ROOT:-/opt/play_video/shared/media-cache}"
 DEPLOY_HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8100/health}"
 DEPLOY_HEALTH_RETRIES="${DEPLOY_HEALTH_RETRIES:-20}"
 DEPLOY_HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
@@ -100,11 +101,13 @@ RSYNC_FILTERS=(
 echo "[deploy] target=$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH service=$DEPLOY_SERVICE"
 
 "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_RELEASE_ROOT" "$DEPLOY_BACKUP_ROOT" <<'REMOTE'
+  "$DEPLOY_PATH" "$DEPLOY_RELEASE_ROOT" "$DEPLOY_BACKUP_ROOT" "$DEPLOY_MEDIA_CACHE_ROOT" "$DRY_RUN" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 release_root="$2"
 backup_root="$3"
+media_cache_root="$4"
+dry_run="$5"
 
 validate_path() {
   case "$1" in
@@ -119,6 +122,11 @@ validate_path() {
 validate_path "$deploy_path"
 validate_path "$release_root"
 validate_path "$backup_root"
+validate_path "$media_cache_root"
+case "$media_cache_root" in
+  /opt/play_video/shared/*) ;;
+  *) echo "Media cache must live under /opt/play_video/shared" >&2; exit 2 ;;
+esac
 test -d "$deploy_path"
 test -f "$deploy_path/.env"
 test -f "$deploy_path/docker-compose.yml"
@@ -126,6 +134,10 @@ command -v docker-compose >/dev/null
 command -v rsync >/dev/null
 command -v curl >/dev/null
 command -v gzip >/dev/null
+if [[ "$dry_run" -eq 0 ]]; then
+  install -d -m 755 "$media_cache_root" "$media_cache_root/objects"
+  install -d -m 700 "$media_cache_root/uploads" "$media_cache_root/locks"
+fi
 REMOTE
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

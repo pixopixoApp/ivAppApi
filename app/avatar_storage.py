@@ -245,7 +245,6 @@ def store_cover_image(
         except OssStorageError:
             # 已有记录但无法生成公开地址时，继续走新建流程。
             pass
-
     cover_id = f"mo_{secrets.token_urlsafe(18)}"
     key = object_key(
         settings,

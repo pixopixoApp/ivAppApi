@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from app.cdn_cache import (
+    AlibabaCdnProvider,
     CdnSubmission,
+    CdnTaskResult,
     active_public_urls,
     enqueue_prefetch,
     enqueue_refresh,
     process_once,
 )
+from app.cdn_publication import CdnPublicationError, stage_publication_gate
 from app.config import get_settings
 from app.models import (
     CdnCacheJob,
@@ -21,6 +26,7 @@ from app.models import (
     PublishedVideo,
     User,
 )
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
 from app.public_origin import (
     PublicOriginError,
@@ -82,12 +88,33 @@ def test_public_url_canonicalizer_is_allowlisted_and_signature_safe(monkeypatch)
         settings,
         "https://third-party.example/ivapp-media/v1/public/video.mp4",
     ).startswith("https://third-party.example")
-
     payload = {"video": [{"video": old_video}], "external": "https://example.test/a"}
     replacement = canonicalize_public_payload(settings, payload)
     assert replacement["video"][0]["video"].startswith(CDN)
     assert replacement["external"] == payload["external"]
     assert payload["video"][0]["video"].startswith(OLD_OSS)
+
+
+def test_private_media_url_uses_short_lived_cdn_type_a_signature(monkeypatch) -> None:
+    settings = _settings(monkeypatch)
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_BASE_URL", "https://private-video.pixopixo.cn")
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_AUTH_KEY", "cdn-secret")
+    monkeypatch.setenv("PRIVATE_MEDIA_CDN_AUTH_UID", "0")
+    get_settings.cache_clear()
+    settings = get_settings()
+    monkeypatch.setattr("app.private_cdn.time.time", lambda: 1_700_000_000)
+    monkeypatch.setattr("app.private_cdn.secrets.token_hex", lambda _length: "nonce")
+    key = "ivapp-media/v1/private/creator-sources/aa/source.mp4"
+    timestamp = 1_700_000_000
+    path = f"/{key}"
+    digest = hashlib.md5(
+        f"{path}-{timestamp}-nonce-0-cdn-secret".encode()
+    ).hexdigest()
+
+    assert sign_private_media_url(settings, key=key, expires_seconds=120) == (
+        f"https://private-video.pixopixo.cn{path}"
+        f"?auth_key={timestamp}-nonce-0-{digest}"
+    )
 
 
 def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, db) -> None:
@@ -105,13 +132,25 @@ def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, d
             self.calls.append((operation, urls))
             return CdnSubmission(task_id="task-1", request_id="request-1")
 
+        def status(self, task_id):
+            assert task_id == "task-1"
+            return CdnTaskResult(state="succeeded")
+
     provider = Provider()
     assert process_once(db, settings, provider=provider) == 1
     row = db.query(CdnCacheJob).one()
-    assert row.state == "succeeded"
+    assert row.state == "pending"
     assert row.attempts == 1
     assert row.provider_task_id == "task-1"
     assert provider.calls == [("prefetch", [url])]
+
+    row.next_attempt_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    db.add(row)
+    db.commit()
+    assert process_once(db, settings, provider=provider) == 1
+    db.refresh(row)
+    assert row.state == "succeeded"
+    assert row.attempts == 1
 
     with pytest.raises(PublicOriginError):
         enqueue_refresh(db, settings, [url + "?v=2"])
@@ -121,6 +160,170 @@ def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, d
             settings,
             [f"{OLD_OSS}{PUBLIC_PREFIX}runtime/work/pub/single.mp4"],
         )
+
+
+@pytest.mark.parametrize("provider_status", ["Failed", "Timeout", "Canceled"])
+def test_provider_terminal_failures_do_not_poll_forever(provider_status) -> None:
+    task = SimpleNamespace(status=provider_status, description="provider stopped")
+    response = SimpleNamespace(body=SimpleNamespace(tasks=[task]))
+
+    class Client:
+        def describe_refresh_task_by_id(self, request):
+            assert request.task_id == "task-terminal"
+            return response
+
+    provider = AlibabaCdnProvider.__new__(AlibabaCdnProvider)
+    provider._client = Client()
+    result = provider.status("task-terminal")
+
+    assert result.state == "failed"
+    assert result.error_message == "provider stopped"
+
+
+def test_superseded_publication_cannot_be_reopened(monkeypatch, db) -> None:
+    _settings(monkeypatch)
+    first_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/first/single.mp4"
+    second_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/second/single.mp4"
+    stage_publication_gate(
+        db,
+        video_id="work",
+        publication_id="first",
+        urls=[first_url],
+    )
+    db.commit()
+    stage_publication_gate(
+        db,
+        video_id="work",
+        publication_id="second",
+        urls=[second_url],
+    )
+    db.commit()
+    db.expire_all()
+
+    with pytest.raises(CdnPublicationError, match="superseded"):
+        stage_publication_gate(
+            db,
+            video_id="work",
+            publication_id="first",
+            urls=[first_url],
+        )
+
+
+def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch, db) -> None:
+    settings = _settings(monkeypatch)
+    now = datetime.now(timezone.utc)
+    old_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/old/single.mp4"
+    new_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/new/single.mp4"
+    source = {"interactions": []}
+    new_spec = compile_runtime_spec(
+        item_id="work",
+        content_mode="single",
+        source=source,
+        video_url=new_url,
+    )
+    row = PublishedVideo(
+        id="work",
+        content_type="runtime",
+        video_url=old_url,
+        timeline=source,
+        runtime_spec=compile_runtime_spec(
+            item_id="work",
+            content_mode="single",
+            source=source,
+            video_url=old_url,
+        ),
+        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        html_url=None,
+        bridge_version=None,
+        required_capabilities=[],
+        active_publication_id="old",
+        version="v1",
+        title="Work",
+        description="",
+        user_id=None,
+        content_mode="single",
+        review_status="approved",
+        distribution_enabled=True,
+        cdn_ready=True,
+        created_at=now,
+        updated_at=now,
+    )
+    creation = CreatorCreation(
+        id="work",
+        user_id="user",
+        upload_id="upload",
+        status="published",
+        runtime_spec=row.runtime_spec,
+        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add_all([row, creation])
+    enqueue_prefetch(db, settings, [new_url])
+    gate = stage_publication_gate(
+        db,
+        video_id=row.id,
+        publication_id="new",
+        urls=[new_url],
+        staged_payload={
+            "video_url": new_url,
+            "runtime_spec": new_spec,
+            "runtime_spec_version": RUNTIME_SPEC_VERSION,
+            "active_publication_id": "new",
+            "version": "v2",
+        },
+    )
+    db.commit()
+
+    class Provider:
+        def __init__(self) -> None:
+            self.complete = False
+
+        def submit(self, operation, urls):
+            assert operation == "prefetch"
+            assert urls == [new_url]
+            return CdnSubmission(task_id="task-new", request_id="request-new")
+
+        def status(self, task_id):
+            assert task_id == "task-new"
+            return CdnTaskResult(
+                state="succeeded" if self.complete else "pending"
+            )
+
+    provider = Provider()
+    assert process_once(db, settings, provider=provider) == 1
+    db.refresh(row)
+    db.refresh(gate)
+    assert row.video_url == old_url
+    assert row.active_publication_id == "old"
+    assert gate.state == "warming"
+    db.refresh(creation)
+    assert creation.runtime_spec["video"][0]["video"] == old_url
+
+    job = db.query(CdnCacheJob).one()
+    job.next_attempt_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    db.add(job)
+    db.commit()
+    assert process_once(db, settings, provider=provider) == 1
+    db.refresh(row)
+    db.refresh(gate)
+    assert row.video_url == old_url
+    assert gate.state == "warming"
+
+    provider.complete = True
+    job.next_attempt_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    db.add(job)
+    db.commit()
+    assert process_once(db, settings, provider=provider) == 2
+    db.refresh(row)
+    db.refresh(gate)
+    assert row.video_url == new_url
+    assert row.active_publication_id == "new"
+    assert row.version == "v2"
+    assert row.cdn_ready is True
+    assert gate.state == "active"
+    db.refresh(creation)
+    assert creation.runtime_spec["video"][0]["video"] == new_url
 
 
 def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db) -> None:

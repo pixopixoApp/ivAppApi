@@ -19,6 +19,13 @@ from app.avatar_storage import (
     store_user_avatar,
 )
 from app.cdn_cache import enqueue_prefetch, html_package_public_urls
+from app.cdn_publication import (
+    CdnPublicationError,
+    activate_ready_publications,
+    cancel_warming_publications,
+    require_runtime_cdn_gate,
+    stage_publication_gate,
+)
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
@@ -46,6 +53,7 @@ from app.models import (
     VideoView,
 )
 from app.oss_storage import OssStorageError, public_url, sign_get_url
+from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
@@ -820,6 +828,10 @@ def publish_assets(
 ) -> PublishResponse:
     if not media_mode_is_oss(settings):
         raise HTTPException(status_code=409, detail="OSS media storage is not enabled")
+    try:
+        require_runtime_cdn_gate(settings)
+    except CdnPublicationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     item_id = _require_valid_id(payload.video_id.strip())
     author_id = payload.user_id.strip()
     author = db.get(User, author_id)
@@ -911,42 +923,79 @@ def publish_assets(
     source_created_at = payload.created_at
     if source_created_at is not None and source_created_at.tzinfo is None:
         source_created_at = source_created_at.replace(tzinfo=timezone.utc)
-    row = existing or PublishedVideo(
-        id=item_id,
-        content_type=CONTENT_TYPE_RUNTIME,
-        created_at=source_created_at or now,
+    current_tutorial = bool(existing.is_tutorial) if existing is not None else False
+    tutorial = (
+        bool(payload.is_tutorial)
+        if payload.is_tutorial is not None
+        else current_tutorial
     )
-    tutorial = bool(payload.is_tutorial) if payload.is_tutorial is not None else bool(row.is_tutorial)
-    if tutorial:
-        _clear_other_tutorials(db, keep_video_id=item_id)
-    row.content_type = CONTENT_TYPE_RUNTIME
-    row.video_url = video_url
-    row.timeline = source_payload
-    row.runtime_spec = runtime_spec
-    row.runtime_spec_version = RUNTIME_SPEC_VERSION
-    row.html_url = None
-    row.bridge_version = None
-    row.required_capabilities = []
-    row.active_publication_id = published_assets.publication_id
-    row.html_package_id = None
-    row.version = payload.version
-    row.title = payload.title.strip()
-    row.description = payload.description.strip()
-    row.cover_media_object_id = (
-        (payload.cover_media_object_id or "").strip() or None
-    )
-    row.user_id = author_id
-    row.content_mode = payload.content_mode
-    if payload.feed_weight is not None or not updated:
-        row.feed_weight = int(payload.feed_weight or 0)
-    row.content_source = "pgc"
-    row.review_status = "approved"
-    row.is_tutorial = tutorial
-    row.is_deleted = 0
-    row.deleted_at = None
-    row.updated_at = now
-    db.add(row)
+    current_feed_weight = int(existing.feed_weight) if existing is not None else 0
+    target_payload: dict[str, Any] = {
+        "content_type": CONTENT_TYPE_RUNTIME,
+        "video_url": video_url,
+        "timeline": source_payload,
+        "runtime_spec": runtime_spec,
+        "runtime_spec_version": RUNTIME_SPEC_VERSION,
+        "html_url": None,
+        "bridge_version": None,
+        "required_capabilities": [],
+        "active_publication_id": published_assets.publication_id,
+        "html_package_id": None,
+        "version": payload.version,
+        "title": payload.title.strip(),
+        "description": payload.description.strip(),
+        "cover_media_object_id": (
+            (payload.cover_media_object_id or "").strip() or None
+        ),
+        "user_id": author_id,
+        "content_mode": payload.content_mode,
+        "feed_weight": (
+            int(payload.feed_weight or 0)
+            if payload.feed_weight is not None or not updated
+            else current_feed_weight
+        ),
+        "content_source": "pgc",
+        "review_status": "approved",
+        "is_tutorial": tutorial,
+        "is_deleted": 0,
+        "deleted_at": None,
+    }
+    row = existing
+    if row is None:
+        row = PublishedVideo(
+            id=item_id,
+            content_type=CONTENT_TYPE_RUNTIME,
+            created_at=source_created_at or now,
+            distribution_enabled=True,
+            cdn_ready=False,
+        )
+        for field, value in target_payload.items():
+            setattr(row, field, value)
+        row.updated_at = now
+        db.add(row)
     enqueue_prefetch(db, settings, published_assets.urls.values())
+    try:
+        gate = stage_publication_gate(
+            db,
+            video_id=item_id,
+            publication_id=published_assets.publication_id,
+            urls=published_assets.urls.values(),
+            staged_payload=target_payload,
+        )
+        db.flush()
+        activate_ready_publications(
+            db,
+            publication_ids=[published_assets.publication_id],
+        )
+        db.flush()
+    except CdnPublicationError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if gate.state == "failed":
+        detail = gate.error_message or "CDN prefetch failed; old publication remains active"
+        db.commit()
+        raise HTTPException(status_code=503, detail=detail)
+    cdn_status = "ready" if gate.state == "active" else "warming"
     db.commit()
     return PublishResponse(
         video_id=item_id,
@@ -956,6 +1005,9 @@ def publish_assets(
         content_mode=payload.content_mode,
         updated=updated,
         runtime_spec_version=RUNTIME_SPEC_VERSION,
+        publication_id=published_assets.publication_id,
+        cdn_status=cdn_status,
+        poll_after_ms=0 if cdn_status == "ready" else 10_000,
     )
 
 
@@ -1006,13 +1058,21 @@ def preview_runtime(
     }
     if len(media_by_id) != len(declarations) or any(row.state != "ready" for row in media_by_id.values()):
         raise HTTPException(status_code=404, detail="one or more ready media objects were not found")
-    ttl = max(30, min(3600, settings.oss_private_get_ttl_seconds))
+    ttl = max(
+        30,
+        min(
+            3600,
+            settings.private_media_cdn_ttl_seconds
+            if settings.private_media_cdn_base_url.strip()
+            else settings.oss_private_get_ttl_seconds,
+        ),
+    )
     try:
         urls = {
             item.clip_id or "single": (
                 public_url(settings, media_by_id[item.media_object_id].object_key)
                 if media_by_id[item.media_object_id].visibility == "public"
-                else sign_get_url(
+                else sign_private_media_url(
                     settings,
                     key=media_by_id[item.media_object_id].object_key,
                     expires_seconds=ttl,
@@ -1237,6 +1297,7 @@ def _content_management_out(db: Session, settings: Settings, row: PublishedVideo
         "author_nickname": (author.nickname if author else "") or "",
         "feed_weight": int(row.feed_weight or 0),
         "distribution_enabled": bool(getattr(row, "distribution_enabled", True)),
+        "cdn_ready": bool(getattr(row, "cdn_ready", True)),
         "is_tutorial": bool(row.is_tutorial),
         "cover_url": cover_url,
         # Runtime cards use this as a video poster fallback; never proxy bytes through ivapp.
@@ -1672,6 +1733,11 @@ def unpublish_video(
     if row is None:
         raise HTTPException(status_code=404, detail="video not found")
 
+    cancel_warming_publications(
+        db,
+        video_id=video_id,
+        reason="operator unpublished the video while CDN was warming",
+    )
     db.delete(row)
     db.commit()
 
@@ -1703,6 +1769,11 @@ def trash_published_video(
         row.is_deleted = 1
         row.deleted_at = datetime.now(timezone.utc)
         row.distribution_enabled = False
+        cancel_warming_publications(
+            db,
+            video_id=video_id,
+            reason="operator moved the video to trash while CDN was warming",
+        )
         row.updated_at = row.deleted_at
         db.commit()
     log.info("trash published video video_id=%s", video_id)

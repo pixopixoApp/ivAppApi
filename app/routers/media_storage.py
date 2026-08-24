@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
+from datetime import timedelta, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, require_bearer_user
@@ -33,10 +35,21 @@ from app.media_api import (
     RetireLegacyJsonObjectsRequest,
     UploadSessionOut,
 )
+from app.media_cache import (
+    LocalMediaCacheError,
+    commit_staged_upload,
+    ensure_free_space_floor,
+    ensure_upload_capacity,
+    local_media_uri,
+    object_lock,
+    upload_staging_path,
+)
 from app.media_service import (
     MediaServiceError,
     create_upload_session,
     finalize_upload_session,
+    now_utc,
+    safe_filename,
 )
 from app.models import (
     CreatorAccessGrant,
@@ -48,6 +61,7 @@ from app.models import (
 )
 from app.oss_storage import OssStorageError, delete_object, public_url, sign_get_url
 from app.schemas_platform import CreatorUploadOut
+from app.video_probe import VideoProbeError, probe_video
 
 router = APIRouter(tags=["media-storage"])
 
@@ -132,6 +146,68 @@ def archive_local_html_import(
 
 def _iso(value) -> str:
     return value.isoformat() if value is not None else ""
+
+
+def _creator_upload_out(row: CreatorUpload) -> CreatorUploadOut:
+    progress = {
+        "pending": 0,
+        "submitted": 5,
+        "normalizing": 40,
+        "backing_up": 85,
+        "ready": 100,
+        "failed": 100,
+    }.get(row.normalization_status or "pending", 0)
+    return CreatorUploadOut(
+        upload_id=row.id,
+        original_filename=row.original_filename,
+        size_bytes=row.size_bytes,
+        duration_ms=row.duration_ms,
+        preview_url=f"/api/v1/creator/previews/{row.id}",
+        created_at=_iso(row.created_at),
+        upload_transport=row.upload_transport or "oss",
+        normalization_status=row.normalization_status or "pending",
+        normalization_progress_percent=progress,
+        normalization_profile=row.normalization_profile or "mobile-v1",
+        playable_size_bytes=row.playable_size_bytes,
+        normalization_error=row.normalization_error or "",
+    )
+
+
+def _creator_local_session(
+    db: Session,
+    session_id: str,
+    user: AppUser,
+) -> MediaUploadSession:
+    session = db.get(MediaUploadSession, session_id)
+    if (
+        session is None
+        or session.actor_type != "user"
+        or session.actor_id != user.user_id
+        or session.purpose != "creator_video"
+        or (session.context or {}).get("transport") != "local-resumable-v1"
+    ):
+        raise HTTPException(status_code=404, detail="upload session not found")
+    expiry = session.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry < now_utc() and session.state != "ready":
+        raise HTTPException(status_code=410, detail="upload session expired")
+    return session
+
+
+@router.get(
+    "/api/v1/creator/uploads/{upload_id}",
+    response_model=CreatorUploadOut,
+)
+def get_creator_upload(
+    upload_id: str,
+    user: Annotated[AppUser, Depends(require_bearer_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> CreatorUploadOut:
+    row = db.get(CreatorUpload, upload_id)
+    if row is None or row.user_id != user.user_id:
+        raise HTTPException(status_code=404, detail="upload not found")
+    return _creator_upload_out(row)
 
 
 def _media_object_out(settings: Settings, row: MediaObject) -> MediaObjectOut:
@@ -387,8 +463,64 @@ def init_creator_upload(
             detail=f"video exceeds {settings.creator_video_max_bytes} bytes",
         )
     upload_id = f"up_{secrets.token_urlsafe(18)}"
+    if (
+        settings.creator_local_upload_enabled
+        and "local-resumable-v1" in payload.supported_transports
+    ):
+        try:
+            filename = safe_filename(payload.filename)
+            ensure_upload_capacity(settings, payload.size_bytes)
+        except MediaServiceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LocalMediaCacheError as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        session_id = f"cus_{secrets.token_urlsafe(18)}"
+        expires_at = now_utc() + timedelta(
+            seconds=max(300, min(86400, settings.creator_local_upload_ttl_seconds))
+        )
+        session = MediaUploadSession(
+            id=session_id,
+            actor_type="user",
+            actor_id=user.user_id,
+            purpose="creator_video",
+            state="pending",
+            target_id=upload_id,
+            manifest_hash="",
+            context={
+                "transport": "local-resumable-v1",
+                "upload_id": upload_id,
+                "filename": filename,
+                "content_type": payload.content_type,
+                "size_bytes": int(payload.size_bytes),
+                "sha256": payload.sha256.lower(),
+                "offset": 0,
+            },
+            expires_at=expires_at,
+        )
+        db.add(session)
+        db.commit()
+        return UploadSessionOut(
+            session_id=session.id,
+            purpose="creator_video",
+            state="pending",
+            expires_at=_iso(expires_at),
+            transport="local-resumable-v1",
+            uploads=[],
+            upload={
+                "method": "PATCH",
+                "url": f"/api/v1/creator/uploads/{session.id}/source",
+                "chunk_size": max(
+                    1024 * 1024,
+                    min(32 * 1024 * 1024, settings.creator_local_upload_chunk_bytes),
+                ),
+                "offset": 0,
+                "expires_at": _iso(expires_at),
+            },
+        )
+    if not settings.creator_legacy_oss_upload_enabled:
+        raise HTTPException(status_code=426, detail="please update the app to upload videos")
     try:
-        return create_upload_session(
+        result = create_upload_session(
             db,
             settings,
             actor_type="user",
@@ -406,9 +538,105 @@ def init_creator_upload(
                 )
             ],
         )
+        return result.model_copy(update={"transport": "oss"})
     except (MediaServiceError, OssStorageError) as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.head("/api/v1/creator/uploads/{session_id}/source", status_code=204)
+def inspect_creator_local_upload(
+    session_id: str,
+    user: Annotated[AppUser, Depends(require_bearer_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> Response:
+    session = _creator_local_session(db, session_id, user)
+    context = dict(session.context or {})
+    return Response(
+        status_code=204,
+        headers={
+            "Upload-Offset": str(int(context.get("offset") or 0)),
+            "Upload-Length": str(int(context.get("size_bytes") or 0)),
+            "Upload-State": session.state,
+        },
+    )
+
+
+@router.patch("/api/v1/creator/uploads/{session_id}/source", status_code=204)
+async def upload_creator_source_locally(
+    session_id: str,
+    request: Request,
+    user: Annotated[AppUser, Depends(require_bearer_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Response:
+    session = _creator_local_session(db, session_id, user)
+    if session.state == "ready":
+        raise HTTPException(status_code=409, detail="upload session already finalized")
+    try:
+        requested_offset = int(request.headers.get("upload-offset", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid Upload-Offset") from exc
+    raw_length = request.headers.get("content-length")
+    try:
+        content_length = int(raw_length or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=411, detail="Content-Length is required") from exc
+    chunk_limit = max(1024 * 1024, min(32 * 1024 * 1024, settings.creator_local_upload_chunk_bytes))
+    if content_length <= 0 or content_length > chunk_limit:
+        raise HTTPException(status_code=413, detail="upload chunk exceeds the configured limit")
+
+    staging = upload_staging_path(settings, session.id)
+    with object_lock(settings, f"upload:{session.id}"):
+        db.refresh(session)
+        context = dict(session.context or {})
+        expected_size = int(context.get("size_bytes") or 0)
+        committed_offset = int(context.get("offset") or 0)
+        actual_size = staging.stat().st_size if staging.is_file() else 0
+        if actual_size != committed_offset:
+            if actual_size > committed_offset:
+                with staging.open("r+b") as stream:
+                    stream.truncate(committed_offset)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                committed_offset = actual_size
+                context["offset"] = actual_size
+        if requested_offset != committed_offset:
+            return Response(status_code=409, headers={"Upload-Offset": str(committed_offset)})
+        if committed_offset + content_length > expected_size:
+            raise HTTPException(status_code=413, detail="upload exceeds the reserved size")
+
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        start_offset = committed_offset
+        total = committed_offset
+        try:
+            with staging.open("ab") as output:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > start_offset + content_length or total > expected_size:
+                        raise HTTPException(status_code=413, detail="upload chunk size mismatch")
+                    output.write(chunk)
+                if total != start_offset + content_length:
+                    raise HTTPException(status_code=400, detail="upload chunk was incomplete")
+                output.flush()
+                os.fsync(output.fileno())
+            ensure_free_space_floor(settings)
+        except BaseException:
+            if staging.exists():
+                with staging.open("r+b") as output:
+                    output.truncate(start_offset)
+                    output.flush()
+                    os.fsync(output.fileno())
+            raise
+        context["offset"] = total
+        session.context = context
+        session.state = "uploaded" if total == expected_size else "uploading"
+        db.add(session)
+        db.commit()
+    return Response(status_code=204, headers={"Upload-Offset": str(total)})
 
 
 @router.post(
@@ -429,14 +657,49 @@ def finalize_creator_upload(
     upload_id = str((session.context or {}).get("upload_id") or "")
     existing = db.get(CreatorUpload, upload_id) if upload_id else None
     if existing is not None:
-        return CreatorUploadOut(
-            upload_id=existing.id,
-            original_filename=existing.original_filename,
-            size_bytes=existing.size_bytes,
-            duration_ms=existing.duration_ms,
-            preview_url=f"/api/v1/creator/previews/{existing.id}",
-            created_at=_iso(existing.created_at),
+        return _creator_upload_out(existing)
+    if (session.context or {}).get("transport") == "local-resumable-v1":
+        session = _creator_local_session(db, session_id, user)
+        context = dict(session.context or {})
+        expected_size = int(context.get("size_bytes") or 0)
+        if session.state != "uploaded" or int(context.get("offset") or 0) != expected_size:
+            raise HTTPException(status_code=409, detail="local upload is incomplete")
+        staging = upload_staging_path(settings, session.id)
+        try:
+            metadata = probe_video(staging)
+            if metadata.duration_ms > settings.creator_video_max_duration_seconds * 1000:
+                raise LocalMediaCacheError(
+                    f"video must be {settings.creator_video_max_duration_seconds} seconds or shorter"
+                )
+            commit_staged_upload(
+                settings,
+                staging,
+                sha256=str(context.get("sha256") or ""),
+                size_bytes=expected_size,
+            )
+        except (LocalMediaCacheError, VideoProbeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        digest = str(context["sha256"]).lower()
+        row = CreatorUpload(
+            id=upload_id,
+            user_id=user.user_id,
+            storage_key=local_media_uri(digest),
+            media_object_id=None,
+            source_local_uri=local_media_uri(digest),
+            source_sha256=digest,
+            upload_transport="local-resumable-v1",
+            normalization_status="pending",
+            normalization_profile="mobile-v1",
+            original_filename=str(context.get("filename") or "video.mp4"),
+            size_bytes=expected_size,
+            duration_ms=metadata.duration_ms,
         )
+        session.state = "ready"
+        session.finalized_at = now_utc()
+        db.add_all([row, session])
+        db.commit()
+        db.refresh(row)
+        return _creator_upload_out(row)
     try:
         result = finalize_upload_session(
             db,
@@ -463,6 +726,10 @@ def finalize_creator_upload(
         user_id=user.user_id,
         storage_key=media.object_key,
         media_object_id=media.id,
+        source_sha256=media.sha256,
+        upload_transport="oss",
+        normalization_status="pending",
+        normalization_profile="mobile-v1",
         original_filename=media.original_filename,
         size_bytes=media.size_bytes,
         duration_ms=duration_ms,
@@ -470,11 +737,4 @@ def finalize_creator_upload(
     db.add(row)
     db.commit()
     db.refresh(row)
-    return CreatorUploadOut(
-        upload_id=row.id,
-        original_filename=row.original_filename,
-        size_bytes=row.size_bytes,
-        duration_ms=row.duration_ms,
-        preview_url=f"/api/v1/creator/previews/{row.id}",
-        created_at=_iso(row.created_at),
-    )
+    return _creator_upload_out(row)

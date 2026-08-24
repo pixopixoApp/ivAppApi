@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     # Where published mp4 files live (compose bind: ./volumes → /volumes)
     media_root: str = "/volumes/media"
 
+    # Shared local-first store. ivapp writes creator ingress here and ivadmin
+    # reads the exact same immutable SHA object from its matching bind mount.
+    media_cache_enabled: bool = False
+    media_cache_root: str = "/data/media-cache"
+    media_cache_min_free_bytes: int = 20 * 1024 * 1024 * 1024
+    creator_local_upload_enabled: bool = False
+    creator_local_upload_chunk_bytes: int = 8 * 1024 * 1024
+    creator_local_upload_ttl_seconds: int = 3600
+    creator_legacy_oss_upload_enabled: bool = True
+
     # Canonical media storage. ``local`` remains available only for the
     # additive migration/read-compatibility release; production cutover uses
     # ``oss`` and removes the media bind mount.
@@ -71,6 +81,12 @@ class Settings(BaseSettings):
     oss_upload_ttl_seconds: int = 600
     oss_private_get_ttl_seconds: int = 300
     oss_max_concurrency: int = 16
+    # Type-A authenticated CDN origin for private draft/original playback.
+    # The CDN origin must be configured to read the private OSS bucket.
+    private_media_cdn_base_url: str = ""
+    private_media_cdn_auth_key: str = ""
+    private_media_cdn_auth_uid: str = "0"
+    private_media_cdn_ttl_seconds: int = 900
 
     # Email auth — 阿里企业邮箱（465 SSL）
     smtp_host: str = ""
@@ -119,12 +135,18 @@ class Settings(BaseSettings):
     html_import_progress_timeout_seconds: float = 10.0
 
     # CDN cache work is persisted in MySQL and submitted asynchronously. The
-    # worker uses an ECS RAM role; long-lived OSS keys are never reused here.
+    # worker uses an ECS RAM role or an explicitly configured CDN-capable RAM
+    # key. A dedicated least-privilege principal remains preferred.
     cdn_cache_enabled: bool = False
     cdn_prefetch_on_publish: bool = True
     cdn_domain: str = ""
     cdn_api_region: str = "cn-hangzhou"
+    # Prefer an ECS RAM role. These optional keys also support an existing
+    # runtime RAM principal after operations intentionally grants CDN access.
+    aliyun_cdn_access_key_id: str = ""
+    aliyun_cdn_access_key_secret: str = ""
     cdn_worker_poll_seconds: float = 2.0
+    cdn_provider_poll_seconds: float = 10.0
     cdn_worker_batch_size: int = 50
     cdn_worker_max_attempts: int = 6
     cdn_worker_lease_seconds: int = 300

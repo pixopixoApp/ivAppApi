@@ -19,9 +19,11 @@ ALIBABA_CLOUD_IMDSV1_DISABLED=true
 
 Attach an ECS RAM role with the policy in
 `../../ops/new-server/pixo-cdn-cache-ram-policy.json`. Optionally set
-`ALIBABA_CLOUD_ECS_METADATA` to the role name. Never place a long-lived key in
-the CDN worker environment. Keep `CDN_CACHE_ENABLED=false` until the role is
-attached and its metadata endpoint is reachable from the container.
+`ALIBABA_CLOUD_ECS_METADATA` to the role name. Explicit
+`ALIYUN_CDN_ACCESS_KEY_ID` and `ALIYUN_CDN_ACCESS_KEY_SECRET` values are an
+alternative when an ECS role cannot be attached. A dedicated least-privilege
+principal is preferred; an existing runtime RAM principal is supported when
+operations intentionally grants the documented CDN actions.
 
 A full HTTP GET can be used as a temporary one-time warm-up before the role is
 available, but it only fills the edge node selected for that request. It is not
@@ -47,8 +49,17 @@ content `updated_at` values. The API also canonicalizes every public response,
 so an overlooked compatible legacy URL cannot leak back to clients.
 
 The `cdn-worker` service continuously handles new publication, HTML package and
-avatar prefetch tasks. Provider failures are retried with bounded exponential
-backoff and never delay the publish request.
+avatar prefetch tasks. A runtime publication remains hidden (or its previous
+immutable version remains active) until `DescribeRefreshTaskById` reports every
+prefetch item as `Complete`. Provider failures are retried with bounded
+exponential backoff; a final failure keeps the new runtime publication closed.
+
+Alibaba standard prefetch fills its L2 origin-pull cache, not every possible L1
+edge node. Enable **Range Origin Fetch / Match Client** for the CDN domain so an
+L1 miss fetches only the requested video range from the already-warm hierarchy,
+instead of pulling an entire MP4 across regions. Publication gating guarantees
+that the URL has completed CDN prefetch; it cannot promise that every global L1
+POP already contains every byte.
 
 ## Content updates and emergency refresh
 

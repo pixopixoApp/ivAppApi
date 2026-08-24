@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import get_settings
-from app.media_api import DirectUploadObjectRequest
+from app.media_api import DirectUploadObjectRequest, InternalUploadSessionRequest
+from app.media_cache import object_path
 from app.media_service import (
     MediaServiceError,
     create_upload_session,
@@ -47,6 +48,23 @@ def _oss_settings(monkeypatch):
     monkeypatch.setenv("OSS_ROOT_PREFIX", "ivapp-media/v1")
     get_settings.cache_clear()
     return get_settings()
+
+
+def test_internal_backup_contract_accepts_creator_original_and_playable() -> None:
+    request = InternalUploadSessionRequest(
+        purpose="creator_video",
+        target_id="upload_123",
+        objects=[
+            DirectUploadObjectRequest(
+                client_ref="playable.mp4",
+                filename="playable.mp4",
+                content_type="video/mp4",
+                size_bytes=1234,
+                sha256="a" * 64,
+            )
+        ],
+    )
+    assert request.purpose == "creator_video"
 
 
 def test_post_policy_is_exact_key_size_type_and_never_exposes_secret(monkeypatch) -> None:
@@ -621,6 +639,77 @@ def test_server_prevalidated_html_skips_cross_region_redownload(db, monkeypatch)
 
     assert result.state == "ready"
     assert result.objects[0].state == "ready"
+
+
+def test_internal_backup_uses_shared_cache_instead_of_redownload(
+    db,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MEDIA_CACHE_ROOT", str(tmp_path / "media-cache"))
+    settings = _oss_settings(monkeypatch)
+    payload = b"locally-verified-story-clip"
+    digest = hashlib.sha256(payload).hexdigest()
+    cached = object_path(settings, digest)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(payload)
+    monkeypatch.setattr(
+        "app.media_service.create_post_upload",
+        lambda _settings, **kwargs: (
+            "https://oss.test",
+            {"key": kwargs["key"], "policy": "signed"},
+        ),
+    )
+    session = create_upload_session(
+        db,
+        settings,
+        actor_type="internal",
+        actor_id="publish-key",
+        purpose="admin_artifact",
+        target_id="story_001",
+        context={"local_sha256": digest, "backup_job_id": "backup_001"},
+        objects=[
+            DirectUploadObjectRequest(
+                client_ref="clip.mp4",
+                filename="clip.mp4",
+                relative_path="clip.mp4",
+                content_type="video/mp4",
+                size_bytes=len(payload),
+                sha256=digest,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "app.media_service.head_object",
+        lambda _settings, *, key: OssObjectMetadata(
+            size_bytes=len(payload),
+            content_type="video/mp4",
+            etag="etag",
+            headers={"x-oss-meta-sha256": digest},
+        ),
+    )
+    monkeypatch.setattr(
+        "app.media_service.download_file",
+        lambda *_args, **_kwargs: pytest.fail(
+            "shared-cache backup must not be downloaded from OSS"
+        ),
+    )
+    monkeypatch.setattr(
+        "app.media_service.copy_object",
+        lambda _settings, **kwargs: kwargs["target_key"],
+    )
+
+    result = finalize_upload_session(
+        db,
+        settings,
+        session_id=session.session_id,
+        actor_type="internal",
+        actor_id="publish-key",
+    )
+
+    assert result.state == "ready"
+    assert result.objects[0].sha256 == digest
 
 
 def test_media_migration_preflight_reports_missing_runtime_file(db, tmp_path: Path) -> None:
