@@ -215,6 +215,12 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
     old_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/old/single.mp4"
     new_url = f"{CDN}{PUBLIC_PREFIX}runtime/work/new/single.mp4"
     source = {"interactions": []}
+    new_spec = compile_runtime_spec(
+        item_id="work",
+        content_mode="single",
+        source=source,
+        video_url=new_url,
+    )
     row = PublishedVideo(
         id="work",
         content_type="runtime",
@@ -242,7 +248,17 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
         created_at=now,
         updated_at=now,
     )
-    db.add(row)
+    creation = CreatorCreation(
+        id="work",
+        user_id="user",
+        upload_id="upload",
+        status="published",
+        runtime_spec=row.runtime_spec,
+        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add_all([row, creation])
     enqueue_prefetch(db, settings, [new_url])
     gate = stage_publication_gate(
         db,
@@ -251,6 +267,8 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
         urls=[new_url],
         staged_payload={
             "video_url": new_url,
+            "runtime_spec": new_spec,
+            "runtime_spec_version": RUNTIME_SPEC_VERSION,
             "active_publication_id": "new",
             "version": "v2",
         },
@@ -279,6 +297,8 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
     assert row.video_url == old_url
     assert row.active_publication_id == "old"
     assert gate.state == "warming"
+    db.refresh(creation)
+    assert creation.runtime_spec["video"][0]["video"] == old_url
 
     job = db.query(CdnCacheJob).one()
     job.next_attempt_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -302,6 +322,8 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
     assert row.version == "v2"
     assert row.cdn_ready is True
     assert gate.state == "active"
+    db.refresh(creation)
+    assert creation.runtime_spec["video"][0]["video"] == new_url
 
 
 def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db) -> None:

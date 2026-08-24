@@ -8,6 +8,12 @@ import hashlib
 import json
 
 from app.cdn_cache import enqueue_prefetch
+from app.cdn_publication import (
+    CdnPublicationError,
+    activate_ready_publications,
+    require_runtime_cdn_gate,
+    stage_publication_gate,
+)
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import (
@@ -35,10 +41,13 @@ def main() -> int:
         parser.error("invalid migration bounds")
     settings = get_settings()
     migrated = 0
+    warming = 0
     skipped = 0
     failures: list[dict[str, str]] = []
 
     with SessionLocal() as db:
+        if args.apply:
+            require_runtime_cdn_gate(settings)
         rows = (
             db.query(CreatorUpload, CreatorCreation, PublishedVideo)
             .join(CreatorCreation, CreatorCreation.upload_id == CreatorUpload.id)
@@ -74,7 +83,7 @@ def main() -> int:
             selected.append(row)
             if len(selected) >= args.limit:
                 break
-        for upload, creation, video in selected:
+        for upload, _creation, video in selected:
             playable = db.get(MediaObject, upload.playable_media_object_id)
             if playable is None or playable.state != "ready":
                 failures.append({"video_id": video.id, "error": "playable media is not ready"})
@@ -82,7 +91,11 @@ def main() -> int:
             if not args.apply:
                 migrated += 1
                 continue
-            timeline = video.timeline if isinstance(video.timeline, dict) else creation.source_timeline
+            timeline = (
+                video.timeline
+                if isinstance(video.timeline, dict)
+                else _creation.source_timeline
+            )
             if not isinstance(timeline, dict):
                 failures.append({"video_id": video.id, "error": "timeline is missing"})
                 continue
@@ -102,16 +115,33 @@ def main() -> int:
                     source=timeline,
                     video_url=final_url,
                 )
-                video.video_url = final_url
-                video.runtime_spec = runtime
-                video.runtime_spec_version = RUNTIME_SPEC_VERSION
-                video.active_publication_id = published.publication_id
-                creation.runtime_spec = runtime
-                creation.runtime_spec_version = RUNTIME_SPEC_VERSION
-                db.add_all([video, creation])
                 enqueue_prefetch(db, settings, [final_url])
+                gate = stage_publication_gate(
+                    db,
+                    video_id=video.id,
+                    publication_id=published.publication_id,
+                    urls=[final_url],
+                    staged_payload={
+                        "video_url": final_url,
+                        "runtime_spec": runtime,
+                        "runtime_spec_version": RUNTIME_SPEC_VERSION,
+                        "active_publication_id": published.publication_id,
+                    },
+                )
+                db.flush()
+                activate_ready_publications(
+                    db,
+                    publication_ids=[published.publication_id],
+                )
+                db.flush()
+                if gate.state == "failed":
+                    raise CdnPublicationError(
+                        gate.error_message or "CDN prefetch failed"
+                    )
                 db.commit()
                 migrated += 1
+                if gate.state != "active":
+                    warming += 1
             except Exception as exc:  # noqa: BLE001 - report per-item batch failure
                 db.rollback()
                 failures.append({"video_id": video.id, "error": str(exc)[:300]})
@@ -121,6 +151,7 @@ def main() -> int:
                     "mode": "apply" if args.apply else "dry-run",
                     "selected": len(selected),
                     "migrated_or_would_migrate": migrated,
+                    "warming": warming,
                     "already_current": skipped,
                     "failures": failures,
                 },

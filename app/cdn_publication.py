@@ -8,7 +8,12 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import CdnCacheJob, CdnPublicationGate, PublishedVideo
+from app.models import (
+    CdnCacheJob,
+    CdnPublicationGate,
+    CreatorCreation,
+    PublishedVideo,
+)
 
 
 class CdnPublicationError(RuntimeError):
@@ -82,6 +87,12 @@ def _apply_payload(
     row.cdn_ready = True
     row.updated_at = _now()
     db.add(row)
+    creation = db.get(CreatorCreation, row.id)
+    if creation is not None and isinstance(row.runtime_spec, dict):
+        creation.runtime_spec = row.runtime_spec
+        creation.runtime_spec_version = row.runtime_spec_version
+        creation.updated_at = row.updated_at
+        db.add(creation)
 
 
 def stage_publication_gate(
