@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -68,7 +70,12 @@ from app.protocol_envelope import (
     video_error,
     video_ok,
 )
-from app.protocol_video import RUNTIME_SPEC_VERSION, RuntimeSpecError, read_runtime_spec
+from app.protocol_video import (
+    LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
+    RuntimeSpecError,
+    normalize_client_runtime_spec_versions,
+    read_runtime_spec,
+)
 from app.public_origin import canonicalize_public_payload, canonicalize_public_url
 from app.safety import blocked_peer_ids, users_blocked_between
 from app.schemas import (
@@ -106,6 +113,61 @@ def _valid_email(email: str) -> bool:
     return bool(email) and _EMAIL_RE.match(email) is not None
 
 
+@dataclass(frozen=True)
+class FeedItemContext:
+    authors_by_id: dict[str, User]
+    play_counts_by_video_id: dict[str, int]
+    followed_author_ids: frozenset[str]
+
+
+def _load_feed_item_context(
+    db: Session,
+    rows: list[PublishedVideo],
+    *,
+    viewer_user_id: str | None,
+) -> FeedItemContext:
+    video_ids = [row.id for row in rows]
+    author_ids = {
+        row.user_id
+        for row in rows
+        if row.user_id is not None and row.user_id.strip()
+    }
+    authors = (
+        db.query(User).filter(User.user_id.in_(author_ids)).all()
+        if author_ids
+        else []
+    )
+    play_count_rows = (
+        db.query(VideoView.video_id, func.count(VideoView.id))
+        .filter(VideoView.video_id.in_(video_ids))
+        .group_by(VideoView.video_id)
+        .all()
+        if video_ids
+        else []
+    )
+    followed_author_ids: frozenset[str] = frozenset()
+    eligible_follow_ids = author_ids - ({viewer_user_id} if viewer_user_id else set())
+    if viewer_user_id and eligible_follow_ids:
+        followed_author_ids = frozenset(
+            followee_id
+            for (followee_id,) in (
+                db.query(Follow.followee_user_id)
+                .filter(
+                    Follow.follower_user_id == viewer_user_id,
+                    Follow.followee_user_id.in_(eligible_follow_ids),
+                )
+                .all()
+            )
+        )
+    return FeedItemContext(
+        authors_by_id={author.user_id: author for author in authors},
+        play_counts_by_video_id={
+            video_id: int(count) for video_id, count in play_count_rows
+        },
+        followed_author_ids=followed_author_ids,
+    )
+
+
 def _item_from_published(
     db: Session,
     row: PublishedVideo,
@@ -113,6 +175,8 @@ def _item_from_published(
     settings: Settings,
     viewer_user_id: str | None = None,
     public_share_base_url: str = "",
+    supported_runtime_spec_versions: frozenset[str] = LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
+    context: FeedItemContext | None = None,
 ) -> FeedItemOut | None:
     if getattr(row, "is_deleted", 0) != 0 or row.deleted_at is not None:
         return None
@@ -123,7 +187,11 @@ def _item_from_published(
     avatar_url = ""
     nickname = ""
     if row.user_id:
-        author = db.get(User, row.user_id)
+        author = (
+            context.authors_by_id.get(row.user_id)
+            if context is not None
+            else db.get(User, row.user_id)
+        )
         if author is not None:
             avatar_url = canonicalize_public_url(settings, author.avatar_url) or ""
             nickname = author.nickname or ""
@@ -134,6 +202,8 @@ def _item_from_published(
     bridge_version = None
     required_capabilities: list[str] = []
     if content_type == CONTENT_TYPE_RUNTIME:
+        if row.runtime_spec_version not in supported_runtime_spec_versions:
+            return None
         try:
             clips = read_runtime_spec(
                 canonicalize_public_payload(settings, row.runtime_spec),
@@ -173,18 +243,24 @@ def _item_from_published(
         return None
 
     play_count = (
-        db.query(VideoView).filter(VideoView.video_id == row.id).count()
+        context.play_counts_by_video_id.get(row.id, 0)
+        if context is not None
+        else db.query(VideoView).filter(VideoView.video_id == row.id).count()
     )
     viewer_following_author = False
     if viewer_user_id and row.user_id and viewer_user_id != row.user_id:
         viewer_following_author = (
-            db.query(Follow)
-            .filter(
-                Follow.follower_user_id == viewer_user_id,
-                Follow.followee_user_id == row.user_id,
+            row.user_id in context.followed_author_ids
+            if context is not None
+            else (
+                db.query(Follow)
+                .filter(
+                    Follow.follower_user_id == viewer_user_id,
+                    Follow.followee_user_id == row.user_id,
+                )
+                .first()
+                is not None
             )
-            .first()
-            is not None
         )
     return FeedItemOut(
         item_id=row.id,
@@ -203,6 +279,7 @@ def _item_from_published(
         is_following=viewer_following_author,
         viewer_following_author=viewer_following_author,
         following=viewer_following_author,
+        experience_spec_version=(row.runtime_spec_version if content_type == CONTENT_TYPE_RUNTIME else None),
         video=clips,
         html_url=html_url,
         bridge_version=bridge_version,
@@ -228,6 +305,7 @@ def list_published_items(
     cursor_kind: str = "published_items",
     cursor_secret: str,
     public_share_base_url: str = "",
+    supported_runtime_spec_versions: frozenset[str] = LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
 ) -> PublishedItemsPage:
     """Keyset-paginate persisted, visible Runtime and HTML items (newest first)."""
     q = (
@@ -238,7 +316,7 @@ def list_published_items(
                 and_(
                     PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
                     PublishedVideo.runtime_spec.is_not(None),
-                    PublishedVideo.runtime_spec_version == RUNTIME_SPEC_VERSION,
+                    PublishedVideo.runtime_spec_version.in_(supported_runtime_spec_versions),
                 ),
                 and_(
                     PublishedVideo.content_type == CONTENT_TYPE_HTML,
@@ -273,6 +351,13 @@ def list_published_items(
         )
     if cursor:
         values = decode_cursor(cursor=cursor, kind=cursor_kind, secret=cursor_secret)
+        cursor_versions = values.get("experience_spec_versions")
+        if not (
+            cursor_versions is None
+            and supported_runtime_spec_versions
+            == LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS
+        ) and cursor_versions != sorted(supported_runtime_spec_versions):
+            raise CursorError("cursor runtime capabilities changed")
         created_at = datetime_from_cursor_value(values.get("created_at"))
         row_id = values.get("id")
         if not isinstance(row_id, str) or not row_id:
@@ -291,6 +376,11 @@ def list_published_items(
         .limit(max((limit + 1) * 5, 50))
         .all()
     )
+    context = _load_feed_item_context(
+        db,
+        rows,
+        viewer_user_id=viewer_user_id,
+    )
     accepted: list[tuple[PublishedVideo, FeedItemOut]] = []
     for row in rows:
         item = _item_from_published(
@@ -299,6 +389,8 @@ def list_published_items(
             settings=settings,
             viewer_user_id=viewer_user_id,
             public_share_base_url=public_share_base_url,
+            supported_runtime_spec_versions=supported_runtime_spec_versions,
+            context=context,
         )
         if item is None:
             continue
@@ -315,6 +407,7 @@ def list_published_items(
             values={
                 "created_at": datetime_to_cursor_value(last_row.created_at),
                 "id": last_row.id,
+                "experience_spec_versions": sorted(supported_runtime_spec_versions),
             },
             secret=cursor_secret,
         )
@@ -324,16 +417,26 @@ def list_published_items(
         has_more=has_more,
     )
 
-def _ordered_pool(db: Session, *, viewer_user_id: str | None = None) -> tuple[list[str], str | None]:
+def _ordered_pool(
+    db: Session,
+    *,
+    viewer_user_id: str | None = None,
+    supported_runtime_spec_versions: frozenset[str] = LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
+) -> tuple[list[str], str | None]:
     """Return (weight-ordered visible ids, tutorial_id or None)."""
-    rows = (
-        db.query(PublishedVideo)
+    query = (
+        db.query(
+            PublishedVideo.id,
+            PublishedVideo.user_id,
+            PublishedVideo.is_tutorial,
+        )
+        .outerjoin(User, PublishedVideo.user_id == User.user_id)
         .filter(
             or_(
                 and_(
                     PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
                     PublishedVideo.runtime_spec.is_not(None),
-                    PublishedVideo.runtime_spec_version == RUNTIME_SPEC_VERSION,
+                    PublishedVideo.runtime_spec_version.in_(supported_runtime_spec_versions),
                 ),
                 and_(
                     PublishedVideo.content_type == CONTENT_TYPE_HTML,
@@ -346,22 +449,73 @@ def _ordered_pool(db: Session, *, viewer_user_id: str | None = None) -> tuple[li
             PublishedVideo.review_status == "approved",
             PublishedVideo.distribution_enabled.is_(True),
             PublishedVideo.cdn_ready.is_(True),
+            or_(
+                PublishedVideo.user_id.is_(None),
+                PublishedVideo.user_id == "",
+                User.enabled.is_(True),
+            ),
         )
-        .order_by(PublishedVideo.feed_weight.desc(), PublishedVideo.created_at.desc(), PublishedVideo.id.asc())
-        .all()
     )
+    hidden_authors = blocked_peer_ids(db, viewer_user_id)
+    if hidden_authors:
+        query = query.filter(
+            or_(
+                PublishedVideo.user_id.is_(None),
+                PublishedVideo.user_id == "",
+                PublishedVideo.user_id.notin_(hidden_authors),
+            )
+        )
+    rows = query.order_by(
+        PublishedVideo.feed_weight.desc(),
+        PublishedVideo.created_at.desc(),
+        PublishedVideo.id.asc(),
+    ).all()
     ordered: list[str] = []
     tutorial_id: str | None = None
-    hidden_authors = blocked_peer_ids(db, viewer_user_id)
     for row in rows:
-        if not is_author_visible(db, row.user_id):
-            continue
-        if row.user_id and row.user_id in hidden_authors:
-            continue
         ordered.append(row.id)
-        if bool(getattr(row, "is_tutorial", False)) and tutorial_id is None:
+        if bool(row.is_tutorial) and tutorial_id is None:
             tutorial_id = row.id
     return ordered, tutorial_id
+
+
+def _locked_recommend_cursor(db: Session, *, state_key: str) -> RecommendCursor:
+    """Create the cursor without a missing-row gap lock, then lock the row.
+
+    MySQL REPEATABLE READ turns ``SELECT ... FOR UPDATE`` on a missing primary
+    key into a gap lock. Concurrent first requests for different devices can
+    then deadlock while inserting their independent cursor rows. An atomic
+    insert/no-op-upsert establishes the row before the locking read.
+    """
+    dialect = db.get_bind().dialect.name
+    if dialect == "mysql":
+        statement = mysql_insert(RecommendCursor).values(token=state_key, cursor=0)
+        db.execute(
+            statement.on_duplicate_key_update(cursor=RecommendCursor.cursor)
+        )
+    elif dialect == "sqlite":
+        statement = sqlite_insert(RecommendCursor).values(token=state_key, cursor=0)
+        db.execute(
+            statement.on_conflict_do_nothing(index_elements=[RecommendCursor.token])
+        )
+    else:
+        state = (
+            db.query(RecommendCursor)
+            .filter(RecommendCursor.token == state_key)
+            .with_for_update()
+            .one_or_none()
+        )
+        if state is None:
+            state = RecommendCursor(token=state_key, cursor=0)
+            db.add(state)
+            db.flush()
+        return state
+    return (
+        db.query(RecommendCursor)
+        .filter(RecommendCursor.token == state_key)
+        .with_for_update()
+        .one()
+    )
 
 
 def _next_video_ids(
@@ -372,8 +526,13 @@ def _next_video_ids(
     user_id: str | None,
     cursor_token: str | None,
     cursor_secret: str,
+    supported_runtime_spec_versions: frozenset[str],
 ) -> tuple[list[str], str | None]:
-    weight_ordered, tutorial_id = _ordered_pool(db, viewer_user_id=user_id)
+    weight_ordered, tutorial_id = _ordered_pool(
+        db,
+        viewer_user_id=user_id,
+        supported_runtime_spec_versions=supported_runtime_spec_versions,
+    )
     cycle_ordered = pin_tutorial(weight_ordered, tutorial_id=tutorial_id)
     seen_ids: set[str] | None = None
     cycle_resume_cursor: int | None = None
@@ -426,43 +585,38 @@ def _next_video_ids(
         cursor = values.get("index")
         if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
             raise CursorError("invalid recommendation cursor position")
+        cursor_versions = values.get("experience_spec_versions")
+        if not (
+            cursor_versions is None
+            and supported_runtime_spec_versions
+            == LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS
+        ) and cursor_versions != sorted(supported_runtime_spec_versions):
+            raise CursorError("cursor runtime capabilities changed")
     else:
-        state = (
-            db.query(RecommendCursor)
-            .filter(RecommendCursor.token == state_key)
-            .with_for_update()
-            .one_or_none()
-        )
+        state = _locked_recommend_cursor(db, state_key=state_key)
         if cycle_resume_cursor is not None:
             cursor = cycle_resume_cursor
         else:
-            cursor = state.cursor if state is not None else 0
+            cursor = state.cursor
     out, new_cursor = page_circular(sequence, cursor=cursor, limit=limit)
 
     if not cursor_token:
-        if state is None:
-            db.add(RecommendCursor(token=state_key, cursor=new_cursor))
-        else:
-            state.cursor = new_cursor
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            raced = db.get(RecommendCursor, state_key)
-            if raced is None:
-                raise
-            raced.cursor = new_cursor
-            db.commit()
+        assert state is not None
+        state.cursor = new_cursor
+        db.commit()
 
     next_cursor = None
     if sequence:
         next_cursor = encode_cursor(
             kind="recommendations",
-            values={"index": new_cursor},
+            values={
+                "index": new_cursor,
+                "experience_spec_versions": sorted(supported_runtime_spec_versions),
+            },
             secret=cursor_secret,
         )
 
-    log.info(
+    log.debug(
         "video feed token=%s user_id=%s pool=%d tutorial=%s seen=%s cursor=%d->%d limit=%d returned=%d",
         state_key,
         user_id or "-",
@@ -682,7 +836,7 @@ def post_google_login(
     summary="拉取推荐视频列表",
     description="游客可访问（可不带 token）。教学片未看时置顶；否则 feed_weight 降序；"
     "登录用户在一个播放周期内只收到未看内容，整池播放完成后重置。"
-    "成功 body.items[]（App v1.0：每 clip 的 interactions 带 on_success/on_miss；Story 可选 clip.on_end；无 transition）。"
+    "成功 body.items[]（ExperienceSpec v1.0/v1.1；v1.1 Story 可选 video.on_end；无 transition）。"
     "单视频 video.length=1；Story 多段且入口 clip 在首位。池为空 status=100。",
 )
 def post_video(
@@ -694,9 +848,17 @@ def post_video(
     token = resolve_request_token(request, payload.head, act="video")
     user = resolve_current_user(request, db, token)
     limit = payload.body.limit
+    supported_runtime_spec_versions = normalize_client_runtime_spec_versions(
+        payload.body.supported_experience_spec_versions
+    )
     ssid = resolve_ssid(payload.head)
     payload.head.ssid = ssid
-    state_key = f"feed:user:{user.user_id}" if user else f"feed:ssid:{ssid}"
+    capability_key = ",".join(sorted(supported_runtime_spec_versions)) or "none"
+    state_key = (
+        f"feed:user:{user.user_id}:spec:{capability_key}"
+        if user
+        else f"feed:ssid:{ssid}:spec:{capability_key}"
+    )
     try:
         video_ids, next_cursor = _next_video_ids(
             db,
@@ -705,6 +867,7 @@ def post_video(
             user_id=user.user_id if user else None,
             cursor_token=payload.body.cursor,
             cursor_secret=settings.cursor_secret or settings.publish_key,
+            supported_runtime_spec_versions=supported_runtime_spec_versions,
         )
     except CursorError as exc:
         log.warning("video invalid cursor err=%s", exc)
@@ -713,9 +876,20 @@ def post_video(
         log.warning("video feed empty pool token=%s", token)
         return video_error(ver=settings.server_ver, head_in=payload.head)
 
+    rows_by_id = {
+        row.id: row
+        for row in db.query(PublishedVideo)
+        .filter(PublishedVideo.id.in_(video_ids))
+        .all()
+    }
+    context = _load_feed_item_context(
+        db,
+        list(rows_by_id.values()),
+        viewer_user_id=user.user_id if user else None,
+    )
     items: list[FeedItemOut] = []
     for vid in video_ids:
-        row = db.get(PublishedVideo, vid)
+        row = rows_by_id.get(vid)
         if row is None or row.is_deleted != 0:
             log.warning("video feed skip missing/deleted id=%s", vid)
             continue
@@ -725,6 +899,8 @@ def post_video(
             settings=settings,
             viewer_user_id=user.user_id if user else None,
             public_share_base_url=settings.public_share_base_url,
+            supported_runtime_spec_versions=supported_runtime_spec_versions,
+            context=context,
         )
         if item is not None:
             items.append(item)
@@ -738,7 +914,7 @@ def post_video(
         has_more=True,
         is_circular=True,
     )
-    log.info("video feed ok token=%s items=%d", token, len(items))
+    log.debug("video feed ok token=%s items=%d", token, len(items))
     return video_ok(body=body, ver=settings.server_ver, head_in=payload.head)
 
 
@@ -758,6 +934,9 @@ def post_video_detail(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VideoDetailResponse:
     video_id = payload.body.video_id.strip()
+    supported_runtime_spec_versions = normalize_client_runtime_spec_versions(
+        payload.body.supported_experience_spec_versions
+    )
     if not video_id:
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
@@ -769,6 +948,10 @@ def post_video_detail(
         or row.review_status != "approved"
         or not row.distribution_enabled
         or not row.cdn_ready
+        or (
+            (row.content_type or CONTENT_TYPE_RUNTIME) == CONTENT_TYPE_RUNTIME
+            and row.runtime_spec_version not in supported_runtime_spec_versions
+        )
     ):
         log.warning("video_detail missing video_id=%s", video_id)
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
@@ -795,11 +978,17 @@ def post_video_detail(
         settings=settings,
         viewer_user_id=viewer.user_id if viewer else None,
         public_share_base_url=settings.public_share_base_url,
+        supported_runtime_spec_versions=supported_runtime_spec_versions,
+        context=_load_feed_item_context(
+            db,
+            [row],
+            viewer_user_id=viewer.user_id if viewer else None,
+        ),
     )
     if item is None:
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)
 
-    log.info("video_detail ok video_id=%s", video_id)
+    log.debug("video_detail ok video_id=%s", video_id)
     return video_detail_ok(
         body=VideoBodyOut(items=[item]),
         ver=settings.server_ver,

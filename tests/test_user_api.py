@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
+from app.db import engine
 from app.main import app
 from app.models import EmailCode, Follow, PublishedVideo, User, UserToken, VideoView
-from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
+from app.protocol_video import compile_runtime_spec
 from app.routers import feed as feed_router
 
 
@@ -157,7 +159,7 @@ def _published(db, video_id: str, user_id: str, *, created_at: datetime) -> None
             video_url=f"/media/{video_id}.mp4",
             timeline=timeline,
             runtime_spec=spec,
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version=spec["version"],
             version="1",
             user_id=user_id,
             content_mode="single",
@@ -165,6 +167,123 @@ def _published(db, video_id: str, user_id: str, *, created_at: datetime) -> None
             updated_at=created_at,
         )
     )
+
+
+def test_visitor_feed_query_count_does_not_scale_with_catalog_size(db) -> None:
+    now = datetime.now(timezone.utc)
+    for index in range(30):
+        user_id = f"query-author-{index}"
+        db.add(
+            User(
+                user_id=user_id,
+                provider="email",
+                subject=f"{user_id}@example.com",
+                enabled=True,
+            )
+        )
+        _published(
+            db,
+            f"query-video-{index}",
+            user_id,
+            created_at=now - timedelta(seconds=index),
+        )
+        db.add(VideoView(video_id=f"query-video-{index}", user_id="historic-viewer"))
+    db.commit()
+
+    statements: list[str] = []
+
+    def record_statement(*args) -> None:
+        statements.append(args[2])
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/video",
+                json={
+                    "head": {
+                        "act": "video",
+                        "ver": "1.2",
+                        "ssid": "query-count-device",
+                    },
+                    "body": {"limit": 10},
+                },
+            ).json()
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert response["head"]["status"] == 0
+    assert len(response["body"]["items"]) == 10
+    assert all(item["play_count"] == 1 for item in response["body"]["items"])
+    assert len(statements) <= 9, "\n".join(statements)
+
+
+def test_continuous_tap_is_only_served_to_v12_capable_clients(db) -> None:
+    _user(db, "tap-author")
+    timeline = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [{"gesture": "continuous_tap", "gate_at_ms": 1000}],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-tap-item",
+        content_mode="single",
+        source=timeline,
+        video_url="/media/continuous-tap-item.mp4",
+    )
+    now = datetime.now(timezone.utc)
+    db.add(
+        PublishedVideo(
+            id="continuous-tap-item",
+            video_url="/media/continuous-tap-item.mp4",
+            timeline=timeline,
+            runtime_spec=spec,
+            runtime_spec_version=spec["version"],
+            version="1",
+            user_id="tap-author",
+            content_mode="single",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.commit()
+    capable_body = {
+        "supported_experience_spec_versions": ["1.0", "1.1", "1.2"],
+    }
+
+    with TestClient(app) as client:
+        legacy_feed = client.post(
+            "/video",
+            json={"head": {"act": "video", "ver": "1.2"}, "body": {"limit": 10}},
+        ).json()
+        capable_feed = client.post(
+            "/video",
+            json={
+                "head": {"act": "video", "ver": "1.2"},
+                "body": {"limit": 10, **capable_body},
+            },
+        ).json()
+        legacy_detail = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "continuous-tap-item"},
+            },
+        ).json()
+        capable_detail = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "continuous-tap-item", **capable_body},
+            },
+        ).json()
+
+    assert legacy_feed["head"]["status"] == 100
+    assert legacy_detail["head"]["status"] == 100
+    assert capable_feed["body"]["items"][0]["experience_spec_version"] == "1.2"
+    assert capable_feed["body"]["items"][0]["video"][0]["interactions"][0][
+        "type"
+    ] == "continuous_tap"
+    assert capable_detail["body"]["items"][0]["item_id"] == "continuous-tap-item"
 
 
 def test_feed_fields_circular_cursor_play_count_and_finite_list_pagination(db, monkeypatch) -> None:
@@ -179,6 +298,14 @@ def test_feed_fields_circular_cursor_play_count_and_finite_list_pagination(db, m
             "author",
             created_at=now - timedelta(minutes=index),
         )
+    db.flush()
+    legacy = db.get(PublishedVideo, "video-2")
+    assert legacy is not None and isinstance(legacy.runtime_spec, dict)
+    legacy_spec = dict(legacy.runtime_spec)
+    legacy_spec["version"] = "1.0"
+    legacy.runtime_spec = legacy_spec
+    legacy.runtime_spec_version = "1.0"
+    db.add(legacy)
     db.commit()
     memory = _MemoryImpressions()
     monkeypatch.setattr(feed_router, "get_impression_store", lambda: memory)
@@ -238,6 +365,8 @@ def test_feed_fields_circular_cursor_play_count_and_finite_list_pagination(db, m
     assert db.query(VideoView).filter(VideoView.video_id == "video-0").count() == 1
     ids1 = [item["item_id"] for item in page1["body"]["items"]]
     ids2 = [item["item_id"] for item in page2["body"]["items"]]
+    listed_items = page1["body"]["items"] + page2["body"]["items"]
+    assert {item["experience_spec_version"] for item in listed_items} == {"1.0", "1.1"}
     assert len(ids1) == 2
     assert len(ids2) == 1
     assert not set(ids1) & set(ids2)

@@ -287,6 +287,7 @@ if ! rsync -az --no-owner --no-group --delete-delay \
 fi
 
 echo "[deploy] applying forward database migrations"
+echo "[deploy] historic runtime backfill requested=$BACKFILL_RUNTIME_SPECS"
 if ! "${SSH[@]}" bash -s -- \
   "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$BACKFILL_RUNTIME_SPECS" <<'REMOTE'
 set -Eeuo pipefail
@@ -296,12 +297,22 @@ service="$3"
 backfill="$4"
 docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
   "$service" alembic upgrade head
-if [[ "$backfill" -eq 1 ]]; then
+case "$backfill" in
+1)
+  echo "[deploy] auditing and applying historic runtime specs"
   docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
     "$service" python -m app.runtime_backfill
   docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
     "$service" python -m app.runtime_backfill --apply
-fi
+  ;;
+0)
+  echo "[deploy] historic runtime backfill skipped"
+  ;;
+*)
+  echo "Invalid backfill flag: $backfill" >&2
+  exit 2
+  ;;
+esac
 REMOTE
 then
   echo "[deploy] migration/backfill failed; API was not switched" >&2

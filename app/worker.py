@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import case, text
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
@@ -22,9 +22,9 @@ from app.db import SessionLocal, engine
 from app.logging_config import get_logger, setup_logging
 from app.models import CreatorCreation, CreatorUpload, CreatorVersion
 from app.protocol_video import (
-    RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
     compile_runtime_spec,
+    runtime_spec_version_from_compiled,
 )
 
 log = get_logger(__name__)
@@ -228,7 +228,20 @@ def process_next_upload_normalization(settings: Settings | None = None) -> bool:
                     )
                 )
             )
-            .order_by(CreatorUpload.created_at.asc())
+            # Analysis only needs the ready local normalization.  Missing OSS
+            # backup identities are synchronized opportunistically, so an old
+            # ready upload must never starve newer uploads that still need
+            # their normalization job submitted or polled.
+            .order_by(
+                case(
+                    (
+                        CreatorUpload.normalization_status.in_(("pending", "normalizing")),
+                        0,
+                    ),
+                    else_=1,
+                ),
+                CreatorUpload.created_at.asc(),
+            )
             .with_for_update(skip_locked=True)
             .first()
         )
@@ -382,7 +395,7 @@ def _apply_remote_job(
         version.progress_percent = 100
         version.source_timeline = timeline
         version.runtime_spec = runtime
-        version.runtime_spec_version = RUNTIME_SPEC_VERSION
+        version.runtime_spec_version = runtime_spec_version_from_compiled(runtime)
         version.error_code = ""
         version.error_message = ""
     version.updated_at = _now()

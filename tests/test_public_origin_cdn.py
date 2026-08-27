@@ -27,7 +27,7 @@ from app.models import (
     User,
 )
 from app.private_cdn import sign_private_media_url
-from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
+from app.protocol_video import compile_runtime_spec
 from app.public_origin import (
     PublicOriginError,
     canonicalize_public_payload,
@@ -221,18 +221,19 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
         source=source,
         video_url=new_url,
     )
+    old_spec = compile_runtime_spec(
+        item_id="work",
+        content_mode="single",
+        source=source,
+        video_url=old_url,
+    )
     row = PublishedVideo(
         id="work",
         content_type="runtime",
         video_url=old_url,
         timeline=source,
-        runtime_spec=compile_runtime_spec(
-            item_id="work",
-            content_mode="single",
-            source=source,
-            video_url=old_url,
-        ),
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec=old_spec,
+        runtime_spec_version=old_spec["version"],
         html_url=None,
         bridge_version=None,
         required_capabilities=[],
@@ -254,7 +255,7 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
         upload_id="upload",
         status="published",
         runtime_spec=row.runtime_spec,
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec_version=old_spec["version"],
         created_at=now,
         updated_at=now,
     )
@@ -268,7 +269,7 @@ def test_publication_keeps_old_url_until_provider_confirms_prefetch(monkeypatch,
         staged_payload={
             "video_url": new_url,
             "runtime_spec": new_spec,
-            "runtime_spec_version": RUNTIME_SPEC_VERSION,
+            "runtime_spec_version": new_spec["version"],
             "active_publication_id": "new",
             "version": "v2",
         },
@@ -379,7 +380,7 @@ def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db
         video_url=old_url,
         timeline=source,
         runtime_spec=old_spec,
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec_version=old_spec["version"],
         html_url=None,
         bridge_version=None,
         required_capabilities=[],

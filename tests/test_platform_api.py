@@ -19,7 +19,6 @@ from app.models import (
     User,
     UserToken,
 )
-from app.protocol_video import RUNTIME_SPEC_VERSION
 from app.routers.platform import _invite_hash
 
 
@@ -313,7 +312,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
             progress_percent=100,
             source_timeline=timeline,
             runtime_spec={"preview": True},
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version="1.1",
             created_at=now,
             updated_at=now,
         )
@@ -337,7 +336,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
     row = db.get(PublishedVideo, "cr_test")
     assert row.title == "Test creation"
     assert row.description == "Playable"
-    assert row.runtime_spec_version == RUNTIME_SPEC_VERSION
+    assert row.runtime_spec_version == "1.1"
     interaction = row.runtime_spec["video"][0]["interactions"][0]
     assert interaction["pause_video"] is True
     assert interaction["detection"]["response_window_ms"] == 0

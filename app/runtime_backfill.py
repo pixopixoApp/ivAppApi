@@ -14,8 +14,10 @@ from app.models import PublishedVideo
 from app.oss_storage import OssStorageError
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
+    SUPPORTED_RUNTIME_SPEC_VERSIONS,
     RuntimeSpecError,
     compile_runtime_spec,
+    runtime_spec_version_from_compiled,
 )
 from app.public_origin import canonicalize_public_url
 from app.publication_service import load_published_runtime_urls
@@ -85,7 +87,7 @@ def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
     if apply:
         for row, spec in compiled:
             row.runtime_spec = spec
-            row.runtime_spec_version = RUNTIME_SPEC_VERSION
+            row.runtime_spec_version = runtime_spec_version_from_compiled(spec)
             updated += 1
         db.commit()
     else:
@@ -116,7 +118,10 @@ def main() -> int:
             {
                 **asdict(report),
                 "mode": "apply" if args.apply else "dry-run",
-                "runtime_spec_version": RUNTIME_SPEC_VERSION,
+                "latest_runtime_spec_version": RUNTIME_SPEC_VERSION,
+                "supported_runtime_spec_versions": sorted(
+                    SUPPORTED_RUNTIME_SPEC_VERSIONS
+                ),
             },
             ensure_ascii=False,
             indent=2,

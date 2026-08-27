@@ -44,9 +44,10 @@ from app.models import (
 from app.oss_storage import OssStorageError
 from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
-    RUNTIME_SPEC_VERSION,
+    BASE_RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
     compile_runtime_spec,
+    runtime_spec_version_from_compiled,
 )
 from app.public_origin import canonicalize_public_payload, canonicalize_public_url
 from app.publication_service import RuntimeSourceAsset, publish_runtime_assets
@@ -1160,7 +1161,9 @@ def publish_creation(
         return CreatorPublishResponse(
             video_id=row.published_video_id,
             status=("published" if row.status == "published" else "pending_review"),
-            runtime_spec_version=row.runtime_spec_version or RUNTIME_SPEC_VERSION,
+            runtime_spec_version=(
+                row.runtime_spec_version or BASE_RUNTIME_SPEC_VERSION
+            ),
             share_url=_share_url(settings, row.published_video_id),
             cdn_status=cdn_status,
         )
@@ -1230,6 +1233,7 @@ def publish_creation(
     except RuntimeSpecError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=f"preview cannot be published: {exc}") from exc
+    runtime_spec_version = runtime_spec_version_from_compiled(runtime_spec)
 
     storage = LocalMediaStorage(settings) if not media_mode_is_oss(settings) else None
     destination = None
@@ -1251,7 +1255,7 @@ def publish_creation(
             video_url=copied_url,
             timeline=source_timeline,
             runtime_spec=runtime_spec,
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version=runtime_spec_version,
             html_url=None,
             bridge_version=None,
             required_capabilities=[],
@@ -1276,12 +1280,12 @@ def publish_creation(
         row.progress_percent = 100
         row.published_video_id = row.id
         row.runtime_spec = runtime_spec
-        row.runtime_spec_version = RUNTIME_SPEC_VERSION
+        row.runtime_spec_version = runtime_spec_version
         if version is not None:
             version.status = "published"
             version.progress_stage = "published"
             version.runtime_spec = runtime_spec
-            version.runtime_spec_version = RUNTIME_SPEC_VERSION
+            version.runtime_spec_version = runtime_spec_version
             version.updated_at = now
             db.add(version)
         row.updated_at = now
@@ -1311,7 +1315,7 @@ def publish_creation(
     return CreatorPublishResponse(
         video_id=row.id,
         status="pending_review",
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec_version=runtime_spec_version,
         share_url=_share_url(settings, row.id),
         cdn_status=(
             "ready"

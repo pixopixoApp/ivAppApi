@@ -196,12 +196,12 @@ python3 -m venv .venv
 ./scripts/deploy.sh
 ```
 
-首次上线持久化 runtime spec 时必须显式执行：
+首次上线持久化 runtime spec，或首次切换到 ExperienceSpec v1.1 时必须显式执行：
 
 ```bash
 ./scripts/deploy.sh --backfill-runtime-specs
 ```
 
-脚本会先做本地检查、远端源码快照和 MySQL dump，再运行 Alembic；指定 backfill 时先 dry-run、再 apply；随后切换 API、健康检查并重建 Worker。生产 `.env` 和 `volumes` 不会上传、下载或进入源码备份。
+脚本会先做本地检查、远端源码快照和 MySQL dump，再运行 Alembic；指定 backfill 时先 dry-run、再 apply，把历史 Runtime 内容从原始 timeline/story 重编译到当前协议版本；随后切换 API、健康检查并重建 Worker。生产 `.env` 和 `volumes` 不会上传、下载或进入源码备份。
 
 详细运维说明见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)，原始现状审计见 [docs/PROJECT_ANALYSIS.md](docs/PROJECT_ANALYSIS.md)。

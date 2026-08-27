@@ -1,10 +1,71 @@
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
+from app.db import engine
 from app.main import app
-from app.models import AnalyticsLog, PublishedVideo, User, VideoView
-from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
+from app.models import AnalyticsLog, CreatorCreation, PublishedVideo, User, VideoView
+from app.protocol_video import compile_runtime_spec
+
+
+def test_content_management_query_count_does_not_scale_with_page_size(db):
+    now = datetime.now(timezone.utc)
+    for index in range(30):
+        user_id = f"content-query-author-{index}"
+        video_id = f"content-query-video-{index}"
+        db.add(
+            User(
+                user_id=user_id,
+                provider="email",
+                subject=f"{user_id}@example.test",
+                nickname=f"Author {index}",
+            )
+        )
+        db.add(
+            PublishedVideo(
+                id=video_id,
+                content_type="runtime",
+                video_url=f"/media/{video_id}.mp4",
+                timeline={"large_source": "x" * 2000},
+                runtime_spec={"version": "1.1", "large_payload": "x" * 2000},
+                runtime_spec_version="1.1",
+                version="1",
+                user_id=user_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            CreatorCreation(
+                id=f"content-query-creation-{index}",
+                user_id=user_id,
+                upload_id=f"content-query-upload-{index}",
+                status="completed",
+                published_video_id=video_id,
+            )
+        )
+    db.commit()
+
+    statements: list[str] = []
+
+    def record_statement(*args) -> None:
+        statements.append(args[2])
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        with TestClient(app) as client:
+            response = client.get(
+                "/internal/v1/content-management?limit=30",
+                headers={"X-Publish-Key": "test-publish-key"},
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 30
+    assert len(response.json()["items"]) == 30
+    assert len(statements) <= 5, "\n".join(statements)
 
 
 def test_pending_ugc_is_not_public_until_reviewed(db):
@@ -14,7 +75,7 @@ def test_pending_ugc_is_not_public_until_reviewed(db):
         PublishedVideo(
             id="ugc-1", content_type="runtime", video_url="/media/ugc-1.mp4", timeline=timeline,
             runtime_spec=compile_runtime_spec(item_id="ugc-1", content_mode="single", source=timeline, video_url="/media/ugc-1.mp4"),
-            runtime_spec_version=RUNTIME_SPEC_VERSION, version="1", user_id="creator", content_source="ugc",
+            runtime_spec_version="1.1", version="1", user_id="creator", content_source="ugc",
             review_status="pending", created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
         )
     )
@@ -44,7 +105,7 @@ def test_video_metrics_are_aggregated_without_returning_raw_events(db):
                 source={"interactions": []},
                 video_url="/media/metric-1.mp4",
             ),
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version="1.1",
             version="1",
         )
     )
@@ -87,7 +148,7 @@ def test_non_distributed_content_remains_in_internal_operations_only(db):
                 source={"interactions": []},
                 video_url="/media/qa-vision-1.mp4",
             ),
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version="1.1",
             version="1",
             distribution_enabled=False,
         )
@@ -139,7 +200,7 @@ def test_operator_can_edit_a_runtime_draft_without_making_it_public(db):
                 source={"interactions": []},
                 video_url="/media/draft-runtime-1.mp4",
             ),
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version="1.1",
             version="draft-v1",
             review_status="approved",
         )

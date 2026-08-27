@@ -36,7 +36,7 @@ from app.oss_storage import (
     public_url,
     upload_file,
 )
-from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
+from app.protocol_video import compile_runtime_spec, runtime_spec_version_from_compiled
 
 
 @dataclass(frozen=True)
@@ -442,7 +442,9 @@ def apply_inventory(root: Path, batch_id: str, items: list[InventoryItem]) -> No
                 source=video.timeline or {},
                 video_url=video_url,
             )
-            video.runtime_spec_version = RUNTIME_SPEC_VERSION
+            video.runtime_spec_version = runtime_spec_version_from_compiled(
+                video.runtime_spec
+            )
             video.updated_at = now
         db.commit()
 

@@ -23,7 +23,7 @@ from app.models import (
     PublishedMediaAsset,
     PublishedVideo,
 )
-from app.protocol_video import RUNTIME_SPEC_VERSION, compile_runtime_spec
+from app.protocol_video import compile_runtime_spec, runtime_spec_version_from_compiled
 from app.publication_service import RuntimeSourceAsset, publish_runtime_assets
 
 
@@ -124,7 +124,9 @@ def main() -> int:
                     staged_payload={
                         "video_url": final_url,
                         "runtime_spec": runtime,
-                        "runtime_spec_version": RUNTIME_SPEC_VERSION,
+                        "runtime_spec_version": runtime_spec_version_from_compiled(
+                            runtime
+                        ),
                         "active_publication_id": published.publication_id,
                     },
                 )

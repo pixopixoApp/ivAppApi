@@ -17,7 +17,15 @@ from app.vision_targets import VisionTargetError, normalize_vision_config
 log = logging.getLogger(__name__)
 
 _CONF = 0.85
-RUNTIME_SPEC_VERSION = "1.0"
+# v1.1 adds ``video[].on_end`` and continuous_swipe. v1.2 adds
+# continuous_tap. Compilation deliberately keeps content on v1.1 unless the
+# new interaction is present so clients can negotiate capabilities safely.
+BASE_RUNTIME_SPEC_VERSION = "1.1"
+RUNTIME_SPEC_VERSION = "1.2"
+SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
+    {"1.0", BASE_RUNTIME_SPEC_VERSION, RUNTIME_SPEC_VERSION}
+)
+LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS = frozenset({"1.0", "1.1"})
 RUNTIME_SPEC_SCHEMA = "pixo.runtime.v1"
 
 # Per-gesture detection defaults (App interaction-type catalog).
@@ -48,6 +56,17 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
     "scrub_right": {**_TOUCH_MID, "response_window_ms": 0, "min_travel_dp": 96},
     "scrub_up": {**_TOUCH_MID, "response_window_ms": 0, "min_travel_dp": 96},
     "scrub_down": {**_TOUCH_MID, "response_window_ms": 0, "min_travel_dp": 96},
+    "continuous_swipe": {
+        **_TOUCH_MID,
+        "response_window_ms": 0,
+        "min_travel_dp": 32,
+        "idle_timeout_ms": 500,
+    },
+    "continuous_tap": {
+        **_TOUCH_MID,
+        "response_window_ms": 0,
+        "idle_timeout_ms": 500,
+    },
     "pinch": {**_TOUCH_MID, "response_window_ms": 0, "min_scale_delta": 0.2},
     "draw_circle": {
         **_TOUCH_MID,
@@ -92,6 +111,12 @@ _FEEDBACK = {
     "vibrate": True,
     "sound_effect": "sfx_cheer",
 }
+_CONTINUOUS_FEEDBACK = {
+    "animation": "none",
+    "animation_duration_ms": 0,
+    "vibrate": False,
+    "sound_effect": "",
+}
 
 _DEFAULT_PLACE = "middle_bottom"
 _ACTION_CONTINUE = {"action": "continue"}
@@ -124,6 +149,22 @@ def supported_gestures() -> frozenset[str]:
     return frozenset(_DETECTION_BY_GESTURE)
 
 
+def normalize_client_runtime_spec_versions(
+    declared: list[str] | None,
+) -> frozenset[str]:
+    """Intersect client capabilities with the server without rejecting future values."""
+    if declared is None:
+        return LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS
+    return frozenset(declared).intersection(SUPPORTED_RUNTIME_SPEC_VERSIONS)
+
+
+def runtime_spec_version_from_compiled(spec: dict[str, Any]) -> str:
+    version = spec.get("version") if isinstance(spec, dict) else None
+    if version not in SUPPORTED_RUNTIME_SPEC_VERSIONS:
+        raise RuntimeSpecError(f"compiled runtime spec has invalid version: {version!r}")
+    return str(version)
+
+
 def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
     base = _DETECTION_BY_GESTURE.get(gesture)
     if base is None:
@@ -144,6 +185,55 @@ def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
         except VisionTargetError as exc:
             raise RuntimeSpecError(str(exc)) from exc
     return detection
+
+
+def _validate_sustained_source(
+    timeline: dict[str, Any],
+    interactions: list[Any],
+) -> None:
+    sustained_types = {"continuous_swipe", "continuous_tap"}
+    if not any(
+        isinstance(item, dict) and item.get("gesture") in sustained_types
+        for item in interactions
+    ):
+        return
+    media = timeline.get("media")
+    duration = media.get("duration_ms") if isinstance(media, dict) else None
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+        raise RuntimeSpecError(
+            "timeline.media.duration_ms is required for sustained interactions"
+        )
+    for index, item in enumerate(interactions):
+        if not isinstance(item, dict) or item.get("gesture") not in sustained_types:
+            continue
+        label = f"interaction[{index}]"
+        gesture = str(item.get("gesture"))
+        gate = item.get("gate_at_ms")
+        if isinstance(gate, bool) or not isinstance(gate, int) or gate < 0:
+            raise RuntimeSpecError(f"{label} gate_at_ms must be a non-negative integer")
+        if gate >= duration:
+            raise RuntimeSpecError(
+                f"{label} {gesture} must start before media.duration_ms"
+            )
+        if item.get("pause_video", True) is not True:
+            raise RuntimeSpecError(f"{label} {gesture} requires pause_video=true")
+        if "gate_end_ms" in item:
+            raise RuntimeSpecError(f"{label} {gesture} does not allow gate_end_ms")
+        if "outcomes" in item:
+            raise RuntimeSpecError(f"{label} {gesture} does not allow outcomes")
+        if "region" in item:
+            raise RuntimeSpecError(f"{label} {gesture} does not allow region")
+        if index + 1 < len(interactions):
+            following = interactions[index + 1]
+            next_gate = following.get("gate_at_ms") if isinstance(following, dict) else None
+            if (
+                isinstance(next_gate, bool)
+                or not isinstance(next_gate, int)
+                or next_gate <= gate
+            ):
+                raise RuntimeSpecError(
+                    f"{label} {gesture} must end at a later interaction"
+                )
 
 
 def _outcome_to_action(outcome: Any) -> dict[str, Any]:
@@ -195,18 +285,28 @@ def _one_interaction(item: dict, *, index: int) -> dict:
     if gate < 0:
         raise RuntimeSpecError(f"interaction[{index}] gate_at_ms must be non-negative")
     detection = _detection_for_item(item, gesture=gesture)
-    on_success, on_miss = _actions_from_item(item)
+    sustained = gesture in {"continuous_swipe", "continuous_tap"}
+    if sustained:
+        on_success, on_miss = dict(_ACTION_CONTINUE), dict(_ACTION_CONTINUE)
+    else:
+        on_success, on_miss = _actions_from_item(item)
     pause_video = item.get("pause_video", True)
     if not isinstance(pause_video, bool):
         raise RuntimeSpecError(f"interaction[{index}] pause_video must be boolean")
     return {
         "id": f"action_{index + 1:03d}",
         "type": gesture,
-        "description": item.get("hint") or "",
+        "description": item.get("hint") or (
+            "持续往复滑动以播放"
+            if gesture == "continuous_swipe"
+            else "持续点击以播放"
+            if gesture == "continuous_tap"
+            else ""
+        ),
         "offset_time_ms": gate,
         "pause_video": pause_video,
         "detection": detection,
-        "feedback": dict(_FEEDBACK),
+        "feedback": dict(_CONTINUOUS_FEEDBACK if sustained else _FEEDBACK),
         "on_success": on_success,
         "on_miss": on_miss,
     }
@@ -224,6 +324,7 @@ def timeline_to_clip(
         interactions = timeline.get("interactions") or []
         if not isinstance(interactions, list):
             raise RuntimeSpecError("timeline.interactions must be an array")
+        _validate_sustained_source(timeline, interactions)
         for index, item in enumerate(interactions):
             if not isinstance(item, dict):
                 raise RuntimeSpecError(f"interaction[{index}] must be an object")
@@ -252,18 +353,23 @@ def timeline_to_video(
 
 
 def _on_end_action(on_end: Any) -> dict[str, Any] | None:
-    """Map clip-level on_end → Action; only goto is supported. Invalid/missing → None."""
+    """Map the Story clip-end event to the existing ExperienceSpec Action union."""
     if not isinstance(on_end, dict):
         return None
-    if on_end.get("action") != "goto":
+    action = on_end.get("action")
+    if action == "goto":
+        clip_id = on_end.get("clip_id")
+        if isinstance(clip_id, str) and clip_id.strip():
+            return {
+                "action": "jump_video",
+                "target_video_id": clip_id.strip(),
+                "timing": _TIMING_IMMEDIATE,
+            }
         return None
-    clip_id = on_end.get("clip_id")
-    if isinstance(clip_id, str) and clip_id.strip():
-        return {
-            "action": "jump_video",
-            "target_video_id": clip_id.strip(),
-            "timing": _TIMING_IMMEDIATE,
-        }
+    if action == "end":
+        return {"action": "end_experience", "timing": _TIMING_IMMEDIATE}
+    if action == "retry_previous_point":
+        return {"action": "retry_previous_point"}
     return None
 
 
@@ -281,6 +387,8 @@ def _clip_from_story_body(
         clip_id=clip_id,
     )
     end_action = _on_end_action(body.get("on_end"))
+    if "on_end" in body and end_action is None:
+        raise RuntimeSpecError(f"story clip {clip_id!r} has an invalid on_end action")
     if end_action is not None:
         clip["on_end"] = end_action
     return clip
@@ -388,6 +496,7 @@ def compile_runtime_spec(
     except ValidationError as exc:
         raise RuntimeSpecError(f"invalid compiled runtime spec: {exc}") from exc
     clip_ids = {clip["video_id"] for clip in clips}
+    incoming_interaction_targets: set[str] = set()
     for clip in clips:
         actions = [clip.get("on_end")]
         for interaction in clip["interactions"]:
@@ -399,9 +508,32 @@ def compile_runtime_spec(
                 raise RuntimeSpecError(
                     f"jump target not found: {action.get('target_video_id')!r}"
                 )
+        for interaction in clip["interactions"]:
+            for action in (interaction.get("on_success"), interaction.get("on_miss")):
+                if isinstance(action, dict) and action.get("action") == "jump_video":
+                    incoming_interaction_targets.add(str(action.get("target_video_id") or ""))
+    for clip in clips:
+        if (
+            isinstance(clip.get("on_end"), dict)
+            and clip["on_end"].get("action") == "retry_previous_point"
+            and clip["video_id"] not in incoming_interaction_targets
+        ):
+            raise RuntimeSpecError(
+                f"video {clip['video_id']!r} on_end retry_previous_point requires "
+                "an incoming interaction jump_video"
+            )
+    compiled_version = (
+        RUNTIME_SPEC_VERSION
+        if any(
+            interaction["type"] == "continuous_tap"
+            for clip in clips
+            for interaction in clip["interactions"]
+        )
+        else BASE_RUNTIME_SPEC_VERSION
+    )
     return {
         "schema": RUNTIME_SPEC_SCHEMA,
-        "version": RUNTIME_SPEC_VERSION,
+        "version": compiled_version,
         "item_id": item_id,
         "video": clips,
     }
@@ -414,9 +546,9 @@ def read_runtime_spec(
     version: str | None,
 ) -> list[ClipOut]:
     """Validate persisted data without adding, changing, or defaulting fields."""
-    if version != RUNTIME_SPEC_VERSION:
+    if version not in SUPPORTED_RUNTIME_SPEC_VERSIONS:
         raise RuntimeSpecError(
-            f"runtime spec version mismatch: {version!r} != {RUNTIME_SPEC_VERSION!r}"
+            f"unsupported runtime spec version: {version!r}"
         )
     if not isinstance(spec, dict):
         raise RuntimeSpecError("runtime spec missing")
@@ -433,13 +565,93 @@ def read_runtime_spec(
         clips = [ClipOut.model_validate(raw) for raw in raw_clips]
     except ValidationError as exc:
         raise RuntimeSpecError(f"runtime spec validation failed: {exc}") from exc
+    if version == "1.0" and any(clip.on_end is not None for clip in clips):
+        raise RuntimeSpecError("video.on_end requires runtime spec version 1.1")
+    clip_ids = {clip.video_id for clip in clips}
+    incoming_interaction_targets: set[str] = set()
     for clip in clips:
+        actions = [clip.on_end]
         for interaction in clip.interactions:
+            actions.extend((interaction.on_success, interaction.on_miss))
+            for action in (interaction.on_success, interaction.on_miss):
+                if action.action == "jump_video" and action.target_video_id:
+                    incoming_interaction_targets.add(action.target_video_id)
+        for action in actions:
+            if action is None or action.action != "jump_video":
+                continue
+            if action.target_video_id not in clip_ids:
+                raise RuntimeSpecError(
+                    f"jump target not found: {action.target_video_id!r}"
+                )
+        for index, interaction in enumerate(clip.interactions):
+            if interaction.type not in _DETECTION_BY_GESTURE:
+                raise RuntimeSpecError(f"unsupported gesture: {interaction.type}")
+            if version == "1.0" and interaction.type == "continuous_swipe":
+                raise RuntimeSpecError("continuous_swipe requires runtime spec version 1.1")
+            if version in {"1.0", "1.1"} and interaction.type == "continuous_tap":
+                raise RuntimeSpecError("continuous_tap requires runtime spec version 1.2")
             if interaction.detection.response_window_ms < 0:
                 raise RuntimeSpecError("interaction response_window_ms must be non-negative")
+            if interaction.type == "continuous_swipe":
+                detection = interaction.detection
+                if (
+                    interaction.offset_time_ms is None
+                    or interaction.pause_video is not True
+                    or detection.response_window_ms != 0
+                    or detection.place != "middle_middle"
+                    or detection.min_travel_dp != 32
+                    or detection.idle_timeout_ms not in {180, 360, 500}
+                    or interaction.on_success.action != "continue"
+                    or interaction.on_miss.action != "continue"
+                ):
+                    raise RuntimeSpecError(
+                        "continuous_swipe persisted contract is invalid"
+                    )
+                next_offset = (
+                    clip.interactions[index + 1].offset_time_ms
+                    if index + 1 < len(clip.interactions)
+                    else None
+                )
+                if next_offset is not None and next_offset <= interaction.offset_time_ms:
+                    raise RuntimeSpecError(
+                        "continuous_swipe must end at a later interaction"
+                    )
+            if interaction.type == "continuous_tap":
+                detection = interaction.detection
+                if (
+                    interaction.pause_video is not True
+                    or detection.response_window_ms != 0
+                    or detection.place != "middle_middle"
+                    or detection.idle_timeout_ms != 500
+                    or detection.min_travel_dp is not None
+                    or interaction.on_success.action != "continue"
+                    or interaction.on_miss.action != "continue"
+                ):
+                    raise RuntimeSpecError(
+                        "continuous_tap persisted contract is invalid"
+                    )
+                next_offset = (
+                    clip.interactions[index + 1].offset_time_ms
+                    if index + 1 < len(clip.interactions)
+                    else None
+                )
+                if next_offset is not None and next_offset <= interaction.offset_time_ms:
+                    raise RuntimeSpecError(
+                        "continuous_tap must end at a later interaction"
+                    )
             if interaction.type == "camera_motion":
                 try:
                     normalize_vision_config((interaction.detection.model_extra or {}).get("vision"))
                 except VisionTargetError as exc:
                     raise RuntimeSpecError(str(exc)) from exc
+    for clip in clips:
+        if (
+            clip.on_end is not None
+            and clip.on_end.action == "retry_previous_point"
+            and clip.video_id not in incoming_interaction_targets
+        ):
+            raise RuntimeSpecError(
+                f"video {clip.video_id!r} on_end retry_previous_point requires "
+                "an incoming interaction jump_video"
+            )
     return clips

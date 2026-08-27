@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -9,7 +10,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.avatar_storage import (
     AvatarStorageError,
@@ -52,13 +53,13 @@ from app.models import (
     User,
     VideoView,
 )
-from app.oss_storage import OssStorageError, public_url, sign_get_url
+from app.oss_storage import OssStorageError, public_url
 from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
-    RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
     compile_runtime_spec,
     read_runtime_spec,
+    runtime_spec_version_from_compiled,
 )
 from app.public_origin import (
     PublicOriginError,
@@ -211,13 +212,18 @@ def _remove_published_media(settings: Settings, item_id: str) -> None:
         log.info("removed story media dir item_id=%s path=%s", item_id, story)
 
 
+def _normalize_timeline(data: Any) -> dict[str, Any]:
+    """Validate business JSON without materializing omitted optional fields."""
+    return Timeline.model_validate(data).model_dump(mode="python", exclude_none=True)
+
+
 def _parse_timeline(raw: str) -> dict[str, Any]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"timeline must be JSON: {exc}") from exc
     try:
-        return Timeline.model_validate(data).model_dump(mode="python")
+        return _normalize_timeline(data)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
 
@@ -249,7 +255,7 @@ def _parse_story(raw: str) -> dict[str, Any]:
         if timeline is None:
             raise HTTPException(status_code=400, detail=f"story.clips[{cid}].timeline required")
         try:
-            tl = Timeline.model_validate(timeline).model_dump(mode="python")
+            tl = _normalize_timeline(timeline)
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"invalid timeline for clip {cid}: {exc}"
@@ -714,6 +720,7 @@ async def publish(
         dest.write_bytes(raw)
         detail = f"interactions={n_interactions} bytes={len(raw)}"
 
+    compiled_version = runtime_spec_version_from_compiled(runtime_spec)
     now = datetime.now(timezone.utc)
     source_created_at = None
     if created_at:
@@ -737,7 +744,7 @@ async def publish(
                 video_url=video_url,
                 timeline=payload_json,
                 runtime_spec=runtime_spec,
-                runtime_spec_version=RUNTIME_SPEC_VERSION,
+                runtime_spec_version=compiled_version,
                 html_url=None,
                 bridge_version=None,
                 required_capabilities=[],
@@ -771,13 +778,13 @@ async def publish(
             user_id=author_id,
             content_mode=mode,
             updated=False,
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version=compiled_version,
         )
 
     row.video_url = video_url
     row.timeline = payload_json
     row.runtime_spec = runtime_spec
-    row.runtime_spec_version = RUNTIME_SPEC_VERSION
+    row.runtime_spec_version = compiled_version
     row.html_url = None
     row.bridge_version = None
     row.required_capabilities = []
@@ -810,7 +817,7 @@ async def publish(
         user_id=author_id,
         content_mode=mode,
         updated=True,
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec_version=compiled_version,
     )
 
 
@@ -850,7 +857,7 @@ def publish_assets(
         if payload.timeline is None:
             raise HTTPException(status_code=400, detail="timeline is required")
         try:
-            source_payload = Timeline.model_validate(payload.timeline).model_dump(mode="python")
+            source_payload = _normalize_timeline(payload.timeline)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
         declarations = [item for item in payload.assets if item.role == "single"]
@@ -918,6 +925,7 @@ def publish_assets(
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    compiled_version = runtime_spec_version_from_compiled(runtime_spec)
     now = datetime.now(timezone.utc)
     updated = existing is not None
     source_created_at = payload.created_at
@@ -935,7 +943,7 @@ def publish_assets(
         "video_url": video_url,
         "timeline": source_payload,
         "runtime_spec": runtime_spec,
-        "runtime_spec_version": RUNTIME_SPEC_VERSION,
+        "runtime_spec_version": compiled_version,
         "html_url": None,
         "bridge_version": None,
         "required_capabilities": [],
@@ -1004,7 +1012,7 @@ def publish_assets(
         user_id=author_id,
         content_mode=payload.content_mode,
         updated=updated,
-        runtime_spec_version=RUNTIME_SPEC_VERSION,
+        runtime_spec_version=compiled_version,
         publication_id=published_assets.publication_id,
         cdn_status=cdn_status,
         poll_after_ms=0 if cdn_status == "ready" else 10_000,
@@ -1034,7 +1042,7 @@ def preview_runtime(
         if payload.timeline is None:
             raise HTTPException(status_code=400, detail="timeline is required")
         try:
-            source_payload = Timeline.model_validate(payload.timeline).model_dump(mode="python")
+            source_payload = _normalize_timeline(payload.timeline)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid timeline: {exc}") from exc
         declarations = [item for item in payload.assets if item.role == "single"]
@@ -1268,12 +1276,75 @@ def _video_info(
     )
 
 
-def _content_management_out(db: Session, settings: Settings, row: PublishedVideo) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _ContentManagementContext:
+    authors: dict[str, User]
+    covers: dict[str, MediaObject]
+    creation_statuses: dict[str, str]
+
+
+def _load_content_management_context(
+    db: Session, rows: list[PublishedVideo]
+) -> _ContentManagementContext:
+    author_ids = {row.user_id for row in rows if row.user_id}
+    cover_ids = {row.cover_media_object_id for row in rows if row.cover_media_object_id}
+    video_ids = [row.id for row in rows]
+    authors = (
+        {
+            row.user_id: row
+            for row in db.query(User).filter(User.user_id.in_(author_ids)).all()
+        }
+        if author_ids
+        else {}
+    )
+    covers = (
+        {
+            row.id: row
+            for row in db.query(MediaObject).filter(MediaObject.id.in_(cover_ids)).all()
+        }
+        if cover_ids
+        else {}
+    )
+    creation_statuses = (
+        {
+            published_video_id: status
+            for published_video_id, status in db.query(
+                CreatorCreation.published_video_id,
+                CreatorCreation.status,
+            )
+            .filter(CreatorCreation.published_video_id.in_(video_ids))
+            .all()
+        }
+        if video_ids
+        else {}
+    )
+    return _ContentManagementContext(
+        authors=authors,
+        covers=covers,
+        creation_statuses=creation_statuses,
+    )
+
+
+def _content_management_out(
+    db: Session,
+    settings: Settings,
+    row: PublishedVideo,
+    *,
+    context: _ContentManagementContext | None = None,
+) -> dict[str, Any]:
     """Small, UI-oriented projection. Binary media is always browser→OSS."""
-    author = db.get(User, row.user_id) if row.user_id else None
+    author = (
+        context.authors.get(row.user_id)
+        if context is not None and row.user_id
+        else db.get(User, row.user_id) if row.user_id else None
+    )
     cover_url = ""
     if row.cover_media_object_id:
-        cover = db.get(MediaObject, row.cover_media_object_id)
+        cover = (
+            context.covers.get(row.cover_media_object_id)
+            if context is not None
+            else db.get(MediaObject, row.cover_media_object_id)
+        )
         if cover is not None:
             # 封面是公开的 immutable 对象，直接给 CDN / 公开 OSS 的永久 URL，
             # 避免使用 OSS 私有签名 URL（会过期、带签名参数，不适合 <img> 直用）。
@@ -1284,7 +1355,15 @@ def _content_management_out(db: Session, settings: Settings, row: PublishedVideo
                     cover_url = public_url(settings, cover.object_key)
                 except OssStorageError:
                     log.warning("content cover public url failed video_id=%s", row.id)
-    creation = db.query(CreatorCreation).filter(CreatorCreation.published_video_id == row.id).one_or_none()
+    if context is None:
+        creation = (
+            db.query(CreatorCreation)
+            .filter(CreatorCreation.published_video_id == row.id)
+            .one_or_none()
+        )
+        creation_status = creation.status if creation else "published"
+    else:
+        creation_status = context.creation_statuses.get(row.id, "published")
     return {
         "id": row.id,
         "source": row.content_source or "pgc",
@@ -1292,7 +1371,7 @@ def _content_management_out(db: Session, settings: Settings, row: PublishedVideo
         "title": row.title or row.id,
         "description": row.description or "",
         "status": row.review_status or "approved",
-        "creation_status": creation.status if creation else "published",
+        "creation_status": creation_status,
         "author_user_id": row.user_id or "",
         "author_nickname": (author.nickname if author else "") or "",
         "feed_weight": int(row.feed_weight or 0),
@@ -1332,8 +1411,42 @@ def list_content_management(
     if status != "all":
         q = q.filter(PublishedVideo.review_status == status)
     total = q.count()
-    rows = q.order_by(PublishedVideo.updated_at.desc(), PublishedVideo.id.desc()).offset(offset).limit(limit).all()
-    return {"items": [_content_management_out(db, settings, row) for row in rows], "total": total}
+    rows = (
+        q.options(
+            load_only(
+                PublishedVideo.id,
+                PublishedVideo.content_source,
+                PublishedVideo.content_type,
+                PublishedVideo.title,
+                PublishedVideo.description,
+                PublishedVideo.review_status,
+                PublishedVideo.user_id,
+                PublishedVideo.feed_weight,
+                PublishedVideo.distribution_enabled,
+                PublishedVideo.cdn_ready,
+                PublishedVideo.is_tutorial,
+                PublishedVideo.cover_media_object_id,
+                PublishedVideo.html_url,
+                PublishedVideo.video_url,
+                PublishedVideo.created_at,
+                PublishedVideo.updated_at,
+                PublishedVideo.reviewed_by,
+                PublishedVideo.reviewed_at,
+                PublishedVideo.review_note,
+            )
+        )
+        .order_by(PublishedVideo.updated_at.desc(), PublishedVideo.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    context = _load_content_management_context(db, rows)
+    return {
+        "items": [
+            _content_management_out(db, settings, row, context=context) for row in rows
+        ],
+        "total": total,
+    }
 
 
 @router.get("/content-management/{video_id}", summary="统一内容管理详情")
@@ -1423,9 +1536,7 @@ def patch_content_management_detail(
                     db, settings, video_id=row.id, publication_id=row.active_publication_id
                 )
             else:
-                source = Timeline.model_validate(payload.timeline).model_dump(
-                    mode="python", exclude_none=True
-                )
+                source = _normalize_timeline(payload.timeline)
             row.timeline = source
             row.runtime_spec = compile_runtime_spec(
                 item_id=row.id,
@@ -1434,7 +1545,9 @@ def patch_content_management_detail(
                 video_url=canonicalize_public_url(settings, row.video_url) or row.video_url,
                 video_urls=story_urls,
             )
-            row.runtime_spec_version = RUNTIME_SPEC_VERSION
+            row.runtime_spec_version = runtime_spec_version_from_compiled(
+                row.runtime_spec
+            )
         except HTTPException:
             raise
         except (MediaServiceError, OssStorageError, RuntimeSpecError, ValueError) as exc:
@@ -1605,7 +1718,7 @@ def recompile_video_runtime_spec(
     except (MediaServiceError, OssStorageError, RuntimeSpecError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     row.runtime_spec = spec
-    row.runtime_spec_version = RUNTIME_SPEC_VERSION
+    row.runtime_spec_version = runtime_spec_version_from_compiled(spec)
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)

@@ -7,12 +7,16 @@
 - SSH：`root@123.56.218.5:22`
 - 项目：`/opt/play_video/ivapp`
 - Compose project：`ivapp`
-- API service：`api`
+- API service：`api`（默认 3 个 Uvicorn worker，可用 `API_WORKERS` 显式覆盖）
 - 创作协调 Worker service：`worker`（单实例、全局并发 1；只调用 ivadmin 私有 API）
 - 健康检查：`http://127.0.0.1:8100/health`
 - Compose 命令：`docker-compose`（不是 `docker compose`）
 
 服务器必须已有真实 `/opt/play_video/ivapp/.env` 和数据库/Redis `volumes/`。媒体切换严格按 [OSS 手册](OSS_MEDIA_MIGRATION.md) 执行。
+
+当前 4 vCPU 生产机保持 `API_WORKERS=3`，为 MySQL、Redis 与后台任务预留容量。每个进程拥有独立的 SQLAlchemy
+连接池与应用缓存；调整 worker 数前必须同时复核 CPU、内存、数据库连接
+预算，并重新运行稳态压测，不能只按核数盲目增加。
 
 ## 2. 本地配置
 
@@ -39,13 +43,13 @@ cp .deploy.env.example .deploy.env
 ./scripts/deploy.sh
 ```
 
-首次引入 `runtime_spec` 或明确需要重编译全部历史作品时使用：
+首次引入 `runtime_spec`、首次切换到 ExperienceSpec v1.1，或明确需要重编译全部历史作品时使用：
 
 ```bash
 ./scripts/deploy.sh --backfill-runtime-specs
 ```
 
-该开关会在切换 API 前依次执行 dry-run 与 apply。普通发布不会自动重编译旧作品，避免编译规则变化悄悄改变线上内容。
+该开关会在切换 API 前依次执行 dry-run 与 apply。v1.1 首次发布必须使用它，将历史 Story 中原先按 v1.0 持久化的 `on_end` 重新编译并标记为 v1.1。普通发布不会自动重编译旧作品，避免编译规则变化悄悄改变线上内容。
 
 脚本顺序：
 
