@@ -27,7 +27,7 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
-from app.db import get_db
+from app.db import engine, get_db
 from app.deps import require_publish_key
 from app.html_content import (
     CONTENT_TYPE_HTML,
@@ -423,6 +423,69 @@ def list_users(
     return AdminUserListResponse(
         items=items, total=total, limit=limit, offset=offset
     )
+
+
+def _random_user_func():
+    """Return a SQLAlchemy random()/rand() expression for the active DB dialect.
+
+    MySQL uses RAND(), while SQLite/PostgreSQL use RANDOM().
+    """
+    if engine.dialect.name == "mysql":
+        return func.rand()
+    return func.random()
+
+
+@router.get(
+    "/users/random",
+    response_model=AdminUserOut,
+    summary="随机抽取一个可用账户",
+    description="Header 需 X-Publish-Key。从 users 表中随机返回一个 source=admin、enabled=true、"
+    "且不在 exclude_user_ids 中的账户；没有可用账户时返回 HTTP 404。",
+)
+def random_user(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+    source: Annotated[
+        str, Query(description="创建来源：固定为 admin")
+    ] = USER_SOURCE_ADMIN,
+    enabled: Annotated[
+        bool | None, Query(description="是否启用，默认 true")
+    ] = None,
+    exclude_user_ids: Annotated[
+        list[str] | None,
+        Query(description="需要排除的已绑定 user_id 列表（可重复传参）"),
+    ] = None,
+) -> AdminUserOut:
+    src = (source or USER_SOURCE_ADMIN).strip() or USER_SOURCE_ADMIN
+    if src != USER_SOURCE_ADMIN:
+        raise HTTPException(status_code=400, detail="source must be admin")
+    is_enabled = True if enabled is None else enabled
+
+    query = db.query(User).filter(
+        User.source == src,
+        User.enabled.is_(is_enabled),
+    )
+    if exclude_user_ids:
+        cleaned = [u for u in exclude_user_ids if u and u.strip()]
+        if cleaned:
+            query = query.filter(~User.user_id.in_(cleaned))
+
+    row = query.order_by(_random_user_func()).limit(1).first()
+    if row is None:
+        log.info(
+            "random user none source=%s enabled=%s exclude_count=%d",
+            src,
+            is_enabled,
+            len(exclude_user_ids or []),
+        )
+        raise HTTPException(status_code=404, detail="no available unbound account")
+    log.info(
+        "random user picked source=%s enabled=%s exclude_count=%d",
+        src,
+        is_enabled,
+        len(exclude_user_ids or []),
+    )
+    return _admin_user_out(row)
 
 
 @router.get(
