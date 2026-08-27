@@ -119,6 +119,8 @@ class Settings(BaseSettings):
     creator_video_max_bytes: int = 120 * 1024 * 1024
     creator_video_max_duration_seconds: int = 30
     public_share_base_url: str = ""
+    # Canonical browser player used for shareable Runtime permalinks.
+    public_game_base_url: str = "https://demo.pixopixo.cn/game/"
 
     # Immutable, reviewed HTML packages. Comma-separated HTTPS origins only.
     html_trusted_origins: str = ""

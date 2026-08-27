@@ -97,6 +97,7 @@ from app.schemas import (
     VideoRequest,
     VideoResponse,
 )
+from app.share_urls import published_share_url
 from app.users import get_or_create_user, is_author_visible, is_under_13, needs_birthday
 from app.verification_codes import PURPOSE_LOGIN, find_valid_code, issue_email_code
 
@@ -267,10 +268,11 @@ def _item_from_published(
         content_type=content_type,
         title=row.title or "",
         description=row.description or "",
-        share_url=(
-            f"{public_share_base_url.rstrip('/')}/api/v1/share/{row.id}"
-            if public_share_base_url
-            else f"/api/v1/share/{row.id}"
+        share_url=published_share_url(
+            content_type=content_type,
+            item_id=row.id,
+            public_game_base_url=settings.public_game_base_url,
+            public_share_base_url=public_share_base_url,
         ),
         user_id=row.user_id,
         nickname=nickname,

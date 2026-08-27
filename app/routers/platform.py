@@ -80,6 +80,7 @@ from app.schemas_platform import (
     InviteRevokeResponse,
     Platform,
 )
+from app.share_urls import legacy_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
 from app.video_probe import VideoProbeError, probe_video
@@ -245,8 +246,8 @@ def _creation_out(
 
 
 def _share_url(settings: Settings, video_id: str) -> str:
-    relative = f"/api/v1/share/{video_id}"
-    return f"{settings.public_share_base_url.rstrip('/')}{relative}" if settings.public_share_base_url else relative
+    experience_url = runtime_experience_url(settings.public_game_base_url, video_id)
+    return experience_url or legacy_share_url(settings.public_share_base_url, video_id)
 
 
 @public_router.post(
@@ -1390,7 +1391,7 @@ def creator_share_page(
     video_id: str,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> HTMLResponse:
+) -> Response:
     video = db.get(PublishedVideo, video_id)
     if (
         video is None
@@ -1400,6 +1401,10 @@ def creator_share_page(
         or not video.cdn_ready
     ):
         raise HTTPException(status_code=404, detail="video not found")
+    if video.content_type != "html":
+        experience_url = runtime_experience_url(settings.public_game_base_url, video.id)
+        if experience_url:
+            return RedirectResponse(url=experience_url, status_code=302)
     title = html.escape(video.title or "Pixo interactive video")
     description = html.escape(video.description or "Play this interactive video on Pixo")
     deep_link = html.escape(f"pixo://work/{quote(video.id, safe='')}", quote=True)

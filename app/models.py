@@ -325,7 +325,7 @@ class CreatorUpload(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    storage_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     media_object_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, unique=True, index=True
     )

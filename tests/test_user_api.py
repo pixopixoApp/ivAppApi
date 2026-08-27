@@ -280,6 +280,12 @@ def test_continuous_tap_is_only_served_to_v12_capable_clients(db) -> None:
     assert legacy_feed["head"]["status"] == 100
     assert legacy_detail["head"]["status"] == 100
     assert capable_feed["body"]["items"][0]["experience_spec_version"] == "1.2"
+    assert capable_feed["body"]["items"][0]["share_url"] == (
+        "https://demo.pixopixo.cn/game/?experience=continuous-tap-item"
+    )
+    assert capable_detail["body"]["items"][0]["share_url"] == (
+        "https://demo.pixopixo.cn/game/?experience=continuous-tap-item"
+    )
     assert capable_feed["body"]["items"][0]["video"][0]["interactions"][0][
         "type"
     ] == "continuous_tap"
