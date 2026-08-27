@@ -1,14 +1,61 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 
 from app.config import get_settings
 from app.models import CreatorCreation, CreatorUpload, CreatorVersion
-from app.protocol_video import RUNTIME_SPEC_VERSION
-from app.worker import _apply_remote_job, process_creator_version
+from app.worker import (
+    _apply_remote_job,
+    process_creator_version,
+    process_next_upload_normalization,
+)
+
+
+def test_pending_normalization_is_not_starved_by_ready_backup_sync(
+    db,
+    monkeypatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    ready_without_backup = CreatorUpload(
+        id="up_ready_without_backup",
+        user_id="creator-old",
+        storage_key="creator_uploads/creator-old/ready.mp4",
+        original_filename="ready.mp4",
+        size_bytes=10,
+        duration_ms=1_000,
+        source_sha256="a" * 64,
+        normalization_job_id="mnj-ready",
+        normalization_status="ready",
+        playable_local_uri="local-cache://sha256/" + "b" * 64,
+        playable_sha256="b" * 64,
+        playable_size_bytes=10,
+        created_at=now - timedelta(minutes=5),
+    )
+    pending = CreatorUpload(
+        id="up_pending",
+        user_id="creator-new",
+        storage_key="creator_uploads/creator-new/pending.mp4",
+        original_filename="pending.mp4",
+        size_bytes=10,
+        duration_ms=1_000,
+        source_sha256="c" * 64,
+        normalization_status="pending",
+        created_at=now,
+    )
+    db.add_all([ready_without_backup, pending])
+    db.commit()
+    processed: list[str] = []
+
+    def fake_process(_db, _settings, upload) -> None:
+        processed.append(upload.id)
+
+    monkeypatch.setattr("app.worker.process_upload_normalization", fake_process)
+
+    assert process_next_upload_normalization() is True
+    assert processed == [pending.id]
 
 
 def test_ivadmin_ready_timeline_is_persisted_as_runtime_version(db) -> None:
@@ -70,7 +117,7 @@ def test_ivadmin_ready_timeline_is_persisted_as_runtime_version(db) -> None:
     db.refresh(version)
     db.refresh(creation)
     assert version.status == "ready"
-    assert version.runtime_spec_version == RUNTIME_SPEC_VERSION
+    assert version.runtime_spec_version == "1.1"
     assert creation.active_version_id == version.id
     assert creation.status == "ready"
     assert version.runtime_spec["video"][0]["interactions"][0]["type"] == "tap"

@@ -712,6 +712,85 @@ def test_internal_backup_uses_shared_cache_instead_of_redownload(
     assert result.objects[0].sha256 == digest
 
 
+def test_internal_creator_backup_probes_verified_shared_cache_file(
+    db,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MEDIA_CACHE_ROOT", str(tmp_path / "media-cache"))
+    settings = _oss_settings(monkeypatch)
+    payload = b"locally-verified-creator-video"
+    digest = hashlib.sha256(payload).hexdigest()
+    cached = object_path(settings, digest)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(payload)
+    monkeypatch.setattr(
+        "app.media_service.create_post_upload",
+        lambda _settings, **kwargs: (
+            "https://oss.test",
+            {"key": kwargs["key"], "policy": "signed"},
+        ),
+    )
+    session = create_upload_session(
+        db,
+        settings,
+        actor_type="internal",
+        actor_id="publish-key",
+        purpose="creator_video",
+        target_id="creator_upload_001",
+        context={"local_sha256": digest, "backup_job_id": "backup_creator_001"},
+        objects=[
+            DirectUploadObjectRequest(
+                client_ref="playable.mp4",
+                filename="playable.mp4",
+                relative_path="playable.mp4",
+                content_type="video/mp4",
+                size_bytes=len(payload),
+                sha256=digest,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "app.media_service.head_object",
+        lambda _settings, *, key: OssObjectMetadata(
+            size_bytes=len(payload),
+            content_type="video/mp4",
+            etag="etag",
+            headers={"x-oss-meta-sha256": digest},
+        ),
+    )
+    monkeypatch.setattr(
+        "app.media_service.download_file",
+        lambda *_args, **_kwargs: pytest.fail(
+            "shared-cache creator backup must not be downloaded from OSS"
+        ),
+    )
+    monkeypatch.setattr(
+        "app.media_service.probe_video",
+        lambda path: (
+            SimpleNamespace(duration_ms=1_000)
+            if path == cached
+            else pytest.fail("creator backup must probe the verified shared-cache file")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.media_service.copy_object",
+        lambda _settings, **kwargs: kwargs["target_key"],
+    )
+
+    result = finalize_upload_session(
+        db,
+        settings,
+        session_id=session.session_id,
+        actor_type="internal",
+        actor_id="publish-key",
+    )
+
+    assert result.state == "ready"
+    assert result.objects[0].sha256 == digest
+
+
 def test_media_migration_preflight_reports_missing_runtime_file(db, tmp_path: Path) -> None:
     db.add(
         PublishedVideo(

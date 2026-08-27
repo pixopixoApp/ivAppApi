@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 class ProtocolHeadIn(BaseModel):
@@ -268,7 +275,34 @@ class BatchVideosResponse(BaseModel):
     missing: list[str] = Field(default_factory=list, description="未找到的 video_id")
 
 
-class VideoBodyIn(BaseModel):
+class RuntimeCapabilitiesIn(BaseModel):
+    """Client-declared runtime versions; omission deliberately means legacy."""
+
+    supported_experience_spec_versions: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=8,
+        description=(
+            "客户端可解析的 ExperienceSpec 版本；不传按旧客户端 1.0/1.1 处理"
+        ),
+    )
+
+    @field_validator("supported_experience_spec_versions")
+    @classmethod
+    def _validate_runtime_versions(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for raw in value:
+            version = raw.strip()
+            if not version or len(version) > 16:
+                raise ValueError("experience spec versions must be 1-16 characters")
+            if version not in normalized:
+                normalized.append(version)
+        return normalized
+
+
+class VideoBodyIn(RuntimeCapabilitiesIn):
     """App 拉视频列表；可空。limit 控制本批条数。"""
 
     limit: int = Field(default=10, ge=1, le=50, description="本批返回视频条数")
@@ -293,6 +327,7 @@ class DetectionOut(BaseModel):
     max_volume_score: int | None = None
     min_distance_dp: int | None = None
     min_travel_dp: int | None = None
+    idle_timeout_ms: int | None = None
     min_scale_delta: float | None = None
     min_radius_dp: int | None = None
     max_closure_gap_dp: int | None = None
@@ -315,12 +350,18 @@ class FeedbackOut(BaseModel):
 
 
 class ActionOut(BaseModel):
-    """App v1.0 结果动作；序列化排除 null，避免携带无关字段。"""
+    """ExperienceSpec 结果动作；序列化排除 null，避免携带无关字段。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    action: str = Field(
-        description="continue | jump_video | restart_video（本期不产出 end_experience / retry_previous_point）"
+    action: Literal[
+        "continue",
+        "retry_previous_point",
+        "restart_video",
+        "jump_video",
+        "end_experience",
+    ] = Field(
+        description="continue | retry_previous_point | restart_video | jump_video | end_experience"
     )
     target_video_id: str | None = Field(
         default=None, description="jump_video 必填：同 item 内目标 video_id"
@@ -328,6 +369,18 @@ class ActionOut(BaseModel):
     timing: Literal["immediate", "video_end"] | None = Field(
         default=None, description="jump_video 必填：immediate 或 video_end"
     )
+
+    @model_validator(mode="after")
+    def _validate_action_shape(self) -> ActionOut:
+        if self.action == "jump_video":
+            if not self.target_video_id or self.timing is None:
+                raise ValueError("jump_video requires target_video_id and timing")
+        elif self.action == "end_experience":
+            if self.target_video_id is not None or self.timing is None:
+                raise ValueError("end_experience requires timing and forbids target_video_id")
+        elif self.target_video_id is not None or self.timing is not None:
+            raise ValueError(f"{self.action} forbids target_video_id and timing")
+        return self
 
     @model_serializer(mode="wrap")
     def _omit_nulls(self, handler: Any) -> dict[str, Any]:
@@ -353,7 +406,7 @@ class ClipOut(BaseModel):
     interactions: list[InteractionOut] = Field(description="互动点列表（含分支 Action）")
     on_end: ActionOut | None = Field(
         default=None,
-        description="本段播完后的动作；缺省表示无跳转（Story 源 on_end.goto → jump_video）",
+        description="v1.1 本段播完后的动作；复用同一 Action 联合",
     )
 
     @model_serializer(mode="wrap")
@@ -375,6 +428,10 @@ class FeedItemOut(BaseModel):
     is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
     following: bool = Field(default=False, description="is_following 的兼容字段")
+    experience_spec_version: Literal["1.0", "1.1", "1.2"] | None = Field(
+        default=None,
+        description="Runtime ExperienceSpec 版本；HTML 内容不携带",
+    )
     video: list[ClipOut] | None = Field(
         default=None, description="Runtime：单视频 length=1；Story 多段，入口 clip 在首位"
     )
@@ -387,11 +444,15 @@ class FeedItemOut(BaseModel):
         if self.content_type == "runtime":
             if not self.video:
                 raise ValueError("runtime feed item requires video")
+            if self.experience_spec_version not in {"1.0", "1.1", "1.2"}:
+                raise ValueError("runtime feed item requires a supported experience_spec_version")
             if self.html_url is not None or self.bridge_version is not None:
                 raise ValueError("runtime feed item cannot contain HTML payload")
         else:
             if self.video is not None:
                 raise ValueError("html feed item cannot contain runtime video")
+            if self.experience_spec_version is not None:
+                raise ValueError("html feed item cannot contain experience_spec_version")
             if not self.html_url or self.bridge_version != 1:
                 raise ValueError("html feed item requires html_url and bridge_version=1")
         return self
@@ -414,7 +475,7 @@ class VideoResponse(BaseModel):
     body: VideoBodyOut | EmptyBody
 
 
-class VideoDetailBodyIn(BaseModel):
+class VideoDetailBodyIn(RuntimeCapabilitiesIn):
     video_id: str = Field(
         min_length=1,
         max_length=128,
@@ -786,7 +847,7 @@ class DeactivateResponse(BaseModel):
     body: DeactivateBodyOut | EmptyBody
 
 
-class UserVideosBodyIn(BaseModel):
+class UserVideosBodyIn(RuntimeCapabilitiesIn):
     user_id: str = Field(min_length=1, max_length=64, description="作者 user_id")
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
     cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
@@ -806,7 +867,7 @@ class UserVideosResponse(BaseModel):
     body: VideoBodyOut | EmptyBody
 
 
-class MyVideosBodyIn(BaseModel):
+class MyVideosBodyIn(RuntimeCapabilitiesIn):
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
     cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 
@@ -825,7 +886,7 @@ class MyVideosResponse(BaseModel):
     body: VideoBodyOut | EmptyBody
 
 
-class FollowingFeedBodyIn(BaseModel):
+class FollowingFeedBodyIn(RuntimeCapabilitiesIn):
     limit: int = Field(default=10, ge=1, le=50, description="返回条数上限")
     cursor: str | None = Field(default=None, max_length=1024, description="下一页不透明游标")
 

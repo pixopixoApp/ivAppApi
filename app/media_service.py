@@ -517,6 +517,7 @@ def _verify_and_promote(
     root: Path,
     item: MediaObject,
     verify_content: bool,
+    verified_local_path: Path | None = None,
 ) -> tuple[MediaObject, str, dict]:
     """Verify one uploaded object and copy it to its immutable destination."""
     metadata = _with_oss_retries(
@@ -532,7 +533,7 @@ def _verify_and_promote(
     if remote_sha and remote_sha != item.sha256:
         raise MediaServiceError(f"uploaded checksum metadata mismatch for {client_ref}")
 
-    local_path = root / item.id
+    local_path = verified_local_path or (root / item.id)
     if verify_content:
         _with_oss_retries(
             lambda: download_file(
@@ -602,23 +603,25 @@ def _verify_and_promote(
     return item, metadata.etag or "", updates
 
 
-def _matches_shared_local_cache(
+def _verified_shared_local_cache_path(
     settings: Settings,
     session_context: dict,
     item: MediaObject,
-) -> bool:
+) -> Path | None:
     """Verify an internal backup against the cache mounted by both services."""
     if not settings.media_cache_enabled:
-        return False
+        return None
     declared = valid_sha256(str(session_context.get("local_sha256") or ""))
     if declared is None or declared != item.sha256:
-        return False
+        return None
     path = local_path_for_sha256(
         settings,
         declared,
         expected_size=item.size_bytes,
     )
-    return path is not None and _sha256_file(path) == declared
+    if path is None or _sha256_file(path) != declared:
+        return None
+    return path
 
 
 def finalize_upload_session(
@@ -682,7 +685,7 @@ def finalize_upload_session(
                 )
             )
             locally_verified = {
-                item.id: _matches_shared_local_cache(settings, context, item)
+                item.id: _verified_shared_local_cache_path(settings, context, item)
                 for item in pending
             }
             concurrency = max(1, min(settings.oss_max_concurrency, len(pending) or 1))
@@ -694,7 +697,8 @@ def finalize_upload_session(
                         context,
                         root,
                         item,
-                        not trusted_server_upload and not locally_verified[item.id],
+                        not trusted_server_upload and locally_verified[item.id] is None,
+                        locally_verified[item.id],
                     )
                     for item in pending
                 ]

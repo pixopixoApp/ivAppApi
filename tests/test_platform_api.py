@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.main import app
@@ -19,7 +20,6 @@ from app.models import (
     User,
     UserToken,
 )
-from app.protocol_video import RUNTIME_SPEC_VERSION
 from app.routers.platform import _invite_hash
 
 
@@ -138,12 +138,124 @@ def test_creator_upload_uses_resumable_shared_local_cache(db, monkeypatch, tmp_p
             headers=headers,
             json={},
         )
+        repeated = client.post(
+            "/api/v1/creator/uploads/init",
+            headers=headers,
+            json={
+                "filename": "clip-again.mp4",
+                "content_type": "video/mp4",
+                "size_bytes": len(payload),
+                "sha256": digest,
+                "supported_transports": ["local-resumable-v1"],
+            },
+        )
+        assert repeated.status_code == 201
+        repeated_policy = repeated.json()["upload"]
+        repeated_upload = client.patch(
+            repeated_policy["url"],
+            headers={**headers, "Upload-Offset": "0"},
+            content=payload,
+        )
+        assert repeated_upload.status_code == 204
+        repeated_finalized = client.post(
+            f"/api/v1/creator/uploads/{repeated.json()['session_id']}/finalize",
+            headers=headers,
+            json={},
+        )
 
     assert finalized.status_code == 201
+    assert repeated_finalized.status_code == 201
+    assert finalized.json()["upload_id"] != repeated_finalized.json()["upload_id"]
     assert finalized.json()["upload_transport"] == "local-resumable-v1"
     assert finalized.json()["normalization_status"] == "pending"
     stored = tmp_path / "media-cache" / "objects" / digest[:2] / f"{digest}.cache"
     assert stored.read_bytes() == payload
+    db.expire_all()
+    rows = db.query(CreatorUpload).filter(CreatorUpload.source_sha256 == digest).all()
+    assert len(rows) == 2
+    assert len({row.storage_key for row in rows}) == 1
+    get_settings.cache_clear()
+
+
+def test_creator_upload_finalize_recovers_after_database_failure(
+    db,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    token = _login(db, user_id="recovering-upload-creator")
+    db.add(
+        CreatorAccessGrant(
+            user_id="recovering-upload-creator",
+            source="test",
+            granted_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+    payload = b"recoverable-local-video"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setenv("MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("MEDIA_CACHE_ROOT", str(tmp_path / "media-cache"))
+    monkeypatch.setenv("CREATOR_LOCAL_UPLOAD_ENABLED", "true")
+    get_settings.cache_clear()
+
+    probed_paths = []
+
+    def probe(path):
+        probed_paths.append(path)
+        return SimpleNamespace(duration_ms=2_000)
+
+    monkeypatch.setattr("app.routers.media_storage.probe_video", probe)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    original_commit = Session.commit
+    failed_once = False
+
+    def fail_first_upload_commit(session):
+        nonlocal failed_once
+        if not failed_once and any(isinstance(row, CreatorUpload) for row in session.new):
+            failed_once = True
+            raise RuntimeError("simulated database failure")
+        return original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_first_upload_commit)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        initialized = client.post(
+            "/api/v1/creator/uploads/init",
+            headers=headers,
+            json={
+                "filename": "recover.mp4",
+                "content_type": "video/mp4",
+                "size_bytes": len(payload),
+                "sha256": digest,
+                "supported_transports": ["local-resumable-v1"],
+            },
+        )
+        policy = initialized.json()["upload"]
+        uploaded = client.patch(
+            policy["url"],
+            headers={**headers, "Upload-Offset": "0"},
+            content=payload,
+        )
+        first_finalize = client.post(
+            f"/api/v1/creator/uploads/{initialized.json()['session_id']}/finalize",
+            headers=headers,
+            json={},
+        )
+        recovered = client.post(
+            f"/api/v1/creator/uploads/{initialized.json()['session_id']}/finalize",
+            headers=headers,
+            json={},
+        )
+
+    assert initialized.status_code == 201
+    assert uploaded.status_code == 204
+    assert first_finalize.status_code == 500
+    assert recovered.status_code == 201
+    assert failed_once is True
+    assert len(probed_paths) == 2
+    assert probed_paths[0].suffix == ".part"
+    assert probed_paths[1].suffix == ".cache"
     get_settings.cache_clear()
 
 
@@ -287,6 +399,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
     playable.parent.mkdir(parents=True, exist_ok=True)
     playable.write_bytes(source.read_bytes())
     monkeypatch.setenv("MEDIA_CACHE_ROOT", str(cache_root))
+    monkeypatch.setenv("PUBLIC_GAME_BASE_URL", "https://demo.pixopixo.cn/game/")
     get_settings.cache_clear()
     db.add(
         CreatorUpload(
@@ -313,7 +426,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
             progress_percent=100,
             source_timeline=timeline,
             runtime_spec={"preview": True},
-            runtime_spec_version=RUNTIME_SPEC_VERSION,
+            runtime_spec_version="1.1",
             created_at=now,
             updated_at=now,
         )
@@ -333,11 +446,14 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
         )
     assert rejected.status_code == 400
     assert published.status_code == 200
+    assert published.json()["share_url"] == (
+        "https://demo.pixopixo.cn/game/?experience=cr_test"
+    )
     db.expire_all()
     row = db.get(PublishedVideo, "cr_test")
     assert row.title == "Test creation"
     assert row.description == "Playable"
-    assert row.runtime_spec_version == RUNTIME_SPEC_VERSION
+    assert row.runtime_spec_version == "1.1"
     interaction = row.runtime_spec["video"][0]["interactions"][0]
     assert interaction["pause_video"] is True
     assert interaction["detection"]["response_window_ms"] == 0
@@ -356,10 +472,12 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
             "/api/v1/creator/published/cr_test/restore",
             headers=headers,
         )
-        share = client.get("/api/v1/share/cr_test")
+        share = client.get("/api/v1/share/cr_test", follow_redirects=False)
     assert deleted.json() == {"video_id": "cr_test", "deleted": True}
     assert active_after_delete.json() is None
     assert missing_share.status_code == 404
     assert restored.json() == {"video_id": "cr_test", "deleted": False}
-    assert share.status_code == 200
-    assert "Test creation" in share.text
+    assert share.status_code == 302
+    assert share.headers["location"] == (
+        "https://demo.pixopixo.cn/game/?experience=cr_test"
+    )

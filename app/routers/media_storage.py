@@ -41,8 +41,11 @@ from app.media_cache import (
     ensure_free_space_floor,
     ensure_upload_capacity,
     local_media_uri,
+    local_path_for_sha256,
     object_lock,
+    sha256_file,
     upload_staging_path,
+    valid_sha256,
 )
 from app.media_service import (
     MediaServiceError,
@@ -651,7 +654,12 @@ def finalize_creator_upload(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorUploadOut:
-    session = db.get(MediaUploadSession, session_id)
+    session = (
+        db.query(MediaUploadSession)
+        .filter(MediaUploadSession.id == session_id)
+        .with_for_update()
+        .one_or_none()
+    )
     if session is None or session.actor_type != "user" or session.actor_id != user.user_id:
         raise HTTPException(status_code=404, detail="upload session not found")
     upload_id = str((session.context or {}).get("upload_id") or "")
@@ -664,22 +672,34 @@ def finalize_creator_upload(
         expected_size = int(context.get("size_bytes") or 0)
         if session.state != "uploaded" or int(context.get("offset") or 0) != expected_size:
             raise HTTPException(status_code=409, detail="local upload is incomplete")
+        digest = valid_sha256(str(context.get("sha256") or ""))
+        if digest is None:
+            raise HTTPException(status_code=400, detail="invalid upload checksum")
         staging = upload_staging_path(settings, session.id)
         try:
-            metadata = probe_video(staging)
+            source = staging
+            if not staging.is_file() or staging.is_symlink():
+                source = local_path_for_sha256(
+                    settings,
+                    digest,
+                    expected_size=expected_size,
+                )
+                if source is None or sha256_file(source) != digest:
+                    raise LocalMediaCacheError("uploaded video is unavailable")
+            metadata = probe_video(source)
             if metadata.duration_ms > settings.creator_video_max_duration_seconds * 1000:
                 raise LocalMediaCacheError(
                     f"video must be {settings.creator_video_max_duration_seconds} seconds or shorter"
                 )
-            commit_staged_upload(
-                settings,
-                staging,
-                sha256=str(context.get("sha256") or ""),
-                size_bytes=expected_size,
-            )
+            if source == staging:
+                commit_staged_upload(
+                    settings,
+                    staging,
+                    sha256=digest,
+                    size_bytes=expected_size,
+                )
         except (LocalMediaCacheError, VideoProbeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        digest = str(context["sha256"]).lower()
         row = CreatorUpload(
             id=upload_id,
             user_id=user.user_id,

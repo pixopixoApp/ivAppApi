@@ -58,6 +58,7 @@ from app.protocol_envelope import (
     user_videos_error,
     user_videos_ok,
 )
+from app.protocol_video import normalize_client_runtime_spec_versions
 from app.public_origin import canonicalize_public_url
 from app.routers.feed import list_published_items
 from app.safety import users_blocked_between
@@ -801,6 +802,9 @@ def post_user_videos(
             cursor_kind=f"user_videos:{author.user_id}",
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
+            supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
+                payload.body.supported_experience_spec_versions
+            ),
         )
     except CursorError:
         return user_videos_error(ver=settings.server_ver, head_in=payload.head)
@@ -849,6 +853,9 @@ def post_my_videos(
             cursor_kind=f"my_videos:{me.user_id}",
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
+            supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
+                payload.body.supported_experience_spec_versions
+            ),
         )
     except CursorError:
         return my_videos_error(ver=settings.server_ver, head_in=payload.head)
@@ -905,6 +912,9 @@ def post_following_feed(
             cursor_kind=f"following_feed:{me.user_id}",
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
+            supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
+                payload.body.supported_experience_spec_versions
+            ),
         )
     except CursorError:
         return following_feed_error(ver=settings.server_ver, head_in=payload.head)

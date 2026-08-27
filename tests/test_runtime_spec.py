@@ -7,6 +7,7 @@ import pytest
 from app.models import PublishedVideo
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
+    SUPPORTED_RUNTIME_SPEC_VERSIONS,
     RuntimeSpecError,
     compile_runtime_spec,
     read_runtime_spec,
@@ -39,7 +40,7 @@ def test_compile_preserves_response_window_and_pause_semantics() -> None:
     assert read_runtime_spec(
         spec,
         item_id="demo",
-        version=RUNTIME_SPEC_VERSION,
+        version=spec["version"],
     )[0].interactions[0].type == "mic_blow"
 
 
@@ -50,6 +51,158 @@ def test_unknown_gesture_fails_closed() -> None:
             content_mode="single",
             source={"interactions": [{"gesture": "magic", "gate_at_ms": 1}]},
             video_url="/media/demo.mp4",
+        )
+
+
+def test_continuous_swipe_compiles_as_a_sustained_playback_rule() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [
+            {
+                "gesture": "continuous_swipe",
+                "gate_at_ms": 1000,
+                "hint": "持续往复滑动以播放",
+            },
+            {"gesture": "tap", "gate_at_ms": 6000},
+        ],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/continuous-demo.mp4",
+    )
+    interaction = spec["video"][0]["interactions"][0]
+    assert interaction == {
+        "id": "action_001",
+        "type": "continuous_swipe",
+        "description": "持续往复滑动以播放",
+        "offset_time_ms": 1000,
+        "pause_video": True,
+        "detection": {
+            "confidence_threshold": 0.85,
+            "response_window_ms": 0,
+            "place": "middle_middle",
+            "min_travel_dp": 32,
+            "idle_timeout_ms": 500,
+        },
+        "feedback": {
+            "animation": "none",
+            "animation_duration_ms": 0,
+            "vibrate": False,
+            "sound_effect": "",
+        },
+        "on_success": {"action": "continue"},
+        "on_miss": {"action": "continue"},
+    }
+    assert read_runtime_spec(
+        spec,
+        item_id="continuous-demo",
+        version=spec["version"],
+    )[0].interactions[0].type == "continuous_swipe"
+    legacy_spec = copy.deepcopy(spec)
+    legacy_spec["video"][0]["interactions"][0]["detection"]["idle_timeout_ms"] = 180
+    assert read_runtime_spec(
+        legacy_spec,
+        item_id="continuous-demo",
+        version=legacy_spec["version"],
+    )[0].interactions[0].type == "continuous_swipe"
+
+
+def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [
+            {"gesture": "continuous_tap", "gate_at_ms": 1000},
+            {"gesture": "tap", "gate_at_ms": 6000},
+        ],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-tap-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/continuous-tap-demo.mp4",
+    )
+    interaction = spec["video"][0]["interactions"][0]
+
+    assert spec["version"] == RUNTIME_SPEC_VERSION == "1.2"
+    assert interaction["type"] == "continuous_tap"
+    assert interaction["description"] == "持续点击以播放"
+    assert interaction["pause_video"] is True
+    assert interaction["detection"] == {
+        "confidence_threshold": 0.85,
+        "response_window_ms": 0,
+        "place": "middle_middle",
+        "idle_timeout_ms": 500,
+    }
+    assert interaction["feedback"]["vibrate"] is False
+    assert read_runtime_spec(
+        spec,
+        item_id="continuous-tap-demo",
+        version="1.2",
+    )[0].interactions[0].type == "continuous_tap"
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.1"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.2"):
+        read_runtime_spec(
+            downgraded,
+            item_id="continuous-tap-demo",
+            version="1.1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (
+            {"interactions": [{"gesture": "continuous_swipe", "gate_at_ms": 1000}]},
+            "media.duration_ms is required",
+        ),
+        (
+            {
+                "media": {"duration_ms": 10_000},
+                "interactions": [{
+                    "gesture": "continuous_swipe",
+                    "gate_at_ms": 1000,
+                    "pause_video": False,
+                }],
+            },
+            "requires pause_video=true",
+        ),
+        (
+            {
+                "media": {"duration_ms": 10_000},
+                "interactions": [{
+                    "gesture": "continuous_swipe",
+                    "gate_at_ms": 1000,
+                    "gate_end_ms": 2000,
+                }],
+            },
+            "does not allow gate_end_ms",
+        ),
+        (
+            {
+                "media": {"duration_ms": 10_000},
+                "interactions": [
+                    {"gesture": "continuous_swipe", "gate_at_ms": 1000},
+                    {"gesture": "tap", "gate_at_ms": 1000},
+                ],
+            },
+            "must end at a later interaction",
+        ),
+    ],
+)
+def test_continuous_swipe_rejects_conflicting_source(
+    source: dict,
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeSpecError, match=message):
+        compile_runtime_spec(
+            item_id="continuous-demo",
+            content_mode="single",
+            source=source,
+            video_url="/media/continuous-demo.mp4",
         )
 
 
@@ -75,6 +228,72 @@ def test_story_on_end_is_compiled_and_validated() -> None:
         "target_video_id": "b",
         "timing": "immediate",
     }
+    assert spec["version"] == "1.1"
+
+
+def test_story_result_end_and_retry_reuse_existing_actions() -> None:
+    story = {
+        "entry_clip_id": "a",
+        "clips": {
+            "a": {
+                "timeline": {
+                    "interactions": [{
+                        "gesture": "tap",
+                        "gate_at_ms": 1000,
+                        "gate_end_ms": 4000,
+                        "outcomes": {
+                            "success": {"action": "goto", "clip_id": "b"},
+                            "fail": {"action": "goto", "clip_id": "c"},
+                        },
+                    }],
+                },
+            },
+            "b": {
+                "timeline": {"interactions": []},
+                "on_end": {"action": "end"},
+            },
+            "c": {
+                "timeline": {"interactions": []},
+                "on_end": {"action": "retry_previous_point"},
+            },
+        },
+    }
+    spec = compile_runtime_spec(
+        item_id="branch-story",
+        content_mode="story",
+        source=story,
+        video_url="/media/branch-story/a.mp4",
+    )
+    clips = {clip["video_id"]: clip for clip in spec["video"]}
+    assert clips["b"]["on_end"] == {
+        "action": "end_experience",
+        "timing": "immediate",
+    }
+    assert clips["c"]["on_end"] == {"action": "retry_previous_point"}
+    assert read_runtime_spec(
+        spec,
+        item_id="branch-story",
+        version=spec["version"],
+    )
+
+
+def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
+    assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset({"1.0", "1.1", "1.2"})
+    spec = compile_runtime_spec(
+        item_id="legacy",
+        content_mode="single",
+        source={"interactions": []},
+        video_url="/media/legacy.mp4",
+    )
+    spec["version"] = "1.0"
+    assert read_runtime_spec(spec, item_id="legacy", version="1.0")
+
+    spec["video"][0]["on_end"] = {
+        "action": "end_experience",
+        "timing": "immediate",
+    }
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.1"):
+        read_runtime_spec(spec, item_id="legacy", version="1.0")
 
 
 def test_story_uses_exact_published_oss_url_for_every_clip() -> None:
@@ -117,7 +336,7 @@ def test_persisted_runtime_data_accepts_explicit_response_window() -> None:
     )
     broken = copy.deepcopy(spec)
     broken["video"][0]["interactions"][0]["detection"]["response_window_ms"] = 500
-    assert read_runtime_spec(broken, item_id="demo", version=RUNTIME_SPEC_VERSION)
+    assert read_runtime_spec(broken, item_id="demo", version=broken["version"])
 
 
 def test_camera_motion_requires_a_whitelisted_semantic_target() -> None:
