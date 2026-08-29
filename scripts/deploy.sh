@@ -222,7 +222,9 @@ if [[ -f "$deploy_path/.env.target" ]]; then
   defaults_file="/root/.config/pixo/$project.cnf"
   test -r "$defaults_file"
   mysqldump --defaults-extra-file="$defaults_file" \
-    --single-transaction --quick --routines --events --triggers "$project" \
+    --single-transaction --skip-lock-tables --skip-add-locks \
+    --set-gtid-purged=OFF --no-tablespaces --quick \
+    --routines --events --triggers "$project" \
     | gzip -9 > "$backup_path/database.sql.gz"
 else
   "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" exec -T \
