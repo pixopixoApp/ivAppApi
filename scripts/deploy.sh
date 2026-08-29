@@ -240,14 +240,18 @@ REMOTE
 rollback() {
   echo "[deploy] rolling back to $BACKUP_PATH" >&2
   "${SSH[@]}" bash -s -- \
-    "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+    "$DEPLOY_PATH" "$BACKUP_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" \
+    "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 backup_path="$2"
-project="$3"
-service="$4"
-worker_service="$5"
-cdn_worker_service="$6"
+release_path="$3"
+project="$4"
+service="$5"
+worker_service="$6"
+cdn_worker_service="$7"
+compose="$release_path/scripts/compose_target.sh"
+test -x "$compose"
 test -d "$backup_path/source"
 rsync -a --delete \
   --exclude='.git/' \
@@ -260,17 +264,17 @@ rsync -a --delete \
   --exclude='.pytest_cache/' \
   "$backup_path/source/" "$deploy_path/"
 chmod 600 "$deploy_path/.env"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --quiet
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" build "$service"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
-if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
+"$compose" "$deploy_path" "$project" config --quiet
+"$compose" "$deploy_path" "$project" build "$service"
+"$compose" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
+if "$compose" "$deploy_path" "$project" config --services \
   | grep -qx "$worker_service"; then
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
+  "$compose" "$deploy_path" "$project" up -d \
     --no-deps --force-recreate "$worker_service"
 fi
-if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
+if "$compose" "$deploy_path" "$project" config --services \
   | grep -qx "$cdn_worker_service"; then
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
+  "$compose" "$deploy_path" "$project" up -d \
     --no-deps --force-recreate "$cdn_worker_service"
 fi
 REMOTE
@@ -278,19 +282,23 @@ REMOTE
 
 echo "[deploy] stopping background workers before source switch"
 "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+  "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" \
+  "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
-project="$2"
-worker_service="$3"
-cdn_worker_service="$4"
-if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
+release_path="$2"
+project="$3"
+worker_service="$4"
+cdn_worker_service="$5"
+compose="$release_path/scripts/compose_target.sh"
+test -x "$compose"
+if "$compose" "$deploy_path" "$project" config --services \
   | grep -qx "$worker_service"; then
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" stop "$worker_service"
+  "$compose" "$deploy_path" "$project" stop "$worker_service"
 fi
-if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
+if "$compose" "$deploy_path" "$project" config --services \
   | grep -qx "$cdn_worker_service"; then
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" stop "$cdn_worker_service"
+  "$compose" "$deploy_path" "$project" stop "$cdn_worker_service"
 fi
 REMOTE
 
