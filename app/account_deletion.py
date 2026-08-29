@@ -17,6 +17,7 @@ from app.models import (
     CreatorApplication,
     CreatorCreation,
     CreatorInvite,
+    CreatorSourceGeneration,
     CreatorUpload,
     CreatorVersion,
     EmailCode,
@@ -142,6 +143,9 @@ def delete_account_data(
     db.query(CreatorVersion).filter(CreatorVersion.user_id == user_id).delete(
         synchronize_session=False
     )
+    db.query(CreatorSourceGeneration).filter(
+        CreatorSourceGeneration.user_id == user_id
+    ).delete(synchronize_session=False)
     db.query(CreatorCreation).filter(CreatorCreation.user_id == user_id).delete(
         synchronize_session=False
     )
@@ -150,6 +154,12 @@ def delete_account_data(
     )
     db.query(CreatorAccessGrant).filter(CreatorAccessGrant.user_id == user_id).delete()
     db.query(CreatorApplication).filter(CreatorApplication.user_id == user_id).delete()
+    for invite in (
+        db.query(CreatorInvite).filter(CreatorInvite.assigned_user_id == user_id).all()
+    ):
+        invite.assigned_user_id = None
+        if not invite.redeemed_by_user_id:
+            invite.enabled = False
     for invite in (
         db.query(CreatorInvite).filter(CreatorInvite.redeemed_by_user_id == user_id).all()
     ):

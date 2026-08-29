@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import re
-import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -14,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth_user import (
+    issue_user_token,
     load_app_user,
     require_app_user,
     resolve_current_user,
@@ -43,7 +43,6 @@ from app.models import (
     PublishedVideo,
     RecommendCursor,
     User,
-    UserToken,
     VideoView,
 )
 from app.pagination import (
@@ -294,6 +293,13 @@ class PublishedItemsPage:
     items: list[FeedItemOut]
     next_cursor: str | None
     has_more: bool
+
+
+def _review_allows_direct_share(row: PublishedVideo) -> bool:
+    """Allow unlisted UGC links while keeping recommendation surfaces moderated."""
+    return row.review_status == "approved" or (
+        row.content_source == "ugc" and row.review_status == "pending"
+    )
 
 
 def list_published_items(
@@ -717,24 +723,19 @@ def post_verify(
         db.commit()
         log.warning("verify disabled user email=%s user_id=%s", email, user.user_id)
         return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
-    db.query(UserToken).filter(UserToken.user_id == user.user_id).delete()
-    token = secrets.token_urlsafe(32)
-    token_expires = now + timedelta(days=settings.token_ttl_days)
-    db.add(
-        UserToken(
-            token=token,
-            user_id=user.user_id,
-            created_at=now,
-            expires_at=token_expires,
-        )
+    session = issue_user_token(
+        db,
+        user_id=user.user_id,
+        token_ttl_days=settings.token_ttl_days,
+        now=now,
     )
     db.commit()
 
     body = VerifyBodyOut(
-        token=token,
+        token=session.token,
         user_id=user.user_id,
         email=email,
-        expires_at=token_expires.isoformat(),
+        expires_at=session.expires_at.isoformat(),
         needs_birthday=needs_birthday(user),
         birthday=user.birthday or "",
         is_under_13=is_under_13(user),
@@ -800,24 +801,19 @@ def post_google_login(
         )
         return google_login_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
-    db.query(UserToken).filter(UserToken.user_id == user.user_id).delete()
-    token = secrets.token_urlsafe(32)
-    token_expires = now + timedelta(days=settings.token_ttl_days)
-    db.add(
-        UserToken(
-            token=token,
-            user_id=user.user_id,
-            created_at=now,
-            expires_at=token_expires,
-        )
+    session = issue_user_token(
+        db,
+        user_id=user.user_id,
+        token_ttl_days=settings.token_ttl_days,
+        now=now,
     )
     db.commit()
 
     body = VerifyBodyOut(
-        token=token,
+        token=session.token,
         user_id=user.user_id,
         email=identity.email,
-        expires_at=token_expires.isoformat(),
+        expires_at=session.expires_at.isoformat(),
         needs_birthday=needs_birthday(user),
         birthday=user.birthday or "",
         is_under_13=is_under_13(user),
@@ -947,7 +943,7 @@ def post_video_detail(
         row is None
         or row.is_deleted != 0
         or row.deleted_at is not None
-        or row.review_status != "approved"
+        or not _review_allows_direct_share(row)
         or not row.distribution_enabled
         or not row.cdn_ready
         or (
@@ -1023,7 +1019,7 @@ def post_track(
         tracked is None
         or tracked.is_deleted != 0
         or tracked.deleted_at is not None
-        or tracked.review_status != "approved"
+        or not _review_allows_direct_share(tracked)
         or not tracked.distribution_enabled
         or not tracked.cdn_ready
     ):

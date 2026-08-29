@@ -4,7 +4,7 @@ import signal
 import time
 
 from app.cdn_cache import CdnCacheError, process_once, validate_cdn_config
-from app.config import get_settings
+from app.config import get_settings, validate_environment_contract
 from app.db import SessionLocal
 from app.logging_config import get_logger, setup_logging
 
@@ -19,6 +19,7 @@ def _handle_signal(_signum, _frame) -> None:
 
 def main() -> None:
     settings = get_settings()
+    validate_environment_contract(settings)
     setup_logging(level=settings.log_level)
     validate_cdn_config(settings)
     signal.signal(signal.SIGTERM, _handle_signal)

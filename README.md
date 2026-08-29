@@ -155,7 +155,9 @@ POST /api/v1/creator/published/{id}/restore          作者恢复
 4. `find_playable_moments`
 5. `compile_preview`
 
-ivapp 不包含 Dify 或模型凭证，也不分析视频。Worker 只通过 `X-Creator-Internal-Key` 调用 ivadmin 私有任务 API；ivadmin/ivcore 是分析、模型配置与 Dify 调用的唯一所有者。
+ivapp 不包含模型凭证，也不直接执行模型推理。Worker 只通过
+`X-Creator-Internal-Key` 调用 ivadmin 私有任务 API；ivadmin/ivcore 是提示词规划、
+视频生成、互动分析与模型配置的唯一所有者。
 
 ivapp 与 ivadmin 将同一个宿主机目录挂载为 `/data/media-cache`。上传原片只写一次本机内容寻址存储；ivadmin 直接读取该文件并产出经过完整解码验收的 `mobile-v1` 播放版，分析、预览和发布只引用播放版。原片与播放版分别保留，并由后台任务异步备份到私有 OSS；正常链路不再通过 OSS 在两个服务间搬运视频。
 

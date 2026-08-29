@@ -58,6 +58,34 @@ def test_pending_normalization_is_not_starved_by_ready_backup_sync(
     assert processed == [pending.id]
 
 
+def test_local_mode_does_not_poll_ready_uploads_for_oss_backup(db, monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    db.add(
+        CreatorUpload(
+            id="up_local_ready",
+            user_id="creator",
+            storage_key="creator_uploads/creator/local.mp4",
+            original_filename="local.mp4",
+            size_bytes=10,
+            duration_ms=1_000,
+            source_sha256="d" * 64,
+            normalization_job_id="mnj-local",
+            normalization_status="ready",
+            playable_local_uri="local-cache://sha256/" + "e" * 64,
+            playable_sha256="e" * 64,
+            playable_size_bytes=10,
+            created_at=now,
+        )
+    )
+    db.commit()
+    monkeypatch.setenv("MEDIA_STORAGE_MODE", "local")
+    get_settings.cache_clear()
+    try:
+        assert process_next_upload_normalization() is False
+    finally:
+        get_settings.cache_clear()
+
+
 def test_ivadmin_ready_timeline_is_persisted_as_runtime_version(db) -> None:
     now = datetime.now(timezone.utc)
     upload = CreatorUpload(

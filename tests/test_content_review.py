@@ -68,7 +68,7 @@ def test_content_management_query_count_does_not_scale_with_page_size(db):
     assert len(statements) <= 5, "\n".join(statements)
 
 
-def test_pending_ugc_is_not_public_until_reviewed(db):
+def test_pending_ugc_is_shareable_by_id_but_not_in_feed_until_reviewed(db):
     db.add(User(user_id="creator", provider="email", subject="creator@example.test", source="app"))
     timeline = {"interactions": []}
     db.add(
@@ -83,13 +83,62 @@ def test_pending_ugc_is_not_public_until_reviewed(db):
     headers = {"X-Publish-Key": "test-publish-key"}
     with TestClient(app) as client:
         hidden = client.post("/video", json={"head": {"act": "video", "ver": "1.2"}, "body": {"limit": 10}}).json()
+        direct = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "ugc-1"},
+            },
+        ).json()
+        share = client.get("/api/v1/share/ugc-1", follow_redirects=False)
         listed = client.get("/internal/v1/content-management?source=ugc&status=pending", headers=headers).json()
         reviewed = client.post("/internal/v1/videos/ugc-1/review", headers=headers, json={"status": "approved", "reviewed_by": "ops"})
         public = client.post("/video", json={"head": {"act": "video", "ver": "1.2"}, "body": {"limit": 10}}).json()
     assert hidden["head"]["status"] == 100
+    assert direct["head"]["status"] == 0
+    assert direct["body"]["items"][0]["item_id"] == "ugc-1"
+    assert share.status_code == 302
     assert listed["total"] == 1
     assert reviewed.status_code == 200
     assert public["body"]["items"][0]["item_id"] == "ugc-1"
+
+
+def test_rejected_ugc_is_not_available_by_direct_share(db):
+    timeline = {"interactions": []}
+    db.add(
+        PublishedVideo(
+            id="ugc-rejected",
+            content_type="runtime",
+            video_url="/media/ugc-rejected.mp4",
+            timeline=timeline,
+            runtime_spec=compile_runtime_spec(
+                item_id="ugc-rejected",
+                content_mode="single",
+                source=timeline,
+                video_url="/media/ugc-rejected.mp4",
+            ),
+            runtime_spec_version="1.1",
+            version="1",
+            content_source="ugc",
+            review_status="rejected",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+
+    with TestClient(app) as client:
+        detail = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "ugc-rejected"},
+            },
+        ).json()
+        share = client.get("/api/v1/share/ugc-rejected", follow_redirects=False)
+
+    assert detail["head"]["status"] == 100
+    assert share.status_code == 404
 
 
 def test_video_metrics_are_aggregated_without_returning_raw_events(db):

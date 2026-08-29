@@ -1,8 +1,8 @@
 """FIFO creator coordinator: ivapp state -> private ivadmin jobs.
 
-This process deliberately contains no model or Dify credentials.  ivadmin owns
-video analysis through ivcore; this worker only submits, polls and persists the
-C-end session/version state.
+This process deliberately contains no model-provider credentials. ivadmin owns
+prompt planning, video generation and interaction analysis through ivcore; this
+worker only submits, polls and persists the C-end session/version state.
 """
 
 from __future__ import annotations
@@ -10,17 +10,26 @@ from __future__ import annotations
 import signal
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from sqlalchemy import case, text
 from sqlalchemy.orm import Session
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, validate_environment_contract
 from app.db import SessionLocal, engine
 from app.logging_config import get_logger, setup_logging
-from app.models import CreatorCreation, CreatorUpload, CreatorVersion
+from app.media_cache import local_path_for_sha256
+from app.media_service import media_mode_is_oss
+from app.models import (
+    CreatorCreation,
+    CreatorSourceGeneration,
+    CreatorUpload,
+    CreatorVersion,
+    MediaObject,
+)
+from app.oss_storage import delete_object
 from app.protocol_video import (
     RuntimeSpecError,
     compile_runtime_spec,
@@ -99,6 +108,7 @@ def _request(
             url,
             headers=headers,
             timeout=settings.creator_ivadmin_timeout_seconds,
+            trust_env=False,
             **kwargs,
         )
     except httpx.RequestError as exc:
@@ -215,19 +225,20 @@ def process_upload_normalization(
 def process_next_upload_normalization(settings: Settings | None = None) -> bool:
     """Submit/poll one upload normalization before creator analysis work."""
     settings = settings or get_settings()
+    pending = CreatorUpload.normalization_status.in_(("pending", "normalizing"))
+    candidate = pending
+    if media_mode_is_oss(settings):
+        candidate = pending | (
+            (CreatorUpload.normalization_status == "ready")
+            & (
+                (CreatorUpload.media_object_id.is_(None))
+                | (CreatorUpload.playable_media_object_id.is_(None))
+            )
+        )
     with SessionLocal() as db:
         row = (
             db.query(CreatorUpload)
-            .filter(
-                (CreatorUpload.normalization_status.in_(("pending", "normalizing")))
-                | (
-                    (CreatorUpload.normalization_status == "ready")
-                    & (
-                        (CreatorUpload.media_object_id.is_(None))
-                        | (CreatorUpload.playable_media_object_id.is_(None))
-                    )
-                )
-            )
+            .filter(candidate)
             # Analysis only needs the ready local normalization.  Missing OSS
             # backup identities are synchronized opportunistically, so an old
             # ready upload must never starve newer uploads that still need
@@ -267,6 +278,493 @@ def process_next_upload_normalization(settings: Settings | None = None) -> bool:
                 db.commit()
             log.exception("upload normalization failed upload_id=%s", row.id)
         return True
+
+
+def _schedule_source_poll(
+    generation: CreatorSourceGeneration,
+    settings: Settings,
+    *,
+    seconds: float | None = None,
+) -> None:
+    delay = seconds if seconds is not None else settings.creator_worker_poll_seconds
+    generation.next_poll_at = _now() + timedelta(seconds=max(1.0, delay))
+    generation.updated_at = _now()
+
+
+def _sync_source_creation(
+    db: Session,
+    creation: CreatorCreation,
+    generation: CreatorSourceGeneration,
+) -> None:
+    if creation.source_generation_id != generation.id or creation.status == "abandoned":
+        return
+    creation.source_prompt = generation.original_prompt
+    creation.upload_id = generation.upload_id
+    creation.progress_stage = generation.progress_stage
+    creation.progress_percent = generation.progress_percent
+    creation.error_code = generation.error_code
+    creation.error_message = generation.error_message
+    if generation.status == "ready":
+        creation.status = "source_ready"
+        creation.progress_stage = "review_source"
+        creation.progress_percent = 100
+    elif generation.status in {"failed", "cancelled", "expired"}:
+        creation.status = generation.status
+    else:
+        creation.status = "running"
+    creation.updated_at = _now()
+    db.add(creation)
+
+
+def _generated_upload(
+    db: Session,
+    generation: CreatorSourceGeneration,
+    payload: dict[str, Any],
+) -> CreatorUpload:
+    existing = db.get(CreatorUpload, generation.upload_id) if generation.upload_id else None
+    if existing is not None:
+        if existing.user_id != generation.user_id:
+            raise CreationError("SOURCE_OWNER_MISMATCH", "Generated source ownership is invalid.")
+        return existing
+
+    digest = str(payload.get("source_sha256") or "").lower()
+    size_bytes = int(payload.get("source_size_bytes") or 0)
+    duration_ms = int(payload.get("source_duration_ms") or 0)
+    local_uri = str(payload.get("source_local_uri") or "")
+    storage_key = str(payload.get("source_storage_key") or local_uri)
+    media_object_id = str(payload.get("source_media_object_id") or "") or None
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise CreatorTransportError("ivadmin returned an invalid generated video checksum")
+    if size_bytes <= 0 or duration_ms <= 0 or not local_uri or not storage_key:
+        raise CreatorTransportError("ivadmin returned incomplete generated video metadata")
+    if media_object_id:
+        media = db.get(MediaObject, media_object_id)
+        if (
+            media is None
+            or media.state != "ready"
+            or media.sha256 != digest
+            or int(media.size_bytes) != size_bytes
+        ):
+            raise CreatorTransportError("generated video backup is not ready")
+
+    upload = CreatorUpload(
+        id=f"up_ai_{generation.id.removeprefix('csg_')}",
+        user_id=generation.user_id,
+        storage_key=storage_key[:512],
+        media_object_id=media_object_id,
+        source_local_uri=local_uri[:512],
+        source_sha256=digest,
+        upload_transport="ai-generated",
+        origin="ai_generated",
+        source_generation_id=generation.id,
+        normalization_status="pending",
+        normalization_profile="mobile-v1",
+        original_filename=f"pixo-generated-{generation.attempt}.mp4",
+        size_bytes=size_bytes,
+        duration_ms=duration_ms,
+        created_at=_now(),
+    )
+    db.add(upload)
+    db.flush()
+    generation.upload_id = upload.id
+    return upload
+
+
+def _finish_source_from_upload(
+    db: Session,
+    settings: Settings,
+    creation: CreatorCreation,
+    generation: CreatorSourceGeneration,
+    upload: CreatorUpload,
+) -> None:
+    if upload.normalization_status == "ready":
+        generation.status = "ready"
+        generation.progress_stage = "review_source"
+        generation.progress_percent = 100
+        generation.error_code = ""
+        generation.error_message = ""
+    elif upload.normalization_status == "failed":
+        generation.status = "failed"
+        generation.progress_stage = "failed"
+        generation.error_code = "NORMALIZATION_FAILED"
+        generation.error_message = (
+            upload.normalization_error or "The generated video could not be prepared."
+        )[:500]
+    else:
+        generation.status = "running"
+        generation.progress_stage = "preparing_preview"
+        generation.progress_percent = max(86, generation.progress_percent)
+        _schedule_source_poll(generation, settings)
+    generation.updated_at = _now()
+    db.add(generation)
+    _sync_source_creation(db, creation, generation)
+
+
+def _apply_source_job(
+    db: Session,
+    settings: Settings,
+    creation: CreatorCreation,
+    generation: CreatorSourceGeneration,
+    payload: dict[str, Any],
+) -> None:
+    if str(payload.get("creation_id") or "") != creation.id:
+        raise CreatorTransportError("ivadmin returned the wrong generation creation id")
+    if str(payload.get("generation_id") or "") != generation.id:
+        raise CreatorTransportError("ivadmin returned the wrong generation id")
+    remote_status = str(payload.get("status") or "").lower()
+    if remote_status not in {"queued", "running", "ready", "failed", "cancelled"}:
+        raise CreatorTransportError("ivadmin returned an unknown video generation status")
+
+    generation.ivadmin_job_id = str(
+        payload.get("job_id") or generation.ivadmin_job_id
+    )[:64]
+    generation.prompt_summary = str(payload.get("prompt_summary") or "")[:500]
+    generation.generation_prompt = str(payload.get("generation_prompt") or "")
+    generation.interaction_brief = str(payload.get("interaction_brief") or "")[:1000]
+    preset = payload.get("preset")
+    if isinstance(preset, dict):
+        generation.preset_json = preset
+    accepted = bool(payload.get("provider_task_accepted"))
+    if accepted:
+        generation.provider_task_accepted = True
+        if generation.quota_state == "reserved":
+            generation.quota_state = "charged"
+    try:
+        generation.progress_percent = max(
+            0,
+            min(100, int(payload.get("progress_percent") or 0)),
+        )
+    except (TypeError, ValueError):
+        generation.progress_percent = 0
+    generation.progress_stage = str(
+        payload.get("progress_stage") or remote_status
+    )[:64]
+
+    if remote_status in {"queued", "running"}:
+        generation.status = "running"
+        generation.error_code = ""
+        generation.error_message = ""
+        _schedule_source_poll(generation, settings)
+    elif remote_status in {"failed", "cancelled"}:
+        generation.status = remote_status
+        generation.progress_stage = remote_status
+        generation.error_code = str(
+            payload.get("error_code")
+            or ("CANCELLED" if remote_status == "cancelled" else "VIDEO_GENERATION_FAILED")
+        )[:64]
+        generation.error_message = str(
+            payload.get("error_message")
+            or (
+                "Video generation was cancelled."
+                if remote_status == "cancelled"
+                else "Video generation failed. Please try again."
+            )
+        )[:500]
+        if generation.quota_state == "reserved":
+            generation.quota_state = "released"
+    else:
+        upload = _generated_upload(db, generation, payload)
+        _finish_source_from_upload(db, settings, creation, generation, upload)
+
+    generation.updated_at = _now()
+    db.add(generation)
+    _sync_source_creation(db, creation, generation)
+    db.commit()
+
+
+def process_source_generation(
+    db: Session,
+    settings: Settings,
+    generation: CreatorSourceGeneration,
+) -> None:
+    creation = db.get(CreatorCreation, generation.creation_id)
+    if creation is None or creation.user_id != generation.user_id:
+        raise CreationError("CREATION_MISSING", "Creator session no longer exists.")
+
+    if generation.cancel_requested and generation.upload_id:
+        generation.status = "cancelled"
+        generation.progress_stage = "cancelled"
+        generation.error_code = "CANCELLED"
+        generation.error_message = "Generated source was not accepted."
+        generation.updated_at = _now()
+        db.add(generation)
+        _sync_source_creation(db, creation, generation)
+        db.commit()
+        return
+
+    if generation.upload_id:
+        upload = db.get(CreatorUpload, generation.upload_id)
+        if upload is None or upload.user_id != generation.user_id:
+            raise CreationError("UPLOAD_MISSING", "The generated source is no longer available.")
+        _finish_source_from_upload(db, settings, creation, generation, upload)
+        db.commit()
+        return
+
+    if generation.cancel_requested:
+        if generation.ivadmin_job_id:
+            response = _request(
+                settings,
+                "POST",
+                f"/internal/v1/mobile-creator/video-generations/{generation.ivadmin_job_id}/cancel",
+            )
+            _apply_source_job(db, settings, creation, generation, _parse_job(response))
+            return
+        generation.status = "cancelled"
+        generation.progress_stage = "cancelled"
+        generation.error_code = "CANCELLED"
+        generation.error_message = "Video generation was cancelled."
+        if generation.quota_state == "reserved":
+            generation.quota_state = "released"
+        generation.updated_at = _now()
+        db.add(generation)
+        _sync_source_creation(db, creation, generation)
+        db.commit()
+        return
+
+    if generation.ivadmin_job_id:
+        response = _request(
+            settings,
+            "GET",
+            f"/internal/v1/mobile-creator/video-generations/{generation.ivadmin_job_id}",
+        )
+    else:
+        response = _request(
+            settings,
+            "POST",
+            "/internal/v1/mobile-creator/video-generations",
+            json={
+                "request_id": generation.request_id,
+                "creation_id": generation.creation_id,
+                "generation_id": generation.id,
+                "prompt": generation.original_prompt,
+            },
+        )
+    _apply_source_job(db, settings, creation, generation, _parse_job(response))
+
+
+def _claim_next_source(db: Session) -> CreatorSourceGeneration | None:
+    row = (
+        db.query(CreatorSourceGeneration)
+        .filter(
+            CreatorSourceGeneration.status.in_(("queued", "running")),
+            CreatorSourceGeneration.next_poll_at <= _now(),
+        )
+        .order_by(CreatorSourceGeneration.created_at.asc())
+        .with_for_update(skip_locked=True)
+        .first()
+    )
+    if row is None:
+        db.rollback()
+        return None
+    if row.status == "queued":
+        row.status = "running"
+        row.progress_stage = "planning_prompt"
+        row.progress_percent = max(1, row.progress_percent)
+        row.updated_at = _now()
+        creation = db.get(CreatorCreation, row.creation_id)
+        if creation is not None:
+            _sync_source_creation(db, creation, row)
+        db.commit()
+        db.refresh(row)
+    return row
+
+
+def _fail_source(
+    db: Session,
+    generation: CreatorSourceGeneration,
+    exc: Exception,
+) -> None:
+    db.rollback()
+    fresh = db.get(CreatorSourceGeneration, generation.id)
+    if fresh is None:
+        return
+    fresh.status = "failed"
+    fresh.progress_stage = "failed"
+    fresh.error_code = exc.code if isinstance(exc, CreationError) else "VIDEO_GENERATION_FAILED"
+    fresh.error_message = (
+        str(exc)[:500]
+        if isinstance(exc, CreationError) and str(exc)
+        else "Video generation failed. Please try again."
+    )
+    if fresh.quota_state == "reserved":
+        fresh.quota_state = "released"
+    fresh.updated_at = _now()
+    creation = db.get(CreatorCreation, fresh.creation_id)
+    if creation is not None:
+        _sync_source_creation(db, creation, fresh)
+    db.commit()
+    log.exception(
+        "creator source generation failed generation_id=%s code=%s",
+        fresh.id,
+        fresh.error_code,
+    )
+
+
+def process_next_source_generation(settings: Settings | None = None) -> bool:
+    """Submit or poll one prompt-generated source video."""
+    settings = settings or get_settings()
+    with SessionLocal() as db:
+        row = _claim_next_source(db)
+        if row is None:
+            return False
+        try:
+            process_source_generation(db, settings, row)
+        except CreatorTransportError as exc:
+            db.rollback()
+            fresh = db.get(CreatorSourceGeneration, row.id)
+            if fresh is not None:
+                _schedule_source_poll(fresh, settings, seconds=5)
+                db.add(fresh)
+                db.commit()
+            log.warning(
+                "ivadmin temporarily unavailable generation_id=%s error=%s",
+                row.id,
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - persist product-safe error
+            _fail_source(db, row, exc)
+        return True
+
+
+def _retire_generated_upload(
+    db: Session,
+    settings: Settings,
+    generation: CreatorSourceGeneration,
+) -> None:
+    upload = db.get(CreatorUpload, generation.upload_id) if generation.upload_id else None
+    if upload is None or upload.source_generation_id != generation.id:
+        generation.upload_id = None
+        return
+
+    media_ids = {
+        item
+        for item in (upload.media_object_id, upload.playable_media_object_id)
+        if item
+    }
+    for media_id in media_ids:
+        media = db.get(MediaObject, media_id)
+        if media is None:
+            continue
+        other_reference = (
+            db.query(CreatorUpload.id)
+            .filter(
+                CreatorUpload.id != upload.id,
+                (CreatorUpload.media_object_id == media_id)
+                | (CreatorUpload.playable_media_object_id == media_id),
+            )
+            .first()
+        )
+        if other_reference is None:
+            if media_mode_is_oss(settings) and media.state != "retired":
+                delete_object(settings, key=media.object_key)
+            media.state = "retired"
+            db.add(media)
+
+    if not media_mode_is_oss(settings):
+        for digest, expected_size in {
+            upload.source_sha256: upload.size_bytes,
+            upload.playable_sha256: upload.playable_size_bytes,
+        }.items():
+            if not digest:
+                continue
+            other_reference = (
+                db.query(CreatorUpload.id)
+                .filter(
+                    CreatorUpload.id != upload.id,
+                    (CreatorUpload.source_sha256 == digest)
+                    | (CreatorUpload.playable_sha256 == digest),
+                )
+                .first()
+            )
+            if other_reference is None:
+                path = local_path_for_sha256(
+                    settings,
+                    digest,
+                    expected_size=expected_size,
+                )
+                if path is not None:
+                    path.unlink(missing_ok=True)
+
+    creation = db.get(CreatorCreation, generation.creation_id)
+    if creation is not None and creation.upload_id == upload.id:
+        creation.upload_id = None
+        db.add(creation)
+    db.delete(upload)
+    generation.upload_id = None
+
+
+def process_next_expired_source(settings: Settings | None = None) -> bool:
+    """Retire one unaccepted generated draft after its retention window."""
+    settings = settings or get_settings()
+    with SessionLocal() as db:
+        generation = (
+            db.query(CreatorSourceGeneration)
+            .filter(
+                CreatorSourceGeneration.accepted_at.is_(None),
+                CreatorSourceGeneration.expires_at <= _now(),
+                CreatorSourceGeneration.status.in_(("ready", "failed", "cancelled")),
+            )
+            .order_by(CreatorSourceGeneration.expires_at.asc())
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+        if generation is None:
+            db.rollback()
+            return False
+        try:
+            if generation.ivadmin_job_id:
+                _request(
+                    settings,
+                    "DELETE",
+                    f"/internal/v1/mobile-creator/video-generations/{generation.ivadmin_job_id}",
+                )
+            if generation.upload_id:
+                _request(
+                    settings,
+                    "DELETE",
+                    "/internal/v1/mobile-creator/normalizations/owners/"
+                    f"creator_upload/{generation.upload_id}",
+                )
+            _retire_generated_upload(db, settings, generation)
+            generation.status = "expired"
+            generation.progress_stage = "expired"
+            generation.error_code = "DRAFT_EXPIRED"
+            generation.error_message = "This unaccepted source draft has expired."
+            if generation.quota_state == "reserved":
+                generation.quota_state = "released"
+            generation.updated_at = _now()
+            creation = db.get(CreatorCreation, generation.creation_id)
+            if (
+                creation is not None
+                and creation.source_generation_id == generation.id
+                and not _creation_has_versions(db, creation.id)
+            ):
+                creation.status = "abandoned"
+                creation.progress_stage = "expired"
+                creation.progress_percent = generation.progress_percent
+                creation.error_code = generation.error_code
+                creation.error_message = generation.error_message
+                creation.updated_at = _now()
+                db.add(creation)
+            db.add(generation)
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - retry lifecycle cleanup later
+            db.rollback()
+            log.warning(
+                "generated draft cleanup deferred generation_id=%s error=%s",
+                generation.id,
+                exc,
+            )
+        return True
+
+
+def _creation_has_versions(db: Session, creation_id: str) -> bool:
+    return (
+        db.query(CreatorVersion.id)
+        .filter(CreatorVersion.creation_id == creation_id)
+        .first()
+        is not None
+    )
 
 
 def _submit_job(
@@ -539,6 +1037,7 @@ def process_next_creator_version(settings: Settings | None = None) -> bool:
 
 def main() -> int:
     settings = get_settings()
+    validate_environment_contract(settings)
     setup_logging(level=settings.log_level)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -552,8 +1051,10 @@ def main() -> int:
         with _global_worker_slot() as acquired:
             if acquired:
                 normalized = process_next_upload_normalization(settings)
+                generated = process_next_source_generation(settings)
                 created = process_next_creator_version(settings)
-                processed = normalized or created
+                expired = process_next_expired_source(settings)
+                processed = normalized or generated or created or expired
         interval = 0.25 if processed else settings.creator_worker_poll_seconds
         time.sleep(max(0.25, interval))
     log.info("creator coordinator stopped")

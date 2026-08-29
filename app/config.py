@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -13,6 +15,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=str(_ROOT / ".env"), env_file_encoding="utf-8", extra="ignore")
 
     database_url: str
+    pixo_environment: Literal["development", "production"] | None = None
+    rds_host: str = ""
     publish_key: str
     cursor_secret: str = ""
     server_ver: str = "1.2"
@@ -104,6 +108,7 @@ class Settings(BaseSettings):
     # Comma-separated Android/iOS OAuth client IDs.  Keep the legacy singular
     # field during migration so existing Android deployments remain valid.
     google_client_ids: str = ""
+    web_google_client_id: str = ""
     google_client_secret: str = ""
     google_timeout_seconds: float = 5.0
 
@@ -118,6 +123,12 @@ class Settings(BaseSettings):
     creator_worker_poll_seconds: float = 2.0
     creator_video_max_bytes: int = 120 * 1024 * 1024
     creator_video_max_duration_seconds: int = 30
+    creator_text_to_video_enabled: bool = False
+    creator_video_daily_quota: int = 3
+    creator_video_draft_ttl_days: int = 30
+    creator_access_mode: Literal[
+        "invite", "web_open", "android_open", "all_open"
+    ] = "invite"
     public_share_base_url: str = ""
     # Canonical browser player used for shareable Runtime permalinks.
     public_game_base_url: str = "https://demo.pixopixo.cn/game/"
@@ -157,3 +168,33 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_environment_contract(settings: Settings) -> None:
+    """Fail closed when an explicitly configured runtime crosses environments."""
+    environment = settings.pixo_environment
+    if environment is None:
+        return
+
+    host = (make_url(settings.database_url).host or "").strip().lower()
+    local_hosts = {"mysql", "ivapp-mysql", "localhost", "127.0.0.1"}
+    if environment == "development":
+        if host not in local_hosts:
+            raise RuntimeError("development ivapp must use the local Docker MySQL service")
+        if settings.public_share_base_url.rstrip("/") != "https://api.pixopixo.cn":
+            raise RuntimeError("development ivapp must publish .cn share URLs")
+        if settings.public_game_base_url.rstrip("/") != "https://demo.pixopixo.cn/game":
+            raise RuntimeError("development ivapp must use demo.pixopixo.cn/game")
+        return
+
+    expected_rds_host = settings.rds_host.strip().lower()
+    if host in local_hosts or not host or not expected_rds_host or host != expected_rds_host:
+        raise RuntimeError("production ivapp must use the private RDS endpoint")
+    if settings.public_share_base_url.rstrip("/") != "https://api.pixopixo.com":
+        raise RuntimeError("production ivapp must publish .com share URLs")
+    if settings.public_game_base_url.rstrip("/") != "https://www.pixopixo.com":
+        raise RuntimeError("production ivapp must use www.pixopixo.com")
+    if settings.aliyun_oss_public_base_url.rstrip("/") != "https://video.pixopixo.cn":
+        raise RuntimeError(
+            "production media must remain on video.pixopixo.cn until the CDN cutover"
+        )

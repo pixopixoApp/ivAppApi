@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.auth_user import AppUser, require_bearer_user
+from app.auth_user import AppUser
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
@@ -65,6 +65,7 @@ from app.models import (
 from app.oss_storage import OssStorageError, delete_object, public_url, sign_get_url
 from app.schemas_platform import CreatorUploadOut
 from app.video_probe import VideoProbeError, probe_video
+from app.web_session import require_creator_user
 
 router = APIRouter(tags=["media-storage"])
 
@@ -204,7 +205,7 @@ def _creator_local_session(
 )
 def get_creator_upload(
     upload_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorUploadOut:
     row = db.get(CreatorUpload, upload_id)
@@ -454,7 +455,7 @@ def retire_legacy_run_json(
 )
 def init_creator_upload(
     payload: CreatorDirectUploadRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> UploadSessionOut:
@@ -465,6 +466,12 @@ def init_creator_upload(
             status_code=400,
             detail=f"video exceeds {settings.creator_video_max_bytes} bytes",
         )
+    content_type = payload.content_type.split(";", 1)[0].strip().lower()
+    if not payload.filename.lower().endswith(".mp4") and content_type not in {
+        "video/mp4",
+        "application/mp4",
+    }:
+        raise HTTPException(status_code=400, detail="an MP4 video is required")
     upload_id = f"up_{secrets.token_urlsafe(18)}"
     if (
         settings.creator_local_upload_enabled
@@ -495,7 +502,7 @@ def init_creator_upload(
                 "filename": filename,
                 "content_type": payload.content_type,
                 "size_bytes": int(payload.size_bytes),
-                "sha256": payload.sha256.lower(),
+                "sha256": payload.sha256.lower() if payload.sha256 else "",
                 "offset": 0,
             },
             expires_at=expires_at,
@@ -522,6 +529,11 @@ def init_creator_upload(
         )
     if not settings.creator_legacy_oss_upload_enabled:
         raise HTTPException(status_code=426, detail="please update the app to upload videos")
+    if not payload.sha256:
+        raise HTTPException(
+            status_code=426,
+            detail="browser uploads require local-resumable-v1",
+        )
     try:
         result = create_upload_session(
             db,
@@ -550,7 +562,7 @@ def init_creator_upload(
 @router.head("/api/v1/creator/uploads/{session_id}/source", status_code=204)
 def inspect_creator_local_upload(
     session_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> Response:
     session = _creator_local_session(db, session_id, user)
@@ -569,7 +581,7 @@ def inspect_creator_local_upload(
 async def upload_creator_source_locally(
     session_id: str,
     request: Request,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> Response:
@@ -650,7 +662,7 @@ async def upload_creator_source_locally(
 def finalize_creator_upload(
     session_id: str,
     payload: FinalizeUploadSessionRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorUploadOut:
@@ -672,13 +684,16 @@ def finalize_creator_upload(
         expected_size = int(context.get("size_bytes") or 0)
         if session.state != "uploaded" or int(context.get("offset") or 0) != expected_size:
             raise HTTPException(status_code=409, detail="local upload is incomplete")
-        digest = valid_sha256(str(context.get("sha256") or ""))
-        if digest is None:
+        declared_digest = str(context.get("sha256") or "")
+        digest = valid_sha256(declared_digest)
+        if declared_digest and digest is None:
             raise HTTPException(status_code=400, detail="invalid upload checksum")
         staging = upload_staging_path(settings, session.id)
         try:
             source = staging
             if not staging.is_file() or staging.is_symlink():
+                if digest is None:
+                    raise LocalMediaCacheError("uploaded video is unavailable")
                 source = local_path_for_sha256(
                     settings,
                     digest,
@@ -686,12 +701,18 @@ def finalize_creator_upload(
                 )
                 if source is None or sha256_file(source) != digest:
                     raise LocalMediaCacheError("uploaded video is unavailable")
+            else:
+                calculated_digest = sha256_file(staging)
+                if digest is not None and calculated_digest != digest:
+                    raise LocalMediaCacheError("uploaded video checksum does not match")
+                digest = calculated_digest
             metadata = probe_video(source)
             if metadata.duration_ms > settings.creator_video_max_duration_seconds * 1000:
                 raise LocalMediaCacheError(
                     f"video must be {settings.creator_video_max_duration_seconds} seconds or shorter"
                 )
             if source == staging:
+                assert digest is not None
                 commit_staged_upload(
                     settings,
                     staging,

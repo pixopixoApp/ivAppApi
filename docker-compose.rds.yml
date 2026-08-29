@@ -1,0 +1,46 @@
+services:
+  mysql:
+    profiles:
+      - local-mysql-only
+
+  phpmyadmin:
+    depends_on: !override []
+    environment:
+      PMA_HOST: ${RDS_HOST:?RDS_HOST is required}
+      PMA_PORT: ${RDS_PORT:-3306}
+      PMA_USER: ${RDS_DB_USER:?RDS_DB_USER is required}
+      PMA_PASSWORD: ${RDS_DB_PASSWORD:?RDS_DB_PASSWORD is required}
+      UPLOAD_LIMIT: 256M
+
+  api:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+    env_file: !override
+      - .env
+      - .env.target
+    environment:
+      PIXO_ENVIRONMENT: ${PIXO_ENVIRONMENT:?PIXO_ENVIRONMENT is required}
+      RDS_HOST: ${RDS_HOST:?RDS_HOST is required}
+      DATABASE_URL: ${RDS_DATABASE_URL:?RDS_DATABASE_URL is required}
+    ports: !override
+      - 127.0.0.1:${API_PORT:-8100}:8100
+
+  worker:
+    profiles:
+      - background-workers
+    env_file: !override
+      - .env
+      - .env.target
+    environment:
+      PIXO_ENVIRONMENT: ${PIXO_ENVIRONMENT:?PIXO_ENVIRONMENT is required}
+      RDS_HOST: ${RDS_HOST:?RDS_HOST is required}
+      DATABASE_URL: ${RDS_DATABASE_URL:?RDS_DATABASE_URL is required}
+
+  cdn-worker:
+    profiles:
+      - background-workers
+    environment:
+      PIXO_ENVIRONMENT: ${PIXO_ENVIRONMENT:?PIXO_ENVIRONMENT is required}
+      RDS_HOST: ${RDS_HOST:?RDS_HOST is required}
+      DATABASE_URL: ${RDS_DATABASE_URL:?RDS_DATABASE_URL is required}

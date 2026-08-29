@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import html
+import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
@@ -26,6 +28,7 @@ from app.cdn_publication import (
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
+from app.mail import send_creator_invite
 from app.media_cache import local_path_for_sha256
 from app.media_service import MediaServiceError, media_mode_is_oss
 from app.models import (
@@ -35,6 +38,7 @@ from app.models import (
     CreatorApplication,
     CreatorCreation,
     CreatorInvite,
+    CreatorSourceGeneration,
     CreatorUpload,
     CreatorVersion,
     MediaObject,
@@ -61,15 +65,22 @@ from app.schemas_platform import (
     CreatorAccessOut,
     CreatorAccessRevokeResponse,
     CreatorApplicationDecisionRequest,
+    CreatorApplicationInviteRequest,
+    CreatorApplicationInviteResponse,
+    CreatorApplicationInviteResult,
     CreatorApplicationOut,
     CreatorApplicationRequest,
     CreatorCreationOut,
     CreatorCreationRequest,
+    CreatorGenerationQuotaOut,
     CreatorInviteOut,
     CreatorInvitePage,
     CreatorPublishedMutationOut,
     CreatorPublishRequest,
     CreatorPublishResponse,
+    CreatorSourceAcceptRequest,
+    CreatorSourceGenerationOut,
+    CreatorSourceRegenerateRequest,
     CreatorUploadOut,
     CreatorVersionOut,
     CreatorVersionRequest,
@@ -84,13 +95,16 @@ from app.share_urls import legacy_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
 from app.video_probe import VideoProbeError, probe_video
+from app.web_session import require_creator_user
 
 public_router = APIRouter(prefix="/api/v1", tags=["platform"])
 creator_router = APIRouter(prefix="/api/v1/creator", tags=["creator"])
 operations_router = APIRouter(prefix="/internal/v1", tags=["admin"])
 
-_ACTIVE_CREATION_STATUSES = ("queued", "running")
+_ACTIVE_CREATION_STATUSES = ("queued", "running", "source_ready")
+_ACTIVE_VERSION_STATUSES = ("queued", "running")
 _INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _now() -> datetime:
@@ -99,6 +113,67 @@ def _now() -> datetime:
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat() if value is not None else ""
+
+
+def _quota_window(now: datetime | None = None) -> tuple[str, datetime]:
+    current = (now or _now()).astimezone(_SHANGHAI)
+    next_day = current.date() + timedelta(days=1)
+    reset_local = datetime.combine(next_day, time.min, tzinfo=_SHANGHAI)
+    return current.date().isoformat(), reset_local.astimezone(timezone.utc)
+
+
+def _generation_quota_out(
+    db: Session,
+    user_id: str,
+    settings: Settings | None = None,
+) -> CreatorGenerationQuotaOut:
+    active_settings = settings or get_settings()
+    quota_date, resets_at = _quota_window()
+    rows = (
+        db.query(CreatorSourceGeneration.quota_state, func.count(CreatorSourceGeneration.id))
+        .filter(
+            CreatorSourceGeneration.user_id == user_id,
+            CreatorSourceGeneration.quota_date == quota_date,
+            CreatorSourceGeneration.quota_state.in_(("reserved", "charged")),
+        )
+        .group_by(CreatorSourceGeneration.quota_state)
+        .all()
+    )
+    counts = {str(state): int(count) for state, count in rows}
+    reserved = counts.get("reserved", 0)
+    used = counts.get("charged", 0)
+    limit = max(0, active_settings.creator_video_daily_quota)
+    enabled = bool(active_settings.creator_text_to_video_enabled)
+    return CreatorGenerationQuotaOut(
+        enabled=enabled,
+        limit=limit,
+        used=used,
+        reserved=reserved,
+        remaining=max(0, limit - used - reserved) if enabled else 0,
+        resets_at=_iso(resets_at),
+    )
+
+
+def _reserve_generation_quota(
+    db: Session,
+    *,
+    user_id: str,
+    settings: Settings,
+) -> tuple[str, datetime]:
+    if not settings.creator_text_to_video_enabled:
+        raise HTTPException(status_code=503, detail="text-to-video creation is not available")
+    quota = _generation_quota_out(db, user_id, settings)
+    if quota.remaining <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Daily video generation limit reached",
+                "resets_at": quota.resets_at,
+                "limit": quota.limit,
+            },
+        )
+    quota_date, _resets_at = _quota_window()
+    return quota_date, _now() + timedelta(days=max(1, settings.creator_video_draft_ttl_days))
 
 
 def _normalize_invite(raw: str) -> str:
@@ -112,6 +187,16 @@ def _invite_hash(raw: str) -> str:
 def _new_invite_code() -> str:
     compact = "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(12))
     return f"{compact[:4]}-{compact[4:8]}-{compact[8:]}"
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _creator_application_email(raw: str, user: AppUser | None = None) -> str:
+    value = (raw or (user.email if user else None) or "").strip().lower()
+    if not value or len(value) > 256 or not _EMAIL_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="a valid application email is required")
+    return value
 
 
 def _access_grant(db: Session, user_id: str) -> CreatorAccessGrant | None:
@@ -174,7 +259,7 @@ def delete_account(
 def _version_out(
     row: CreatorVersion,
     *,
-    upload_id: str,
+    upload_id: str | None,
     settings: Settings | None = None,
 ) -> CreatorVersionOut:
     active_settings = settings or get_settings()
@@ -187,7 +272,11 @@ def _version_out(
         progress_stage=row.progress_stage,
         progress_percent=row.progress_percent,
         retry_count=row.retry_count,
-        preview_url=(f"/api/v1/creator/previews/{upload_id}" if ready else None),
+        preview_url=(
+            f"/api/v1/creator/previews/{upload_id}"
+            if ready and upload_id
+            else None
+        ),
         runtime_spec=(
             canonicalize_public_payload(active_settings, row.runtime_spec)
             if ready
@@ -210,6 +299,39 @@ def _creation_versions(db: Session, creation_id: str) -> list[CreatorVersion]:
     )
 
 
+def _source_generation_out(
+    db: Session,
+    row: CreatorSourceGeneration,
+) -> CreatorSourceGenerationOut:
+    upload = db.get(CreatorUpload, row.upload_id) if row.upload_id else None
+    preview_ready = bool(
+        upload is not None
+        and upload.user_id == row.user_id
+        and upload.normalization_status == "ready"
+    )
+    return CreatorSourceGenerationOut(
+        generation_id=row.id,
+        attempt=row.attempt,
+        original_prompt=row.original_prompt,
+        prompt_summary=row.prompt_summary,
+        generation_prompt=row.generation_prompt,
+        interaction_brief=row.interaction_brief,
+        preset=dict(row.preset_json or {}),
+        status=row.status,
+        progress_stage=row.progress_stage,
+        progress_percent=row.progress_percent,
+        provider_task_accepted=row.provider_task_accepted,
+        preview_url=(
+            f"/api/v1/creator/uploads/{upload.id}/media" if preview_ready else None
+        ),
+        error_code=row.error_code or None,
+        error_message=row.error_message or None,
+        expires_at=_iso(row.expires_at),
+        created_at=_iso(row.created_at),
+        updated_at=_iso(row.updated_at),
+    )
+
+
 def _creation_out(
     db: Session,
     row: CreatorCreation,
@@ -217,15 +339,31 @@ def _creation_out(
 ) -> CreatorCreationOut:
     active_settings = settings or get_settings()
     versions = _creation_versions(db, row.id)
-    ready = row.status in ("ready", "published")
+    generation = (
+        db.get(CreatorSourceGeneration, row.source_generation_id)
+        if row.source_generation_id
+        else None
+    )
+    ready = row.status in ("ready", "published", "pending_review")
+    source_out = _source_generation_out(db, generation) if generation is not None else None
     return CreatorCreationOut(
         creation_id=row.id,
         upload_id=row.upload_id,
+        source_mode=("prompt" if row.source_mode == "prompt" else "upload"),
+        source_prompt=row.source_prompt,
+        source_generation_id=row.source_generation_id,
+        source_preview_url=source_out.preview_url if source_out is not None else None,
+        source_generation=source_out,
+        generation_quota=_generation_quota_out(db, row.user_id, active_settings),
         status=row.status,
         progress_stage=row.progress_stage,
         progress_percent=row.progress_percent,
         retry_count=row.retry_count,
-        preview_url=(f"/api/v1/creator/previews/{row.upload_id}" if ready else None),
+        preview_url=(
+            f"/api/v1/creator/previews/{row.upload_id}"
+            if ready and row.upload_id
+            else None
+        ),
         runtime_spec=(
             canonicalize_public_payload(active_settings, row.runtime_spec)
             if ready
@@ -345,8 +483,9 @@ def get_app_version(
 
 @creator_router.get("/access", response_model=CreatorAccessOut)
 def get_creator_access(
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorAccessOut:
     grant = _access_grant(db, user.user_id)
     application = db.get(CreatorApplication, user.user_id)
@@ -355,14 +494,19 @@ def get_creator_access(
         source=grant.source if grant else None,
         granted_at=_iso(grant.granted_at) if grant else None,
         application_status=application.status if application else None,
+        application_email=application.email if application else None,
+        video_generation=(
+            _generation_quota_out(db, user.user_id, settings) if grant else None
+        ),
     )
 
 
 @creator_router.post("/invites/redeem", response_model=CreatorAccessOut)
 def redeem_creator_invite(
     payload: InviteRedeemRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorAccessOut:
     existing = _access_grant(db, user.user_id)
     if existing is not None:
@@ -370,6 +514,7 @@ def redeem_creator_invite(
             granted=True,
             source=existing.source,
             granted_at=_iso(existing.granted_at),
+            video_generation=_generation_quota_out(db, user.user_id, settings),
         )
     normalized = _normalize_invite(payload.code)
     if not normalized:
@@ -383,6 +528,9 @@ def redeem_creator_invite(
     if invite is None or not invite.enabled or invite.redeemed_by_user_id:
         db.rollback()
         raise HTTPException(status_code=400, detail="invite code is invalid or already used")
+    if invite.assigned_user_id and invite.assigned_user_id != user.user_id:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="invite code is assigned to another account")
     now = _now()
     invite.redeemed_by_user_id = user.user_id
     invite.redeemed_at = now
@@ -393,23 +541,40 @@ def redeem_creator_invite(
         granted_at=now,
     )
     db.add(grant)
+    application = db.get(CreatorApplication, user.user_id)
+    if application is not None:
+        if application.invite_id and application.invite_id != invite.id:
+            previous = db.get(CreatorInvite, application.invite_id)
+            if previous is not None and not previous.redeemed_by_user_id:
+                previous.enabled = False
+        application.invite_id = invite.id
+        application.status = "approved"
+        application.last_error = ""
+        application.updated_at = now
     db.commit()
-    return CreatorAccessOut(granted=True, source="invite", granted_at=_iso(now))
+    return CreatorAccessOut(
+        granted=True,
+        source="invite",
+        granted_at=_iso(now),
+        video_generation=_generation_quota_out(db, user.user_id, settings),
+    )
 
 
 @creator_router.post("/applications", response_model=CreatorApplicationOut)
 def apply_for_creator_access(
     payload: CreatorApplicationRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorApplicationOut:
     if _access_grant(db, user.user_id) is not None:
         raise HTTPException(status_code=409, detail="creator access already granted")
     now = _now()
+    email = _creator_application_email(payload.email, user)
     row = db.get(CreatorApplication, user.user_id)
     if row is None:
         row = CreatorApplication(
             user_id=user.user_id,
+            email=email,
             message=payload.message.strip(),
             status="pending",
             created_at=now,
@@ -417,23 +582,24 @@ def apply_for_creator_access(
         )
         db.add(row)
     elif row.status == "pending":
+        row.email = email
         row.message = payload.message.strip()
+        row.last_error = ""
         row.updated_at = now
     elif row.status == "rejected":
+        row.email = email
         row.message = payload.message.strip()
         row.status = "pending"
+        row.invite_id = None
+        row.invited_at = None
+        row.email_sent_at = None
+        row.last_error = ""
         row.updated_at = now
     else:
-        raise HTTPException(status_code=409, detail="application already approved")
+        raise HTTPException(status_code=409, detail="creator application is already being processed")
     db.commit()
     db.refresh(row)
-    return CreatorApplicationOut(
-        user_id=row.user_id,
-        message=row.message,
-        status=row.status,
-        created_at=_iso(row.created_at),
-        updated_at=_iso(row.updated_at),
-    )
+    return _creator_application_out(db, row)
 
 
 @operations_router.post(
@@ -447,17 +613,8 @@ def create_creator_invites(
 ) -> InviteCreateResponse:
     codes: list[str] = []
     while len(codes) < payload.count:
-        code = _new_invite_code()
-        digest = _invite_hash(code)
-        if db.query(CreatorInvite).filter(CreatorInvite.code_hash == digest).first():
-            continue
-        db.add(
-            CreatorInvite(
-                code_hash=digest,
-                code_hint=_normalize_invite(code)[-4:],
-                enabled=True,
-            )
-        )
+        code, invite = _new_creator_invite(db)
+        db.add(invite)
         codes.append(code)
     db.commit()
     return InviteCreateResponse(codes=codes)
@@ -467,6 +624,42 @@ def _invite_status(row: CreatorInvite) -> Literal["unused", "redeemed", "revoked
     if row.redeemed_by_user_id:
         return "redeemed"
     return "unused" if row.enabled else "revoked"
+
+
+def _new_creator_invite(
+    db: Session,
+    *,
+    assigned_user_id: str | None = None,
+) -> tuple[str, CreatorInvite]:
+    while True:
+        code = _new_invite_code()
+        digest = _invite_hash(code)
+        if db.query(CreatorInvite).filter(CreatorInvite.code_hash == digest).first():
+            continue
+        return code, CreatorInvite(
+            code_hash=digest,
+            code_hint=_normalize_invite(code)[-4:],
+            enabled=True,
+            assigned_user_id=assigned_user_id,
+        )
+
+
+def _creator_application_out(db: Session, row: CreatorApplication) -> CreatorApplicationOut:
+    invite = db.get(CreatorInvite, row.invite_id) if row.invite_id else None
+    return CreatorApplicationOut(
+        user_id=row.user_id,
+        email=row.email,
+        message=row.message,
+        status=row.status,
+        invite_id=row.invite_id,
+        invite_code_hint=invite.code_hint if invite else "",
+        invite_status=_invite_status(invite) if invite else None,
+        invited_at=_iso(row.invited_at) or None,
+        email_sent_at=_iso(row.email_sent_at) or None,
+        last_error=row.last_error,
+        created_at=_iso(row.created_at),
+        updated_at=_iso(row.updated_at),
+    )
 
 
 def _invite_out(db: Session, row: CreatorInvite) -> CreatorInviteOut:
@@ -479,6 +672,7 @@ def _invite_out(db: Session, row: CreatorInvite) -> CreatorInviteOut:
         code_hint=row.code_hint,
         enabled=row.enabled,
         status=_invite_status(row),
+        assigned_user_id=row.assigned_user_id,
         redeemed_by_user_id=row.redeemed_by_user_id,
         redeemed_by_label=label,
         redeemed_at=_iso(row.redeemed_at) or None,
@@ -513,6 +707,7 @@ def list_creator_invites(
             or_(
                 CreatorInvite.code_hint.contains(term.upper()),
                 CreatorInvite.redeemed_by_user_id.contains(term),
+                CreatorInvite.assigned_user_id.contains(term),
             )
         )
     total = query.count()
@@ -590,11 +785,26 @@ def revoke_creator_access(
             db.query(CreatorVersion)
             .filter(
                 CreatorVersion.creation_id.in_(creation_ids),
-                CreatorVersion.status.in_(_ACTIVE_CREATION_STATUSES),
+                CreatorVersion.status.in_(_ACTIVE_VERSION_STATUSES),
             )
             .all()
         ):
             version.cancel_requested = True
+        for generation in (
+            db.query(CreatorSourceGeneration)
+            .filter(
+                CreatorSourceGeneration.creation_id.in_(creation_ids),
+                CreatorSourceGeneration.status.in_(("queued", "running")),
+            )
+            .all()
+        ):
+            if generation.status == "queued" and not generation.ivadmin_job_id:
+                generation.status = "cancelled"
+                generation.progress_stage = "cancelled"
+                if generation.quota_state == "reserved":
+                    generation.quota_state = "released"
+            else:
+                generation.cancel_requested = True
     db.commit()
     return CreatorAccessRevokeResponse(
         user_id=uid,
@@ -610,22 +820,117 @@ def revoke_creator_access(
 )
 def list_creator_applications(
     db: Annotated[Session, Depends(get_db)],
-    status: Literal["pending", "approved", "rejected"] | None = None,
+    status: Literal["pending", "invited", "approved", "rejected"] | None = None,
 ) -> list[CreatorApplicationOut]:
     query = db.query(CreatorApplication)
     if status:
         query = query.filter(CreatorApplication.status == status)
     rows = query.order_by(CreatorApplication.updated_at.desc()).limit(500).all()
-    return [
-        CreatorApplicationOut(
-            user_id=row.user_id,
-            message=row.message,
-            status=row.status,
-            created_at=_iso(row.created_at),
-            updated_at=_iso(row.updated_at),
+    return [_creator_application_out(db, row) for row in rows]
+
+
+@operations_router.post(
+    "/creator/applications/invite",
+    response_model=CreatorApplicationInviteResponse,
+    dependencies=[Depends(require_publish_key)],
+)
+def invite_creator_applicants(
+    payload: CreatorApplicationInviteRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreatorApplicationInviteResponse:
+    requested = list(
+        dict.fromkeys(user_id.strip() for user_id in payload.user_ids if user_id.strip())
+    )
+    if not requested:
+        raise HTTPException(status_code=400, detail="at least one user_id is required")
+    results: list[CreatorApplicationInviteResult] = []
+    for user_id in requested:
+        row = (
+            db.query(CreatorApplication)
+            .filter(CreatorApplication.user_id == user_id)
+            .with_for_update()
+            .one_or_none()
         )
-        for row in rows
-    ]
+        if row is None:
+            results.append(CreatorApplicationInviteResult(
+                user_id=user_id,
+                status="failed",
+                error="Creator application not found.",
+            ))
+            db.rollback()
+            continue
+        if row.status != "pending" or row.invite_id:
+            results.append(CreatorApplicationInviteResult(
+                user_id=user_id,
+                email=row.email,
+                status="skipped",
+                application_status=row.status,
+                invite_id=row.invite_id,
+                error="This application has already been processed.",
+            ))
+            db.rollback()
+            continue
+        try:
+            email = _creator_application_email(row.email)
+        except HTTPException as exc:
+            row.last_error = str(exc.detail)
+            row.updated_at = _now()
+            db.commit()
+            results.append(CreatorApplicationInviteResult(
+                user_id=user_id,
+                email=row.email,
+                status="failed",
+                application_status=row.status,
+                error=str(exc.detail),
+            ))
+            continue
+
+        code, invite = _new_creator_invite(db, assigned_user_id=user_id)
+        db.add(invite)
+        db.flush()
+        now = _now()
+        row.invite_id = invite.id
+        row.status = "invited"
+        row.invited_at = now
+        row.email_sent_at = now
+        row.last_error = ""
+        row.updated_at = now
+        try:
+            send_creator_invite(settings, email=email, code=code)
+        # Any delivery failure must roll back the assigned one-time code so the
+        # application remains retryable by operations.
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            failed = db.get(CreatorApplication, user_id)
+            if failed is not None:
+                failed.last_error = "Email could not be sent. Check SMTP settings and retry."
+                failed.updated_at = _now()
+                db.commit()
+            results.append(CreatorApplicationInviteResult(
+                user_id=user_id,
+                email=email,
+                status="failed",
+                application_status="pending",
+                error="Email could not be sent. Check SMTP settings and retry.",
+            ))
+            continue
+        db.commit()
+        results.append(CreatorApplicationInviteResult(
+            user_id=user_id,
+            email=email,
+            status="sent",
+            application_status="invited",
+            invite_id=invite.id,
+            invite_code_hint=invite.code_hint,
+        ))
+
+    return CreatorApplicationInviteResponse(
+        items=results,
+        sent_count=sum(item.status == "sent" for item in results),
+        skipped_count=sum(item.status == "skipped" for item in results),
+        failed_count=sum(item.status == "failed" for item in results),
+    )
 
 
 @operations_router.post(
@@ -643,6 +948,9 @@ def decide_creator_application(
         raise HTTPException(status_code=404, detail="creator application not found")
     row.status = payload.status
     row.updated_at = _now()
+    linked_invite = db.get(CreatorInvite, row.invite_id) if row.invite_id else None
+    if linked_invite is not None and not linked_invite.redeemed_by_user_id:
+        linked_invite.enabled = False
     if payload.status == "approved" and _access_grant(db, user_id) is None:
         db.add(
             CreatorAccessGrant(
@@ -653,18 +961,12 @@ def decide_creator_application(
         )
     db.commit()
     db.refresh(row)
-    return CreatorApplicationOut(
-        user_id=row.user_id,
-        message=row.message,
-        status=row.status,
-        created_at=_iso(row.created_at),
-        updated_at=_iso(row.updated_at),
-    )
+    return _creator_application_out(db, row)
 
 
 @creator_router.post("/uploads", response_model=CreatorUploadOut, status_code=201)
 async def upload_creator_video(
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
     file: Annotated[UploadFile, File()],
@@ -775,7 +1077,7 @@ def public_creator_preview(
 @creator_router.get("/uploads/{upload_id}/media", response_class=FileResponse)
 def preview_creator_upload(
     upload_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> Response:
@@ -814,22 +1116,39 @@ def preview_creator_upload(
 @creator_router.post("/creations", response_model=CreatorCreationOut, status_code=202)
 def create_interactive_video(
     payload: CreatorCreationRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorCreationOut:
     _lock_creator(db, user.user_id)
-    if payload.request_id:
+    request_id = payload.request_id.strip() if payload.request_id else ""
+    if request_id:
+        existing_generation = (
+            db.query(CreatorSourceGeneration)
+            .filter(CreatorSourceGeneration.request_id == request_id)
+            .first()
+        )
+        if existing_generation is not None:
+            if (
+                existing_generation.user_id != user.user_id
+                or existing_generation.original_prompt != payload.prompt.strip()
+            ):
+                raise HTTPException(status_code=409, detail="request id is already in use")
+            return _creation_out(
+                db,
+                _owned_creation(db, existing_generation.creation_id, user.user_id),
+                settings,
+            )
         existing_version = (
             db.query(CreatorVersion)
-            .filter(CreatorVersion.request_id == payload.request_id.strip())
+            .filter(CreatorVersion.request_id == request_id)
             .first()
         )
         if existing_version is not None:
+            if existing_version.user_id != user.user_id:
+                raise HTTPException(status_code=409, detail="request id is already in use")
             existing = _owned_creation(db, existing_version.creation_id, user.user_id)
-            return _creation_out(db, existing)
-    upload = db.get(CreatorUpload, payload.upload_id)
-    if upload is None or upload.user_id != user.user_id:
-        raise HTTPException(status_code=404, detail="upload not found")
+            return _creation_out(db, existing, settings)
     active = (
         db.query(CreatorCreation)
         .filter(
@@ -845,11 +1164,61 @@ def create_interactive_video(
         )
     now = _now()
     creation_id = f"cr_{secrets.token_urlsafe(18)}"
+    if payload.source_mode == "prompt":
+        quota_date, expires_at = _reserve_generation_quota(
+            db,
+            user_id=user.user_id,
+            settings=settings,
+        )
+        generation_id = f"csg_{secrets.token_urlsafe(18)}"
+        generation_request_id = request_id or f"generate:{generation_id}"
+        row = CreatorCreation(
+            id=creation_id,
+            user_id=user.user_id,
+            upload_id=None,
+            source_mode="prompt",
+            source_prompt=payload.prompt.strip(),
+            source_generation_id=generation_id,
+            brief="",
+            status="queued",
+            progress_stage="planning_prompt",
+            progress_percent=0,
+            active_version_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+        generation = CreatorSourceGeneration(
+            id=generation_id,
+            creation_id=creation_id,
+            user_id=user.user_id,
+            attempt=1,
+            request_id=generation_request_id,
+            original_prompt=payload.prompt.strip(),
+            status="queued",
+            progress_stage="planning_prompt",
+            progress_percent=0,
+            quota_date=quota_date,
+            quota_state="reserved",
+            next_poll_at=now,
+            expires_at=expires_at,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([row, generation])
+        db.commit()
+        db.refresh(row)
+        return _creation_out(db, row, settings)
+
+    upload = db.get(CreatorUpload, payload.upload_id)
+    if upload is None or upload.user_id != user.user_id:
+        raise HTTPException(status_code=404, detail="upload not found")
     version_id = f"cv_{secrets.token_urlsafe(18)}"
     row = CreatorCreation(
         id=creation_id,
         user_id=user.user_id,
         upload_id=upload.id,
+        source_mode="upload",
+        source_prompt="",
         brief=payload.brief.strip(),
         status="queued",
         progress_stage="queued",
@@ -865,7 +1234,7 @@ def create_interactive_video(
             creation_id=creation_id,
             user_id=user.user_id,
             number=1,
-            request_id=payload.request_id.strip() if payload.request_id else version_id,
+            request_id=request_id or version_id,
             brief=payload.brief.strip(),
             status="queued",
             progress_stage="queued",
@@ -876,7 +1245,7 @@ def create_interactive_video(
     )
     db.commit()
     db.refresh(row)
-    return _creation_out(db, row)
+    return _creation_out(db, row, settings)
 
 
 def _owned_creation(db: Session, creation_id: str, user_id: str) -> CreatorCreation:
@@ -893,9 +1262,183 @@ def _owned_version(db: Session, version_id: str, user_id: str) -> CreatorVersion
     return row
 
 
+def _owned_source_generation(
+    db: Session,
+    generation_id: str,
+    user_id: str,
+) -> CreatorSourceGeneration:
+    row = db.get(CreatorSourceGeneration, generation_id)
+    if row is None or row.user_id != user_id:
+        raise HTTPException(status_code=404, detail="source generation not found")
+    return row
+
+
+@creator_router.post(
+    "/creations/{creation_id}/source/regenerate",
+    response_model=CreatorCreationOut,
+    status_code=202,
+)
+def regenerate_creation_source(
+    creation_id: str,
+    payload: CreatorSourceRegenerateRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreatorCreationOut:
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    if creation.source_mode != "prompt":
+        raise HTTPException(status_code=409, detail="uploaded sources cannot be regenerated")
+
+    request_id = payload.request_id.strip()
+    existing = (
+        db.query(CreatorSourceGeneration)
+        .filter(CreatorSourceGeneration.request_id == request_id)
+        .first()
+    )
+    if existing is not None:
+        if (
+            existing.creation_id != creation.id
+            or existing.user_id != user.user_id
+            or existing.original_prompt != payload.prompt.strip()
+        ):
+            raise HTTPException(status_code=409, detail="request id is already in use")
+        return _creation_out(db, creation, settings)
+
+    if creation.status in {"published", "pending_review", "deleted"}:
+        raise HTTPException(status_code=409, detail="this creation can no longer be regenerated")
+    if _creation_versions(db, creation.id):
+        raise HTTPException(
+            status_code=409,
+            detail="the source was already accepted; start a new creation instead",
+        )
+    current = (
+        db.get(CreatorSourceGeneration, creation.source_generation_id)
+        if creation.source_generation_id
+        else None
+    )
+    if current is not None and current.status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="source generation is still in progress")
+
+    quota_date, expires_at = _reserve_generation_quota(
+        db,
+        user_id=user.user_id,
+        settings=settings,
+    )
+    next_attempt = int(
+        db.query(func.max(CreatorSourceGeneration.attempt))
+        .filter(CreatorSourceGeneration.creation_id == creation.id)
+        .scalar()
+        or 0
+    ) + 1
+    now = _now()
+    generation = CreatorSourceGeneration(
+        id=f"csg_{secrets.token_urlsafe(18)}",
+        creation_id=creation.id,
+        user_id=user.user_id,
+        attempt=next_attempt,
+        request_id=request_id,
+        original_prompt=payload.prompt.strip(),
+        status="queued",
+        progress_stage="planning_prompt",
+        progress_percent=0,
+        quota_date=quota_date,
+        quota_state="reserved",
+        next_poll_at=now,
+        expires_at=expires_at,
+        created_at=now,
+        updated_at=now,
+    )
+    creation.upload_id = None
+    creation.source_prompt = generation.original_prompt
+    creation.source_generation_id = generation.id
+    creation.brief = ""
+    creation.status = "queued"
+    creation.progress_stage = "planning_prompt"
+    creation.progress_percent = 0
+    creation.active_version_id = None
+    creation.error_code = ""
+    creation.error_message = ""
+    creation.updated_at = now
+    db.add_all([generation, creation])
+    db.commit()
+    db.refresh(creation)
+    return _creation_out(db, creation, settings)
+
+
+@creator_router.post(
+    "/creations/{creation_id}/source/accept",
+    response_model=CreatorCreationOut,
+    status_code=202,
+)
+def accept_creation_source(
+    creation_id: str,
+    payload: CreatorSourceAcceptRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreatorCreationOut:
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    generation = _owned_source_generation(db, payload.generation_id, user.user_id)
+    if generation.creation_id != creation.id or creation.source_generation_id != generation.id:
+        raise HTTPException(status_code=409, detail="this is no longer the current source")
+
+    versions = _creation_versions(db, creation.id)
+    if generation.accepted_at is not None and versions:
+        return _creation_out(db, creation, settings)
+    if generation.status != "ready" or not generation.upload_id:
+        raise HTTPException(status_code=409, detail="source video is not ready for review")
+    upload = db.get(CreatorUpload, generation.upload_id)
+    if (
+        upload is None
+        or upload.user_id != user.user_id
+        or upload.normalization_status != "ready"
+    ):
+        raise HTTPException(status_code=409, detail="source preview is still being prepared")
+    if versions:
+        raise HTTPException(status_code=409, detail="this creation already has an analysis version")
+
+    request_id = payload.request_id.strip()
+    reused = db.query(CreatorVersion).filter(CreatorVersion.request_id == request_id).first()
+    if reused is not None:
+        raise HTTPException(status_code=409, detail="request id is already in use")
+    now = _now()
+    version_id = f"cv_{secrets.token_urlsafe(18)}"
+    brief = generation.interaction_brief.strip() or generation.original_prompt
+    version = CreatorVersion(
+        id=version_id,
+        creation_id=creation.id,
+        user_id=user.user_id,
+        number=1,
+        request_id=request_id,
+        brief=brief,
+        status="queued",
+        progress_stage="queued",
+        progress_percent=0,
+        created_at=now,
+        updated_at=now,
+    )
+    generation.accepted_at = now
+    generation.updated_at = now
+    creation.upload_id = upload.id
+    creation.brief = brief
+    creation.active_version_id = version_id
+    creation.status = "queued"
+    creation.progress_stage = "queued"
+    creation.progress_percent = 0
+    creation.error_code = ""
+    creation.error_message = ""
+    creation.updated_at = now
+    db.add_all([generation, creation, version])
+    db.commit()
+    db.refresh(creation)
+    return _creation_out(db, creation, settings)
+
+
 @creator_router.get("/creations/active", response_model=CreatorCreationOut | None)
 def get_active_creation(
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut | None:
     _require_creator(db, user)
@@ -914,7 +1457,7 @@ def get_active_creation(
 @creator_router.get("/creations/{creation_id}", response_model=CreatorCreationOut)
 def get_creation(
     creation_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _require_creator(db, user)
@@ -929,13 +1472,23 @@ def get_creation(
 def create_version(
     creation_id: str,
     payload: CreatorVersionRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _lock_creator(db, user.user_id)
     creation = _owned_creation(db, creation_id, user.user_id)
     if creation.status == "published":
         raise HTTPException(status_code=409, detail="published creations cannot be changed")
+    if not creation.upload_id:
+        raise HTTPException(status_code=409, detail="accept the generated source video first")
+    if creation.source_mode == "prompt":
+        generation = (
+            db.get(CreatorSourceGeneration, creation.source_generation_id)
+            if creation.source_generation_id
+            else None
+        )
+        if generation is None or generation.accepted_at is None:
+            raise HTTPException(status_code=409, detail="accept the generated source video first")
     if payload.request_id:
         existing = (
             db.query(CreatorVersion)
@@ -999,7 +1552,7 @@ def _cancel_version_row(db: Session, version: CreatorVersion) -> None:
 @creator_router.post("/versions/{version_id}/cancel", response_model=CreatorCreationOut)
 def cancel_version(
     version_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _require_creator(db, user)
@@ -1017,13 +1570,46 @@ def cancel_version(
 @creator_router.post("/creations/{creation_id}/cancel", response_model=CreatorCreationOut)
 def cancel_creation(
     creation_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _require_creator(db, user)
     row = _owned_creation(db, creation_id, user.user_id)
+    if row.source_mode == "prompt" and row.source_generation_id:
+        generation = _owned_source_generation(
+            db,
+            row.source_generation_id,
+            user.user_id,
+        )
+        if generation.accepted_at is None and generation.status in {
+            "queued",
+            "running",
+            "ready",
+        }:
+            if generation.status == "queued" and not generation.ivadmin_job_id:
+                generation.status = "cancelled"
+                generation.progress_stage = "cancelled"
+                generation.error_code = "CANCELLED"
+                generation.error_message = "Video generation was cancelled."
+                if generation.quota_state == "reserved":
+                    generation.quota_state = "released"
+            elif generation.status == "ready":
+                generation.status = "cancelled"
+                generation.progress_stage = "cancelled"
+                generation.error_code = "CANCELLED"
+                generation.error_message = "Generated source was not accepted."
+            else:
+                generation.cancel_requested = True
+            generation.updated_at = _now()
+            row.status = "cancelled" if generation.status == "cancelled" else "running"
+            row.progress_stage = generation.progress_stage
+            row.updated_at = _now()
+            db.add_all([generation, row])
+            db.commit()
+            db.refresh(row)
+            return _creation_out(db, row)
     versions = _creation_versions(db, row.id)
-    active = next((item for item in versions if item.status in _ACTIVE_CREATION_STATUSES), None)
+    active = next((item for item in versions if item.status in _ACTIVE_VERSION_STATUSES), None)
     if active is None:
         raise HTTPException(status_code=409, detail="creation has no cancellable version")
     _cancel_version_row(db, active)
@@ -1038,15 +1624,27 @@ def cancel_creation(
 @creator_router.delete("/creations/{creation_id}", response_model=CreatorCreationOut)
 def abandon_creation(
     creation_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _require_creator(db, user)
     row = _owned_creation(db, creation_id, user.user_id)
     if row.status == "published":
         raise HTTPException(status_code=409, detail="published creations cannot be abandoned")
+    if row.source_mode == "prompt" and row.source_generation_id:
+        generation = db.get(CreatorSourceGeneration, row.source_generation_id)
+        if generation is not None and generation.accepted_at is None:
+            if generation.status == "queued" and not generation.ivadmin_job_id:
+                generation.status = "cancelled"
+                generation.progress_stage = "cancelled"
+                if generation.quota_state == "reserved":
+                    generation.quota_state = "released"
+            elif generation.status == "running":
+                generation.cancel_requested = True
+            generation.updated_at = _now()
+            db.add(generation)
     for version in _creation_versions(db, row.id):
-        if version.status in _ACTIVE_CREATION_STATUSES:
+        if version.status in _ACTIVE_VERSION_STATUSES:
             if version.status == "queued" and not version.ivadmin_job_id:
                 version.status = "cancelled"
                 version.progress_stage = "cancelled"
@@ -1085,7 +1683,7 @@ def _retry_version_row(db: Session, version: CreatorVersion) -> None:
 @creator_router.post("/versions/{version_id}/retry", response_model=CreatorCreationOut, status_code=202)
 def retry_version(
     version_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _lock_creator(db, user.user_id)
@@ -1107,7 +1705,7 @@ def retry_version(
 @creator_router.post("/creations/{creation_id}/retry", response_model=CreatorCreationOut, status_code=202)
 def retry_creation(
     creation_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
     _lock_creator(db, user.user_id)
@@ -1138,7 +1736,7 @@ def retry_creation(
 def publish_creation(
     creation_id: str,
     payload: CreatorPublishRequest,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorPublishResponse:
@@ -1332,7 +1930,7 @@ def publish_creation(
 )
 def delete_published_video(
     video_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorPublishedMutationOut:
     _require_creator(db, user)
@@ -1364,7 +1962,7 @@ def delete_published_video(
 )
 def restore_published_video(
     video_id: str,
-    user: Annotated[AppUser, Depends(require_bearer_user)],
+    user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorPublishedMutationOut:
     _require_creator(db, user)
@@ -1377,8 +1975,10 @@ def restore_published_video(
         video.updated_at = _now()
         creation = db.get(CreatorCreation, video_id)
         if creation is not None and creation.user_id == user.user_id:
-            creation.status = "published"
-            creation.progress_stage = "published"
+            creation.status = (
+                "pending_review" if video.review_status == "pending" else "published"
+            )
+            creation.progress_stage = creation.status
             creation.updated_at = _now()
             db.add(creation)
         db.add(video)
@@ -1399,6 +1999,8 @@ def creator_share_page(
         or video.deleted_at is not None
         or not video.distribution_enabled
         or not video.cdn_ready
+        or video.review_status not in {"approved", "pending"}
+        or (video.review_status == "pending" and video.content_source != "ugc")
     ):
         raise HTTPException(status_code=404, detail="video not found")
     if video.content_type != "html":

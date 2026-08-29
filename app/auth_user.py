@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
@@ -45,6 +46,7 @@ class AppUser:
     provider: str
     subject: str
     token: str
+    channel: str = "android"
 
     @property
     def email(self) -> str | None:
@@ -87,6 +89,39 @@ def load_app_user(db: Session, token: str) -> AppUser | None:
     )
 
 
+def issue_user_token(
+    db: Session,
+    *,
+    user_id: str,
+    token_ttl_days: int,
+    now: datetime | None = None,
+    max_sessions: int = 10,
+) -> UserToken:
+    """Issue one device session without invalidating the user's other devices."""
+    issued_at = now or datetime.now(timezone.utc)
+    db.query(UserToken).filter(
+        UserToken.user_id == user_id,
+        UserToken.expires_at <= issued_at,
+    ).delete(synchronize_session=False)
+    keep_existing = max(0, max_sessions - 1)
+    existing = (
+        db.query(UserToken)
+        .filter(UserToken.user_id == user_id)
+        .order_by(UserToken.created_at.desc(), UserToken.token.desc())
+        .all()
+    )
+    for stale in existing[keep_existing:]:
+        db.delete(stale)
+    row = UserToken(
+        token=secrets.token_urlsafe(32),
+        user_id=user_id,
+        created_at=issued_at,
+        expires_at=issued_at + timedelta(days=token_ttl_days),
+    )
+    db.add(row)
+    return row
+
+
 def resolve_current_user(request: Request, db: Session, token: str) -> AppUser | None:
     """Prefer request.state from router auth; otherwise load from token."""
     cached = getattr(request.state, "app_user", None)
@@ -103,6 +138,10 @@ def _bearer_token(request: Request) -> str:
     if not separator or scheme.lower() != "bearer" or not value.strip():
         return ""
     return value.strip()
+
+
+def bearer_token_from_request(request: Request) -> str:
+    return _bearer_token(request)
 
 
 def resolve_request_token(

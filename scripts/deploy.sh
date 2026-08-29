@@ -7,7 +7,7 @@ if [[ -f "$ROOT_DIR/.deploy.env" ]]; then
   source "$ROOT_DIR/.deploy.env"
 fi
 
-DEPLOY_HOST="${DEPLOY_HOST:-123.56.218.5}"
+DEPLOY_HOST="${DEPLOY_HOST:-8.221.106.221}"
 DEPLOY_USER="${DEPLOY_USER:-root}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/play_video/ivapp}"
@@ -87,6 +87,7 @@ RSYNC_FILTERS=(
   --exclude='.venv/'
   --exclude='node_modules/'
   --exclude='.env'
+  --exclude='.env.target'
   --exclude='.deploy.env'
   --exclude='volumes/'
   --exclude='data/'
@@ -130,10 +131,11 @@ esac
 test -d "$deploy_path"
 test -f "$deploy_path/.env"
 test -f "$deploy_path/docker-compose.yml"
-command -v docker-compose >/dev/null
+docker compose version >/dev/null
 command -v rsync >/dev/null
 command -v curl >/dev/null
 command -v gzip >/dev/null
+command -v mysqldump >/dev/null
 if [[ "$dry_run" -eq 0 ]]; then
   install -d -m 755 "$media_cache_root" "$media_cache_root/objects"
   install -d -m 700 "$media_cache_root/uploads" "$media_cache_root/locks"
@@ -182,9 +184,12 @@ cdn_worker_service="$6"
 build_image="$7"
 chmod 700 "$release_path"
 ln -sfn "$deploy_path/.env" "$release_path/.env"
-docker-compose -p "$project" -f "$release_path/docker-compose.yml" config --quiet
+if [[ -f "$deploy_path/.env.target" ]]; then
+  ln -sfn "$deploy_path/.env.target" "$release_path/.env.target"
+fi
+"$release_path/scripts/compose_target.sh" "$release_path" "$project" config --quiet
 if [[ "$build_image" -eq 1 ]]; then
-  docker-compose -p "$project" -f "$release_path/docker-compose.yml" build \
+  "$release_path/scripts/compose_target.sh" "$release_path" "$project" build \
     "$service" "$worker_service" "$cdn_worker_service"
 fi
 REMOTE
@@ -206,16 +211,25 @@ install -d -m 700 "$backup_path" "$source_backup"
 rsync -a --delete \
   --exclude='.git/' \
   --exclude='.env' \
+  --exclude='.env.target' \
   --exclude='.deploy.env' \
   --exclude='volumes/' \
   --exclude='__pycache__/' \
   --exclude='*.pyc' \
   --exclude='.pytest_cache/' \
   "$deploy_path/" "$source_backup/"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" exec -T \
-  "$database_service" sh -c \
-  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --events --triggers "$MYSQL_DATABASE"' \
-  | gzip -9 > "$backup_path/database.sql.gz"
+if [[ -f "$deploy_path/.env.target" ]]; then
+  defaults_file="/root/.config/pixo/$project.cnf"
+  test -r "$defaults_file"
+  mysqldump --defaults-extra-file="$defaults_file" \
+    --single-transaction --quick --routines --events --triggers "$project" \
+    | gzip -9 > "$backup_path/database.sql.gz"
+else
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" exec -T \
+    "$database_service" sh -c \
+    'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --events --triggers "$MYSQL_DATABASE"' \
+    | gzip -9 > "$backup_path/database.sql.gz"
+fi
 test -s "$backup_path/database.sql.gz"
 sha256sum "$backup_path/database.sql.gz" > "$backup_path/database.sql.gz.sha256"
 chmod 700 "$backup_path"
@@ -236,6 +250,7 @@ test -d "$backup_path/source"
 rsync -a --delete \
   --exclude='.git/' \
   --exclude='.env' \
+  --exclude='.env.target' \
   --exclude='.deploy.env' \
   --exclude='volumes/' \
   --exclude='__pycache__/' \
@@ -243,17 +258,17 @@ rsync -a --delete \
   --exclude='.pytest_cache/' \
   "$backup_path/source/" "$deploy_path/"
 chmod 600 "$deploy_path/.env"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --quiet
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" build "$service"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d --no-deps --force-recreate "$service"
-if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --quiet
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" build "$service"
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
+if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
   | grep -qx "$worker_service"; then
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
     --no-deps --force-recreate "$worker_service"
 fi
-if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
   | grep -qx "$cdn_worker_service"; then
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
     --no-deps --force-recreate "$cdn_worker_service"
 fi
 REMOTE
@@ -267,13 +282,13 @@ deploy_path="$1"
 project="$2"
 worker_service="$3"
 cdn_worker_service="$4"
-if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
   | grep -qx "$worker_service"; then
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$worker_service"
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" stop "$worker_service"
 fi
-if docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --services \
+if "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --services \
   | grep -qx "$cdn_worker_service"; then
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" stop "$cdn_worker_service"
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" stop "$cdn_worker_service"
 fi
 REMOTE
 
@@ -295,14 +310,14 @@ deploy_path="$1"
 project="$2"
 service="$3"
 backfill="$4"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
   "$service" alembic upgrade head
 case "$backfill" in
 1)
   echo "[deploy] auditing and applying historic runtime specs"
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
     "$service" python -m app.runtime_backfill
-  docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" run --rm --no-deps \
+  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
     "$service" python -m app.runtime_backfill --apply
   ;;
 0)
@@ -328,8 +343,8 @@ deploy_path="$1"
 project="$2"
 service="$3"
 chmod 600 "$deploy_path/.env"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" config --quiet
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d --no-deps --force-recreate "$service"
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --quiet
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
 REMOTE
 then
   rollback
@@ -375,9 +390,9 @@ deploy_path="$1"
 project="$2"
 worker_service="$3"
 cdn_worker_service="$4"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
   --no-deps --force-recreate "$worker_service"
-docker-compose -p "$project" -f "$deploy_path/docker-compose.yml" up -d \
+"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
   --no-deps --force-recreate "$cdn_worker_service"
 REMOTE
 then

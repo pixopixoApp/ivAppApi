@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.main import app
 from app.models import (
     CreatorAccessGrant,
+    CreatorApplication,
     CreatorCreation,
     CreatorInvite,
     CreatorUpload,
@@ -85,6 +86,106 @@ def test_single_use_invite_permanently_grants_creator_access(db) -> None:
     assert redeemed.status_code == 200
     assert access.json()["granted"] is True
     assert access.json()["source"] == "invite"
+
+
+def test_creator_waitlist_batch_sends_one_assigned_single_use_code(db, monkeypatch) -> None:
+    alice_token = _login(db, user_id="waitlist-alice")
+    bob_token = _login(db, user_id="waitlist-bob")
+    delivered: dict[str, str] = {}
+
+    def capture_invite(_settings, *, email: str, code: str) -> None:
+        delivered[email] = code
+
+    monkeypatch.setattr("app.routers.platform.send_creator_invite", capture_invite)
+    publish_headers = {"X-Publish-Key": "test-publish-key"}
+    with TestClient(app) as client:
+        for user_id, token in (
+            ("waitlist-alice", alice_token),
+            ("waitlist-bob", bob_token),
+        ):
+            applied = client.post(
+                "/api/v1/creator/applications",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "email": f"{user_id}@example.com",
+                    "message": "I want to create interactive clips.",
+                },
+            )
+            assert applied.status_code == 200
+            assert applied.json()["status"] == "pending"
+
+        processed = client.post(
+            "/internal/v1/creator/applications/invite",
+            headers=publish_headers,
+            json={"user_ids": ["waitlist-alice", "waitlist-bob"]},
+        )
+        repeated = client.post(
+            "/internal/v1/creator/applications/invite",
+            headers=publish_headers,
+            json={"user_ids": ["waitlist-alice"]},
+        )
+        wrong_account = client.post(
+            "/api/v1/creator/invites/redeem",
+            headers={"Authorization": f"Bearer {bob_token}"},
+            json={"code": delivered["waitlist-alice@example.com"]},
+        )
+        redeemed = client.post(
+            "/api/v1/creator/invites/redeem",
+            headers={"Authorization": f"Bearer {alice_token}"},
+            json={"code": delivered["waitlist-alice@example.com"]},
+        )
+
+    assert processed.status_code == 200
+    assert processed.json()["sent_count"] == 2
+    assert repeated.json()["skipped_count"] == 1
+    assert wrong_account.status_code == 400
+    assert redeemed.status_code == 200
+    db.expire_all()
+    alice_application = db.get(CreatorApplication, "waitlist-alice")
+    assert alice_application is not None
+    assert alice_application.status == "approved"
+    invites = db.query(CreatorInvite).order_by(CreatorInvite.id).all()
+    assert len(invites) == 2
+    assert {row.assigned_user_id for row in invites} == {
+        "waitlist-alice",
+        "waitlist-bob",
+    }
+    assert invites[0].redeemed_by_user_id == "waitlist-alice"
+
+
+def test_creator_waitlist_email_failure_rolls_back_invite_and_remains_retryable(
+    db,
+    monkeypatch,
+) -> None:
+    token = _login(db, user_id="waitlist-email-failure")
+
+    def fail_email(_settings, *, email: str, code: str) -> None:
+        del email, code
+        raise RuntimeError("smtp unavailable")
+
+    monkeypatch.setattr("app.routers.platform.send_creator_invite", fail_email)
+    with TestClient(app) as client:
+        applied = client.post(
+            "/api/v1/creator/applications",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"email": "retry@example.com"},
+        )
+        processed = client.post(
+            "/internal/v1/creator/applications/invite",
+            headers={"X-Publish-Key": "test-publish-key"},
+            json={"user_ids": ["waitlist-email-failure"]},
+        )
+
+    assert applied.status_code == 200
+    assert processed.status_code == 200
+    assert processed.json()["failed_count"] == 1
+    db.expire_all()
+    application = db.get(CreatorApplication, "waitlist-email-failure")
+    assert application is not None
+    assert application.status == "pending"
+    assert application.invite_id is None
+    assert "SMTP" in application.last_error
+    assert db.query(CreatorInvite).count() == 0
 
 
 def test_creator_upload_uses_resumable_shared_local_cache(db, monkeypatch, tmp_path) -> None:
@@ -446,6 +547,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
         )
     assert rejected.status_code == 400
     assert published.status_code == 200
+    assert published.json()["status"] == "pending_review"
     assert published.json()["share_url"] == (
         "https://demo.pixopixo.cn/game/?experience=cr_test"
     )
@@ -453,6 +555,8 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
     row = db.get(PublishedVideo, "cr_test")
     assert row.title == "Test creation"
     assert row.description == "Playable"
+    assert row.content_source == "ugc"
+    assert row.review_status == "pending"
     assert row.runtime_spec_version == "1.1"
     interaction = row.runtime_spec["video"][0]["interactions"][0]
     assert interaction["pause_video"] is True

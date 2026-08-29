@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 Platform = Literal["ios", "android"]
 
@@ -53,11 +53,22 @@ class AccountDeletionResponse(BaseModel):
     deleted_at: str
 
 
+class CreatorGenerationQuotaOut(BaseModel):
+    enabled: bool
+    limit: int
+    used: int
+    reserved: int
+    remaining: int
+    resets_at: str
+
+
 class CreatorAccessOut(BaseModel):
     granted: bool
     source: str | None = None
     granted_at: str | None = None
     application_status: str | None = None
+    application_email: str | None = None
+    video_generation: CreatorGenerationQuotaOut | None = None
 
 
 class InviteRedeemRequest(BaseModel):
@@ -65,15 +76,44 @@ class InviteRedeemRequest(BaseModel):
 
 
 class CreatorApplicationRequest(BaseModel):
+    email: str = Field(default="", max_length=256)
     message: str = Field(default="", max_length=500)
 
 
 class CreatorApplicationOut(BaseModel):
     user_id: str
+    email: str
     message: str
     status: str
+    invite_id: int | None = None
+    invite_code_hint: str = ""
+    invite_status: Literal["unused", "redeemed", "revoked"] | None = None
+    invited_at: str | None = None
+    email_sent_at: str | None = None
+    last_error: str = ""
     created_at: str
     updated_at: str
+
+
+class CreatorApplicationInviteRequest(BaseModel):
+    user_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class CreatorApplicationInviteResult(BaseModel):
+    user_id: str
+    email: str = ""
+    status: Literal["sent", "skipped", "failed"]
+    application_status: str = ""
+    invite_id: int | None = None
+    invite_code_hint: str = ""
+    error: str = ""
+
+
+class CreatorApplicationInviteResponse(BaseModel):
+    items: list[CreatorApplicationInviteResult]
+    sent_count: int
+    skipped_count: int
+    failed_count: int
 
 
 class InviteCreateRequest(BaseModel):
@@ -89,6 +129,7 @@ class CreatorInviteOut(BaseModel):
     code_hint: str
     enabled: bool
     status: Literal["unused", "redeemed", "revoked"]
+    assigned_user_id: str | None = None
     redeemed_by_user_id: str | None = None
     redeemed_by_label: str = ""
     redeemed_at: str | None = None
@@ -138,9 +179,52 @@ class CreatorUploadOut(BaseModel):
 
 
 class CreatorCreationRequest(BaseModel):
-    upload_id: str = Field(min_length=1, max_length=64)
+    source_mode: Literal["upload", "prompt"] | None = None
+    upload_id: str | None = Field(default=None, min_length=1, max_length=64)
+    prompt: str = Field(default="", max_length=1000)
     brief: str = Field(default="", max_length=1000)
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> CreatorCreationRequest:
+        mode = self.source_mode or ("upload" if self.upload_id else "prompt")
+        if mode == "upload":
+            if not self.upload_id or self.prompt.strip():
+                raise ValueError("upload creation requires upload_id and no prompt")
+        elif self.upload_id or not self.prompt.strip():
+            raise ValueError("prompt creation requires prompt and no upload_id")
+        self.source_mode = mode
+        return self
+
+
+class CreatorSourceRegenerateRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=1000)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class CreatorSourceAcceptRequest(BaseModel):
+    generation_id: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class CreatorSourceGenerationOut(BaseModel):
+    generation_id: str
+    attempt: int
+    original_prompt: str
+    prompt_summary: str
+    generation_prompt: str
+    interaction_brief: str
+    preset: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    progress_stage: str
+    progress_percent: int
+    provider_task_accepted: bool
+    preview_url: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    expires_at: str
+    created_at: str
+    updated_at: str
 
 
 class CreatorVersionRequest(BaseModel):
@@ -167,7 +251,13 @@ class CreatorVersionOut(BaseModel):
 
 class CreatorCreationOut(BaseModel):
     creation_id: str
-    upload_id: str
+    upload_id: str | None
+    source_mode: Literal["upload", "prompt"] = "upload"
+    source_prompt: str = ""
+    source_generation_id: str | None = None
+    source_preview_url: str | None = None
+    source_generation: CreatorSourceGenerationOut | None = None
+    generation_quota: CreatorGenerationQuotaOut | None = None
     status: str
     progress_stage: str
     progress_percent: int

@@ -293,6 +293,9 @@ class CreatorInvite(Base):
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     code_hint: Mapped[str] = mapped_column(String(16), nullable=False, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    assigned_user_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     redeemed_by_user_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
@@ -306,12 +309,24 @@ class CreatorInvite(Base):
 
 class CreatorApplication(Base):
     __tablename__ = "creator_applications"
+    __table_args__ = (
+        UniqueConstraint("invite_id", name="uq_creator_applications_invite_id"),
+    )
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(256), nullable=False, default="", index=True)
     message: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="pending", index=True
     )
+    invite_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    invited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    email_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -332,6 +347,12 @@ class CreatorUpload(Base):
     source_local_uri: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     source_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
     upload_transport: Mapped[str] = mapped_column(String(32), nullable=False, default="oss")
+    origin: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="user_upload", index=True
+    )
+    source_generation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     normalization_job_id: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", index=True
     )
@@ -361,7 +382,14 @@ class CreatorCreation(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    upload_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    upload_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="upload", index=True
+    )
+    source_prompt: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    source_generation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     brief: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="queued", index=True
@@ -387,6 +415,60 @@ class CreatorCreation(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CreatorSourceGeneration(Base):
+    """One prompt-to-source attempt inside a durable creator session."""
+
+    __tablename__ = "creator_source_generations"
+    __table_args__ = (
+        UniqueConstraint("creation_id", "attempt", name="uq_creator_source_generation_attempt"),
+        UniqueConstraint("request_id", name="uq_creator_source_generation_request"),
+        Index("ix_creator_source_generation_quota", "user_id", "quota_date", "quota_state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    creation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    original_prompt: Mapped[str] = mapped_column(String(1000), nullable=False)
+    prompt_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    generation_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    interaction_brief: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    preset_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="queued", index=True
+    )
+    progress_stage: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="queued"
+    )
+    progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ivadmin_job_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    provider_task_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    upload_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    quota_date: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    quota_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="reserved", index=True
+    )
+    error_code: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    error_message: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    next_poll_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

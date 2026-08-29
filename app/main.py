@@ -8,12 +8,12 @@ from fastapi.responses import JSONResponse
 
 from app.auth_user import AppAuthError
 from app.cdn_cache import validate_cdn_config
-from app.config import get_settings
+from app.config import get_settings, validate_environment_contract
 from app.logging_config import get_logger, setup_logging
 from app.media_cache import initialize_cache
 from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
-from app.routers import admin, feed, media_storage, platform, safety, user
+from app.routers import admin, feed, media_storage, platform, safety, user, web
 
 log = get_logger(__name__)
 
@@ -21,6 +21,7 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
+    validate_environment_contract(settings)
     setup_logging(level=settings.log_level)
     log.info("starting ivapp log_level=%s", settings.log_level)
     media_mode = settings.media_storage_mode.strip().lower()
@@ -66,6 +67,7 @@ app.include_router(platform.creator_router)
 app.include_router(platform.operations_router)
 app.include_router(safety.client_router)
 app.include_router(safety.operations_router)
+app.include_router(web.router)
 
 
 @app.exception_handler(AppAuthError)

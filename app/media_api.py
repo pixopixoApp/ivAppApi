@@ -45,7 +45,7 @@ class CreatorDirectUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_type: str = Field(default="video/mp4", min_length=1, max_length=128)
     size_bytes: int = Field(gt=0)
-    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
     supported_transports: list[str] = Field(default_factory=list, max_length=8)
 
 
