@@ -1,6 +1,8 @@
 .env
 .env.target
 .deploy.env
+.deploy.development.env
+.deploy.production.env
 .venv/
 venv/
 __pycache__/

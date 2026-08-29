@@ -74,7 +74,7 @@ services:
       CREATOR_LOCAL_UPLOAD_ENABLED: ${CREATOR_LOCAL_UPLOAD_ENABLED:-true}
       CREATOR_LEGACY_OSS_UPLOAD_ENABLED: ${CREATOR_LEGACY_OSS_UPLOAD_ENABLED:-true}
     ports:
-      - "${API_PORT:-8100}:8100"
+      - "127.0.0.1:${API_PORT:-8100}:8100"
     volumes:
       # Code (read-only)
       - ./app:/app/app:ro

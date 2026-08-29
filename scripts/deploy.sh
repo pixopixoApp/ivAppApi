@@ -2,12 +2,79 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ -f "$ROOT_DIR/.deploy.env" ]]; then
+
+DEPLOY_ENVIRONMENT=""
+DRY_RUN=0
+ALLOW_DIRTY=0
+SKIP_CHECKS=0
+BUILD_IMAGE=1
+BACKFILL_RUNTIME_SPECS=0
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/deploy.sh --environment development|production [options]
+
+Options:
+  --environment NAME
+                  Required deployment profile: development or production.
+  --dry-run       Show files that would change; do not write or restart remotely.
+  --allow-dirty   Allow deployment from a dirty local Git worktree.
+  --skip-checks   Skip scripts/check.sh.
+  --no-build      Reuse the current API image; only replace source and recreate API.
+  --backfill-runtime-specs
+                   Explicitly compile and persist all historic playback specs.
+  -h, --help      Show this help.
+
+Configuration is loaded only from .deploy.<environment>.env when present.
+Application .env files are never uploaded, downloaded, printed, or included in
+source backups.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --environment)
+      DEPLOY_ENVIRONMENT="${2:-}"
+      [[ -n "$DEPLOY_ENVIRONMENT" ]] || {
+        echo "Missing value for --environment" >&2
+        exit 2
+      }
+      shift
+      ;;
+    --dry-run) DRY_RUN=1 ;;
+    --allow-dirty) ALLOW_DIRTY=1 ;;
+    --skip-checks) SKIP_CHECKS=1 ;;
+    --no-build) BUILD_IMAGE=0 ;;
+    --backfill-runtime-specs) BACKFILL_RUNTIME_SPECS=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+case "$DEPLOY_ENVIRONMENT" in
+  development)
+    EXPECTED_DEPLOY_HOST=123.56.218.5
+    EXPECTED_DATABASE_MODE=local
+    ;;
+  production)
+    EXPECTED_DEPLOY_HOST=8.221.106.221
+    EXPECTED_DATABASE_MODE=rds
+    ;;
+  *)
+    echo "--environment must be development or production" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+DEPLOY_PROFILE_FILE="$ROOT_DIR/.deploy.$DEPLOY_ENVIRONMENT.env"
+if [[ -f "$DEPLOY_PROFILE_FILE" ]]; then
   # shellcheck source=/dev/null
-  source "$ROOT_DIR/.deploy.env"
+  source "$DEPLOY_PROFILE_FILE"
 fi
 
-DEPLOY_HOST="${DEPLOY_HOST:-8.221.106.221}"
+DEPLOY_HOST="${DEPLOY_HOST:-$EXPECTED_DEPLOY_HOST}"
 DEPLOY_USER="${DEPLOY_USER:-root}"
 DEPLOY_PORT="${DEPLOY_PORT:-22}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/play_video/ivapp}"
@@ -22,43 +89,12 @@ DEPLOY_MEDIA_CACHE_ROOT="${DEPLOY_MEDIA_CACHE_ROOT:-/opt/play_video/shared/media
 DEPLOY_HEALTH_URL="${DEPLOY_HEALTH_URL:-http://127.0.0.1:8100/health}"
 DEPLOY_HEALTH_RETRIES="${DEPLOY_HEALTH_RETRIES:-20}"
 DEPLOY_HEALTH_INTERVAL="${DEPLOY_HEALTH_INTERVAL:-2}"
+EXPECTED_RDS_HOST="${EXPECTED_RDS_HOST:-rm-0xik5p5yv576ca6cd.mysql.rds-aliyun-america.rds.aliyuncs.com}"
 
-DRY_RUN=0
-ALLOW_DIRTY=0
-SKIP_CHECKS=0
-BUILD_IMAGE=1
-BACKFILL_RUNTIME_SPECS=0
-
-usage() {
-  cat <<'USAGE'
-Usage: scripts/deploy.sh [options]
-
-Options:
-  --dry-run       Show files that would change; do not write or restart remotely.
-  --allow-dirty   Allow deployment from a dirty local Git worktree.
-  --skip-checks   Skip scripts/check.sh.
-  --no-build      Reuse the current API image; only replace source and recreate API.
-  --backfill-runtime-specs
-                   Explicitly compile and persist all historic playback specs.
-  -h, --help      Show this help.
-
-Configuration is loaded from .deploy.env when present. Production .env is never
-uploaded, downloaded, printed, or included in source backups.
-USAGE
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run) DRY_RUN=1 ;;
-    --allow-dirty) ALLOW_DIRTY=1 ;;
-    --skip-checks) SKIP_CHECKS=1 ;;
-    --no-build) BUILD_IMAGE=0 ;;
-    --backfill-runtime-specs) BACKFILL_RUNTIME_SPECS=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
-  esac
-  shift
-done
+if [[ "$DEPLOY_HOST" != "$EXPECTED_DEPLOY_HOST" ]]; then
+  echo "$DEPLOY_ENVIRONMENT must deploy to $EXPECTED_DEPLOY_HOST, not $DEPLOY_HOST" >&2
+  exit 2
+fi
 
 [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]] || { echo "DEPLOY_PORT must be numeric" >&2; exit 2; }
 [[ "$DEPLOY_HEALTH_RETRIES" =~ ^[1-9][0-9]*$ ]] || { echo "DEPLOY_HEALTH_RETRIES must be positive" >&2; exit 2; }
@@ -89,6 +125,8 @@ RSYNC_FILTERS=(
   --exclude='.env'
   --exclude='.env.target'
   --exclude='.deploy.env'
+  --exclude='.deploy.development.env'
+  --exclude='.deploy.production.env'
   --exclude='volumes/'
   --exclude='data/'
   --exclude='__pycache__/'
@@ -99,16 +137,21 @@ RSYNC_FILTERS=(
   --exclude='.DS_Store'
 )
 
+echo "[deploy] environment=$DEPLOY_ENVIRONMENT database=$EXPECTED_DATABASE_MODE"
 echo "[deploy] target=$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH service=$DEPLOY_SERVICE"
 
 "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_RELEASE_ROOT" "$DEPLOY_BACKUP_ROOT" "$DEPLOY_MEDIA_CACHE_ROOT" "$DRY_RUN" <<'REMOTE'
+  "$DEPLOY_PATH" "$DEPLOY_RELEASE_ROOT" "$DEPLOY_BACKUP_ROOT" \
+  "$DEPLOY_MEDIA_CACHE_ROOT" "$DRY_RUN" "$DEPLOY_ENVIRONMENT" \
+  "$EXPECTED_RDS_HOST" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 release_root="$2"
 backup_root="$3"
 media_cache_root="$4"
 dry_run="$5"
+environment="$6"
+expected_rds_host="$7"
 
 validate_path() {
   case "$1" in
@@ -131,6 +174,32 @@ esac
 test -d "$deploy_path"
 test -f "$deploy_path/.env"
 test -f "$deploy_path/docker-compose.yml"
+case "$environment" in
+  development)
+    grep -qx 'PIXO_ENVIRONMENT=development' "$deploy_path/.env"
+    grep -qx 'MYSQL_DATABASE=ivapp' "$deploy_path/.env"
+    if grep -Fq "$expected_rds_host" "$deploy_path/.env"; then
+      echo 'development .env references the production RDS host' >&2
+      exit 1
+    fi
+    if [[ -e "$deploy_path/.env.target" ]]; then
+      echo 'development must not have .env.target' >&2
+      exit 1
+    fi
+    ;;
+  production)
+    test -f "$deploy_path/.env.target"
+    test -f "$deploy_path/docker-compose.rds.yml"
+    grep -qx 'PIXO_ENVIRONMENT=production' "$deploy_path/.env.target"
+    grep -qx "RDS_HOST=$expected_rds_host" "$deploy_path/.env.target"
+    grep -Eq "^DATABASE_URL=.*@$expected_rds_host:[0-9]+/ivapp" \
+      "$deploy_path/.env.target"
+    ;;
+  *)
+    echo "invalid deployment environment: $environment" >&2
+    exit 2
+    ;;
+esac
 docker compose version >/dev/null
 command -v rsync >/dev/null
 command -v curl >/dev/null
@@ -148,7 +217,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     "${RSYNC_FILTERS[@]}" \
     -e "$RSYNC_SSH" \
     "$ROOT_DIR/" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
-  echo "[deploy] dry run complete; production was not changed"
+  echo "[deploy] dry run complete; $DEPLOY_ENVIRONMENT was not changed"
   exit 0
 fi
 
@@ -173,7 +242,9 @@ rsync -az --no-owner --no-group --delete-delay \
 
 echo "[deploy] validating release configuration"
 if ! "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" "$BUILD_IMAGE" <<'REMOTE'
+  "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" \
+  "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" "$BUILD_IMAGE" \
+  "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 release_path="$2"
@@ -182,14 +253,18 @@ service="$4"
 worker_service="$5"
 cdn_worker_service="$6"
 build_image="$7"
+environment="$8"
 chmod 700 "$release_path"
 ln -sfn "$deploy_path/.env" "$release_path/.env"
-if [[ -f "$deploy_path/.env.target" ]]; then
+if [[ "$environment" == production ]]; then
+  test -f "$deploy_path/.env.target"
   ln -sfn "$deploy_path/.env.target" "$release_path/.env.target"
 fi
-"$release_path/scripts/compose_target.sh" "$release_path" "$project" config --quiet
+"$release_path/scripts/compose_target.sh" \
+  "$release_path" "$project" "$environment" config --quiet
 if [[ "$build_image" -eq 1 ]]; then
-  "$release_path/scripts/compose_target.sh" "$release_path" "$project" build \
+  "$release_path/scripts/compose_target.sh" \
+    "$release_path" "$project" "$environment" build \
     "$service" "$worker_service" "$cdn_worker_service"
 fi
 REMOTE
@@ -200,12 +275,14 @@ fi
 
 echo "[deploy] snapshotting current live source to $BACKUP_PATH"
 "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" "$DEPLOY_DATABASE_SERVICE" <<'REMOTE'
+  "$DEPLOY_PATH" "$BACKUP_PATH" "$DEPLOY_PROJECT" \
+  "$DEPLOY_DATABASE_SERVICE" "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 backup_path="$2"
 project="$3"
 database_service="$4"
+environment="$5"
 source_backup="$backup_path/source"
 install -d -m 700 "$backup_path" "$source_backup"
 rsync -a --delete \
@@ -218,7 +295,7 @@ rsync -a --delete \
   --exclude='*.pyc' \
   --exclude='.pytest_cache/' \
   "$deploy_path/" "$source_backup/"
-if [[ -f "$deploy_path/.env.target" ]]; then
+if [[ "$environment" == production ]]; then
   defaults_file="/root/.config/pixo/$project.cnf"
   test -r "$defaults_file"
   mysqldump --defaults-extra-file="$defaults_file" \
@@ -227,8 +304,7 @@ if [[ -f "$deploy_path/.env.target" ]]; then
     --routines --events --triggers "$project" \
     | gzip -9 > "$backup_path/database.sql.gz"
 else
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" exec -T \
-    "$database_service" sh -c \
+  docker exec "${project}-${database_service}-1" sh -c \
     'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --events --triggers "$MYSQL_DATABASE"' \
     | gzip -9 > "$backup_path/database.sql.gz"
 fi
@@ -241,7 +317,8 @@ rollback() {
   echo "[deploy] rolling back to $BACKUP_PATH" >&2
   "${SSH[@]}" bash -s -- \
     "$DEPLOY_PATH" "$BACKUP_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" \
-    "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+    "$DEPLOY_SERVICE" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" \
+    "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 backup_path="$2"
@@ -250,6 +327,7 @@ project="$4"
 service="$5"
 worker_service="$6"
 cdn_worker_service="$7"
+environment="$8"
 compose="$release_path/scripts/compose_target.sh"
 test -x "$compose"
 test -d "$backup_path/source"
@@ -264,17 +342,17 @@ rsync -a --delete \
   --exclude='.pytest_cache/' \
   "$backup_path/source/" "$deploy_path/"
 chmod 600 "$deploy_path/.env"
-"$compose" "$deploy_path" "$project" config --quiet
-"$compose" "$deploy_path" "$project" build "$service"
-"$compose" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
-if "$compose" "$deploy_path" "$project" config --services \
+"$compose" "$deploy_path" "$project" "$environment" config --quiet
+"$compose" "$deploy_path" "$project" "$environment" build "$service"
+"$compose" "$deploy_path" "$project" "$environment" up -d --no-deps --force-recreate "$service"
+if "$compose" "$deploy_path" "$project" "$environment" config --services \
   | grep -qx "$worker_service"; then
-  "$compose" "$deploy_path" "$project" up -d \
+  "$compose" "$deploy_path" "$project" "$environment" up -d \
     --no-deps --force-recreate "$worker_service"
 fi
-if "$compose" "$deploy_path" "$project" config --services \
+if "$compose" "$deploy_path" "$project" "$environment" config --services \
   | grep -qx "$cdn_worker_service"; then
-  "$compose" "$deploy_path" "$project" up -d \
+  "$compose" "$deploy_path" "$project" "$environment" up -d \
     --no-deps --force-recreate "$cdn_worker_service"
 fi
 REMOTE
@@ -283,22 +361,24 @@ REMOTE
 echo "[deploy] stopping background workers before source switch"
 "${SSH[@]}" bash -s -- \
   "$DEPLOY_PATH" "$RELEASE_PATH" "$DEPLOY_PROJECT" \
-  "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+  "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" \
+  "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 release_path="$2"
 project="$3"
 worker_service="$4"
 cdn_worker_service="$5"
+environment="$6"
 compose="$release_path/scripts/compose_target.sh"
 test -x "$compose"
-if "$compose" "$deploy_path" "$project" config --services \
+if "$compose" "$deploy_path" "$project" "$environment" config --services \
   | grep -qx "$worker_service"; then
-  "$compose" "$deploy_path" "$project" stop "$worker_service"
+  "$compose" "$deploy_path" "$project" "$environment" stop "$worker_service"
 fi
-if "$compose" "$deploy_path" "$project" config --services \
+if "$compose" "$deploy_path" "$project" "$environment" config --services \
   | grep -qx "$cdn_worker_service"; then
-  "$compose" "$deploy_path" "$project" stop "$cdn_worker_service"
+  "$compose" "$deploy_path" "$project" "$environment" stop "$cdn_worker_service"
 fi
 REMOTE
 
@@ -310,24 +390,34 @@ if ! rsync -az --no-owner --no-group --delete-delay \
   rollback
   exit 1
 fi
+"${SSH[@]}" bash -s -- "$DEPLOY_PATH" "$RELEASE_ID" <<'REMOTE'
+set -Eeuo pipefail
+printf '%s\n' "$2" >"$1/.release-id"
+chmod 600 "$1/.release-id" "$1/.env"
+REMOTE
 
 echo "[deploy] applying forward database migrations"
 echo "[deploy] historic runtime backfill requested=$BACKFILL_RUNTIME_SPECS"
 if ! "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" "$BACKFILL_RUNTIME_SPECS" <<'REMOTE'
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" \
+  "$BACKFILL_RUNTIME_SPECS" "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 project="$2"
 service="$3"
 backfill="$4"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
+environment="$5"
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" run --rm --no-deps \
   "$service" alembic upgrade head
 case "$backfill" in
 1)
   echo "[deploy] auditing and applying historic runtime specs"
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
+  "$deploy_path/scripts/compose_target.sh" \
+    "$deploy_path" "$project" "$environment" run --rm --no-deps \
     "$service" python -m app.runtime_backfill
-  "$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" run --rm --no-deps \
+  "$deploy_path/scripts/compose_target.sh" \
+    "$deploy_path" "$project" "$environment" run --rm --no-deps \
     "$service" python -m app.runtime_backfill --apply
   ;;
 0)
@@ -347,14 +437,19 @@ fi
 
 echo "[deploy] recreating API container"
 if ! "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" <<'REMOTE'
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_SERVICE" \
+  "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 project="$2"
 service="$3"
+environment="$4"
 chmod 600 "$deploy_path/.env"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" config --quiet
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d --no-deps --force-recreate "$service"
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" config --quiet
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" up -d \
+  --no-deps --force-recreate "$service"
 REMOTE
 then
   rollback
@@ -394,15 +489,19 @@ fi
 
 echo "[deploy] recreating background workers"
 if ! "${SSH[@]}" bash -s -- \
-  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_WORKER_SERVICE" "$DEPLOY_CDN_WORKER_SERVICE" <<'REMOTE'
+  "$DEPLOY_PATH" "$DEPLOY_PROJECT" "$DEPLOY_WORKER_SERVICE" \
+  "$DEPLOY_CDN_WORKER_SERVICE" "$DEPLOY_ENVIRONMENT" <<'REMOTE'
 set -Eeuo pipefail
 deploy_path="$1"
 project="$2"
 worker_service="$3"
 cdn_worker_service="$4"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
+environment="$5"
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" up -d \
   --no-deps --force-recreate "$worker_service"
-"$deploy_path/scripts/compose_target.sh" "$deploy_path" "$project" up -d \
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" up -d \
   --no-deps --force-recreate "$cdn_worker_service"
 REMOTE
 then
@@ -410,4 +509,4 @@ then
   exit 1
 fi
 
-echo "[deploy] success release=$RELEASE_ID backup=$BACKUP_PATH"
+echo "[deploy] success environment=$DEPLOY_ENVIRONMENT release=$RELEASE_ID backup=$BACKUP_PATH"
