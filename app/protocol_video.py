@@ -11,8 +11,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.public_copy import interaction_instruction
 from app.schemas import ClipOut
-from app.vision_targets import VisionTargetError, normalize_vision_config
+from app.vision_targets import (
+    VisionTargetError,
+    canonical_vision_instruction,
+    normalize_vision_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -293,16 +298,19 @@ def _one_interaction(item: dict, *, index: int) -> dict:
     pause_video = item.get("pause_video", True)
     if not isinstance(pause_video, bool):
         raise RuntimeSpecError(f"interaction[{index}] pause_video must be boolean")
+    description = interaction_instruction(gesture)
+    if gesture == "camera_motion":
+        vision = detection.get("vision")
+        target = vision.get("target") if isinstance(vision, dict) else None
+        if isinstance(target, str):
+            try:
+                description = canonical_vision_instruction(target)
+            except VisionTargetError as exc:
+                raise RuntimeSpecError(str(exc)) from exc
     return {
         "id": f"action_{index + 1:03d}",
         "type": gesture,
-        "description": item.get("hint") or (
-            "持续往复滑动以播放"
-            if gesture == "continuous_swipe"
-            else "持续点击以播放"
-            if gesture == "continuous_tap"
-            else ""
-        ),
+        "description": description,
         "offset_time_ms": gate,
         "pause_video": pause_video,
         "detection": detection,

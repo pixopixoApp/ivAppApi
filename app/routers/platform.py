@@ -54,6 +54,12 @@ from app.protocol_video import (
     runtime_spec_version_from_compiled,
 )
 from app.public_origin import canonicalize_public_payload, canonicalize_public_url
+from app.public_text import (
+    record_creator_creation_text,
+    record_creator_generation_text,
+    record_creator_version_text,
+    record_published_video_text,
+)
 from app.publication_service import RuntimeSourceAsset, publish_runtime_assets
 from app.schemas_platform import (
     AccountDeletionRequest,
@@ -1205,6 +1211,8 @@ def create_interactive_video(
             updated_at=now,
         )
         db.add_all([row, generation])
+        record_creator_creation_text(db, row)
+        record_creator_generation_text(db, generation)
         db.commit()
         db.refresh(row)
         return _creation_out(db, row, settings)
@@ -1227,22 +1235,22 @@ def create_interactive_video(
         created_at=now,
         updated_at=now,
     )
-    db.add(row)
-    db.add(
-        CreatorVersion(
-            id=version_id,
-            creation_id=creation_id,
-            user_id=user.user_id,
-            number=1,
-            request_id=request_id or version_id,
-            brief=payload.brief.strip(),
-            status="queued",
-            progress_stage="queued",
-            progress_percent=0,
-            created_at=now,
-            updated_at=now,
-        )
+    version = CreatorVersion(
+        id=version_id,
+        creation_id=creation_id,
+        user_id=user.user_id,
+        number=1,
+        request_id=request_id or version_id,
+        brief=payload.brief.strip(),
+        status="queued",
+        progress_stage="queued",
+        progress_percent=0,
+        created_at=now,
+        updated_at=now,
     )
+    db.add_all([row, version])
+    record_creator_creation_text(db, row)
+    record_creator_version_text(db, version)
     db.commit()
     db.refresh(row)
     return _creation_out(db, row, settings)
@@ -1361,6 +1369,8 @@ def regenerate_creation_source(
     creation.error_message = ""
     creation.updated_at = now
     db.add_all([generation, creation])
+    record_creator_generation_text(db, generation)
+    record_creator_creation_text(db, creation)
     db.commit()
     db.refresh(creation)
     return _creation_out(db, creation, settings)
@@ -1431,6 +1441,9 @@ def accept_creation_source(
     creation.error_message = ""
     creation.updated_at = now
     db.add_all([generation, creation, version])
+    record_creator_generation_text(db, generation)
+    record_creator_creation_text(db, creation)
+    record_creator_version_text(db, version)
     db.commit()
     db.refresh(creation)
     return _creation_out(db, creation, settings)
@@ -1507,21 +1520,20 @@ def create_version(
     ) + 1
     version_id = f"cv_{secrets.token_urlsafe(18)}"
     now = _now()
-    db.add(
-        CreatorVersion(
-            id=version_id,
-            creation_id=creation.id,
-            user_id=user.user_id,
-            number=next_number,
-            request_id=payload.request_id.strip() if payload.request_id else version_id,
-            brief=payload.brief.strip(),
-            status="queued",
-            progress_stage="queued",
-            progress_percent=0,
-            created_at=now,
-            updated_at=now,
-        )
+    version = CreatorVersion(
+        id=version_id,
+        creation_id=creation.id,
+        user_id=user.user_id,
+        number=next_number,
+        request_id=payload.request_id.strip() if payload.request_id else version_id,
+        brief=payload.brief.strip(),
+        status="queued",
+        progress_stage="queued",
+        progress_percent=0,
+        created_at=now,
+        updated_at=now,
     )
+    db.add(version)
     creation.active_version_id = version_id
     creation.status = "queued"
     creation.progress_stage = "queued"
@@ -1530,6 +1542,8 @@ def create_version(
     creation.error_code = ""
     creation.error_message = ""
     creation.updated_at = now
+    record_creator_version_text(db, version)
+    record_creator_creation_text(db, creation)
     db.commit()
     db.refresh(creation)
     return _creation_out(db, creation)
@@ -1888,6 +1902,10 @@ def publish_creation(
             version.updated_at = now
             db.add(version)
         row.updated_at = now
+        record_published_video_text(db, published)
+        record_creator_creation_text(db, row)
+        if version is not None:
+            record_creator_version_text(db, version)
         enqueue_prefetch(db, settings, prefetch_urls)
         gate = None
         if media_mode_is_oss(settings):

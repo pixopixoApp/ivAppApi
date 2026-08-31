@@ -9,9 +9,23 @@ from app.config import get_settings
 from app.models import CreatorCreation, CreatorUpload, CreatorVersion
 from app.worker import (
     _apply_remote_job,
+    _public_remote_error,
     process_creator_version,
     process_next_upload_normalization,
 )
+
+
+def test_non_english_remote_error_keeps_public_copy_english() -> None:
+    assert _public_remote_error(
+        "模型服务暂时不可用",
+        fallback="Creation failed. Please try again.",
+        error_code="MODEL_FAILED",
+    ) == "Creation failed. Please try again."
+    assert _public_remote_error(
+        "The model is temporarily unavailable.",
+        fallback="Creation failed. Please try again.",
+        error_code="MODEL_FAILED",
+    ) == "The model is temporarily unavailable."
 
 
 def test_pending_normalization_is_not_starved_by_ready_backup_sync(

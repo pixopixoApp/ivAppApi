@@ -35,10 +35,38 @@ from app.protocol_video import (
     compile_runtime_spec,
     runtime_spec_version_from_compiled,
 )
+from app.public_text import (
+    detected_non_english_scripts,
+    record_creator_creation_text,
+    record_creator_generation_text,
+    record_creator_version_text,
+)
 
 log = get_logger(__name__)
 _stop = False
 _TERMINAL = frozenset({"ready", "failed", "cancelled", "published"})
+
+
+def _public_remote_error(
+    raw: object,
+    *,
+    fallback: str,
+    error_code: str,
+) -> str:
+    """Keep actionable English errors while retaining non-English detail in logs."""
+    message = str(raw or "").strip()
+    if not message:
+        return fallback
+    scripts = detected_non_english_scripts(message)
+    if not scripts:
+        return message[:500]
+    log.warning(
+        "non_english_remote_error code=%s scripts=%s detail=%s",
+        error_code,
+        ",".join(scripts),
+        message[:500],
+    )
+    return fallback
 
 
 class CreationError(RuntimeError):
@@ -314,6 +342,7 @@ def _sync_source_creation(
         creation.status = "running"
     creation.updated_at = _now()
     db.add(creation)
+    record_creator_creation_text(db, creation)
 
 
 def _generated_upload(
@@ -397,6 +426,7 @@ def _finish_source_from_upload(
         _schedule_source_poll(generation, settings)
     generation.updated_at = _now()
     db.add(generation)
+    record_creator_generation_text(db, generation)
     _sync_source_creation(db, creation, generation)
 
 
@@ -452,14 +482,16 @@ def _apply_source_job(
             payload.get("error_code")
             or ("CANCELLED" if remote_status == "cancelled" else "VIDEO_GENERATION_FAILED")
         )[:64]
-        generation.error_message = str(
-            payload.get("error_message")
-            or (
-                "Video generation was cancelled."
-                if remote_status == "cancelled"
-                else "Video generation failed. Please try again."
-            )
-        )[:500]
+        fallback = (
+            "Video generation was cancelled."
+            if remote_status == "cancelled"
+            else "Video generation failed. Please try again."
+        )
+        generation.error_message = _public_remote_error(
+            payload.get("error_message"),
+            fallback=fallback,
+            error_code=generation.error_code,
+        )
         if generation.quota_state == "reserved":
             generation.quota_state = "released"
     else:
@@ -468,6 +500,7 @@ def _apply_source_job(
 
     generation.updated_at = _now()
     db.add(generation)
+    record_creator_generation_text(db, generation)
     _sync_source_creation(db, creation, generation)
     db.commit()
 
@@ -841,6 +874,7 @@ def _sync_creation(db: Session, creation: CreatorCreation) -> None:
     creation.error_message = current.error_message
     creation.updated_at = _now()
     db.add(creation)
+    record_creator_creation_text(db, creation)
 
 
 def _apply_remote_job(
@@ -872,9 +906,11 @@ def _apply_remote_job(
         version.status = "failed"
         version.progress_stage = "failed"
         version.error_code = str(payload.get("error_code") or "ANALYSIS_FAILED")[:64]
-        version.error_message = str(
-            payload.get("error_message") or "Creation failed. Please try again."
-        )[:500]
+        version.error_message = _public_remote_error(
+            payload.get("error_message"),
+            fallback="Creation failed. Please try again.",
+            error_code=version.error_code,
+        )
     else:
         timeline = payload.get("timeline")
         if not isinstance(timeline, dict):
@@ -898,6 +934,7 @@ def _apply_remote_job(
         version.error_message = ""
     version.updated_at = _now()
     db.add(version)
+    record_creator_version_text(db, version)
     _sync_creation(db, creation)
     db.commit()
 

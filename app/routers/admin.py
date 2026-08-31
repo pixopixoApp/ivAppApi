@@ -48,6 +48,7 @@ from app.models import (
     CreatorCreation,
     HtmlPackage,
     MediaObject,
+    PublicTextIssue,
     PublishedMediaAsset,
     PublishedVideo,
     User,
@@ -67,6 +68,7 @@ from app.public_origin import (
     canonicalize_public_payload,
     canonicalize_public_url,
 )
+from app.public_text import record_published_video_text
 from app.publication_service import (
     RuntimeSourceAsset,
     load_published_runtime_urls,
@@ -800,28 +802,28 @@ async def publish(
         tutorial_value = False if tutorial_flag is None else tutorial_flag
         if tutorial_value:
             _clear_other_tutorials(db, keep_video_id=item_id)
-        db.add(
-            PublishedVideo(
-                id=item_id,
-                content_type=CONTENT_TYPE_RUNTIME,
-                video_url=video_url,
-                timeline=payload_json,
-                runtime_spec=runtime_spec,
-                runtime_spec_version=compiled_version,
-                html_url=None,
-                bridge_version=None,
-                required_capabilities=[],
-                version=version,
-                user_id=author_id,
-                content_mode=mode,
-                feed_weight=weight,
-                content_source="pgc",
-                review_status="approved",
-                is_tutorial=tutorial_value,
-                created_at=source_created_at or now,
-                updated_at=now,
-            )
+        row = PublishedVideo(
+            id=item_id,
+            content_type=CONTENT_TYPE_RUNTIME,
+            video_url=video_url,
+            timeline=payload_json,
+            runtime_spec=runtime_spec,
+            runtime_spec_version=compiled_version,
+            html_url=None,
+            bridge_version=None,
+            required_capabilities=[],
+            version=version,
+            user_id=author_id,
+            content_mode=mode,
+            feed_weight=weight,
+            content_source="pgc",
+            review_status="approved",
+            is_tutorial=tutorial_value,
+            created_at=source_created_at or now,
+            updated_at=now,
         )
+        db.add(row)
+        record_published_video_text(db, row)
         db.commit()
         log.info(
             "publish created video_id=%s mode=%s user_id=%s version=%s weight=%s tutorial=%s %s url=%s",
@@ -861,6 +863,7 @@ async def publish(
             _clear_other_tutorials(db, keep_video_id=item_id)
         row.is_tutorial = tutorial_flag
     row.updated_at = now
+    record_published_video_text(db, row)
     db.commit()
     log.info(
         "publish updated video_id=%s mode=%s user_id=%s version=%s weight=%s tutorial=%s %s url=%s",
@@ -1290,6 +1293,7 @@ def publish_html(
             settings,
             html_package_public_urls(db, settings, package_id=package.id),
         )
+    record_published_video_text(db, row)
     db.commit()
     log.info(
         "publish html item_id=%s version=%s user_id=%s updated=%s capabilities=%s url=%s",
@@ -1617,6 +1621,7 @@ def patch_content_management_detail(
             raise HTTPException(status_code=422, detail=f"invalid runtime timeline: {exc}") from exc
 
     row.updated_at = datetime.now(timezone.utc)
+    record_published_video_text(db, row)
     db.commit()
     db.refresh(row)
     detail = _content_management_out(db, settings, row)
@@ -1699,6 +1704,48 @@ def review_video(
         creation.updated_at = row.reviewed_at
     db.commit()
     return _video_info(row).model_dump() | {"review_status": row.review_status}
+
+
+@router.get(
+    "/public-text/audit",
+    summary="Audit public text language findings",
+)
+def audit_public_text(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+    status: Annotated[str, Query(pattern="^(open|resolved|all)$")] = "open",
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+) -> dict[str, Any]:
+    query = db.query(PublicTextIssue)
+    if status != "all":
+        query = query.filter(PublicTextIssue.status == status)
+    rows = (
+        query.order_by(PublicTextIssue.last_seen_at.desc(), PublicTextIssue.id.desc())
+        .limit(limit)
+        .all()
+    )
+    open_count = (
+        db.query(func.count(PublicTextIssue.id))
+        .filter(PublicTextIssue.status == "open")
+        .scalar()
+    )
+    return {
+        "open_count": int(open_count or 0),
+        "items": [
+            {
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "field_path": row.field_path,
+                "detected_scripts": list(row.detected_scripts or []),
+                "sample_sha256": row.sample_sha256,
+                "status": row.status,
+                "first_seen_at": row.first_seen_at.isoformat(),
+                "last_seen_at": row.last_seen_at.isoformat(),
+                "resolved_at": row.resolved_at.isoformat() if row.resolved_at else None,
+            }
+            for row in rows
+        ],
+    }
 
 
 @router.get(

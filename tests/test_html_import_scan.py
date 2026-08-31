@@ -77,6 +77,25 @@ def test_scan_conservatively_guards_aliased_get_user_media(tmp_path: Path) -> No
     assert result["compatibility_warnings"] == ["dynamic_get_user_media_constraints"]
 
 
+def test_scan_reports_non_english_text_without_rejecting_package(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text(
+        "<html><body><button>开始体验</button></body></html>",
+        encoding="utf-8",
+    )
+
+    result = _scan(tmp_path)
+
+    assert result["entry_candidates"] == ["index.html"]
+    assert "non_english_text_requires_review" in result["compatibility_warnings"]
+    assert result["non_english_text"] == [
+        {
+            "path": "index.html",
+            "detected_scripts": ["Han"],
+            "sample_sha256": result["non_english_text"][0]["sample_sha256"],
+        }
+    ]
+
+
 def test_safe_extract_ignores_macos_metadata(tmp_path: Path) -> None:
     archive = tmp_path / "source.zip"
     with zipfile.ZipFile(archive, "w") as output:

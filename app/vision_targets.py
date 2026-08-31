@@ -15,23 +15,30 @@ VISION_REGISTRY_VERSION = "v1"
 # Targets are deliberately product semantics, not raw model blendshape names.
 # Left/right always mean the participant's own left/right, not screen position.
 VISION_TARGETS: dict[str, dict[str, Any]] = {
-    "hand_victory": {"family": "hand", "label": "比耶", "camera_facing": "front"},
-    "hand_thumb_up": {"family": "hand", "label": "点赞", "camera_facing": "front"},
-    "hand_thumb_down": {"family": "hand", "label": "踩", "camera_facing": "front"},
-    "hand_open_palm": {"family": "hand", "label": "张开手掌", "camera_facing": "front"},
-    "hand_closed_fist": {"family": "hand", "label": "握拳", "camera_facing": "front"},
-    "hand_pointing_up": {"family": "hand", "label": "食指向上", "camera_facing": "front"},
-    "hand_i_love_you": {"family": "hand", "label": "我爱你手势", "camera_facing": "front"},
-    "face_smile": {"family": "face", "label": "微笑", "camera_facing": "front"},
-    "face_wink_left": {"family": "face", "label": "左眼眨眼（以本人为准）", "camera_facing": "front"},
-    "face_wink_right": {"family": "face", "label": "右眼眨眼（以本人为准）", "camera_facing": "front"},
-    "face_blink": {"family": "face", "label": "双眼眨眼", "camera_facing": "front"},
-    "face_mouth_open": {"family": "face", "label": "张嘴", "camera_facing": "front"},
-    "face_mouth_pucker": {"family": "face", "label": "嘟嘴", "camera_facing": "front"},
-    "face_brow_raise": {"family": "face", "label": "挑眉", "camera_facing": "front"},
-    "face_brow_furrow": {"family": "face", "label": "皱眉", "camera_facing": "front"},
-    "face_cheek_puff": {"family": "face", "label": "鼓腮", "camera_facing": "front"},
+    "hand_victory": {"family": "hand", "label": "Victory sign", "instruction": "Show a victory sign to the camera", "camera_facing": "front"},
+    "hand_thumb_up": {"family": "hand", "label": "Thumbs up", "instruction": "Give the camera a thumbs up", "camera_facing": "front"},
+    "hand_thumb_down": {"family": "hand", "label": "Thumbs down", "instruction": "Give the camera a thumbs down", "camera_facing": "front"},
+    "hand_open_palm": {"family": "hand", "label": "Open palm", "instruction": "Show an open palm to the camera", "camera_facing": "front"},
+    "hand_closed_fist": {"family": "hand", "label": "Closed fist", "instruction": "Show a closed fist to the camera", "camera_facing": "front"},
+    "hand_pointing_up": {"family": "hand", "label": "Pointing up", "instruction": "Point one finger up at the camera", "camera_facing": "front"},
+    "hand_i_love_you": {"family": "hand", "label": "I love you sign", "instruction": "Show the I love you sign to the camera", "camera_facing": "front"},
+    "face_smile": {"family": "face", "label": "Smile", "instruction": "Smile at the camera", "camera_facing": "front"},
+    "face_wink_left": {"family": "face", "label": "Wink left eye", "instruction": "Wink your left eye at the camera", "camera_facing": "front"},
+    "face_wink_right": {"family": "face", "label": "Wink right eye", "instruction": "Wink your right eye at the camera", "camera_facing": "front"},
+    "face_blink": {"family": "face", "label": "Blink", "instruction": "Blink both eyes at the camera", "camera_facing": "front"},
+    "face_mouth_open": {"family": "face", "label": "Open mouth", "instruction": "Open your mouth at the camera", "camera_facing": "front"},
+    "face_mouth_pucker": {"family": "face", "label": "Pucker lips", "instruction": "Pucker your lips at the camera", "camera_facing": "front"},
+    "face_brow_raise": {"family": "face", "label": "Raise eyebrows", "instruction": "Raise your eyebrows at the camera", "camera_facing": "front"},
+    "face_brow_furrow": {"family": "face", "label": "Furrow eyebrows", "instruction": "Furrow your eyebrows at the camera", "camera_facing": "front"},
+    "face_cheek_puff": {"family": "face", "label": "Puff cheeks", "instruction": "Puff your cheeks at the camera", "camera_facing": "front"},
 }
+
+
+def canonical_vision_instruction(target: str) -> str:
+    try:
+        return str(VISION_TARGETS[target]["instruction"])
+    except KeyError as exc:
+        raise VisionTargetError(f"unsupported vision target: {target!r}") from exc
 
 _DEFAULT_CONFIDENCE = {"hand": 0.82, "face": 0.72}
 

@@ -36,6 +36,7 @@ from app.oss_storage import (
     public_url,
     upload_file,
 )
+from app.public_text import detected_non_english_scripts
 from app.users import apply_user_update
 from scripts.pixo_html import (
     ALLOWED_CAPABILITIES,
@@ -262,6 +263,7 @@ def _scan(root: Path) -> dict[str, Any]:
     external_urls: set[str] = set()
     unsupported: set[str] = set()
     warnings: set[str] = set()
+    non_english_text: list[dict[str, Any]] = []
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in {".html", ".htm", ".js", ".mjs", ".cjs", ".css"}:
             try:
@@ -273,6 +275,16 @@ def _scan(root: Path) -> dict[str, Any]:
                 text = payload.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise HtmlImportError(f"text asset is not UTF-8: {path.relative_to(root)}") from exc
+            scripts = detected_non_english_scripts(text)
+            if scripts:
+                warnings.add("non_english_text_requires_review")
+                non_english_text.append(
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "detected_scripts": list(scripts),
+                        "sample_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    }
+                )
             capabilities.update(
                 name for name, pattern in _BRIDGE_HINTS.items() if pattern.search(text)
             )
@@ -314,6 +326,7 @@ def _scan(root: Path) -> dict[str, Any]:
         "compatibility_profile": "browser-v1",
         "unsupported_features": sorted(unsupported),
         "compatibility_warnings": sorted(warnings),
+        "non_english_text": sorted(non_english_text, key=lambda item: item["path"]),
         "contains_existing_manifest": (root / "pixo-html.json").exists(),
     }
 

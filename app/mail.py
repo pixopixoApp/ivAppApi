@@ -97,8 +97,8 @@ def send_verification_code(settings: Settings, *, email: str, code: str) -> None
     _send_message(
         settings,
         email=email,
-        subject="验证码",
-        body=f"您的验证码是 {code}，{minutes} 分钟内有效。",
+        subject="Your Pixopixo verification code",
+        body=f"Your verification code is {code}. It expires in {minutes} minutes.",
         purpose="verification_code",
     )
 

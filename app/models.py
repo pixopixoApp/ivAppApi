@@ -110,6 +110,37 @@ class PublishedVideo(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
+class PublicTextIssue(Base):
+    """Non-blocking audit record for text that may not be English.
+
+    Raw user text is deliberately not duplicated here. Operators can resolve
+    the entity/field from its owning table while this row remains safe to log
+    and aggregate.
+    """
+
+    __tablename__ = "public_text_issues"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_type",
+            "entity_id",
+            "field_path",
+            name="uq_public_text_issues_entity_field",
+        ),
+        Index("ix_public_text_issues_status_seen", "status", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_type: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    field_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    detected_scripts: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class RecommendCursor(Base):
     __tablename__ = "recommend_cursors"
 

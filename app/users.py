@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.models import Follow, User
+from app.public_text import record_user_text
 
 MIN_ACCOUNT_AGE_YEARS = 13
 
@@ -200,6 +201,7 @@ def apply_user_update(
         )
         db.add(row)
         db.flush()
+        record_user_text(db, row)
         return row
 
     new_provider = row.provider if provider is None else ((provider or "email").strip() or "email")
@@ -222,6 +224,7 @@ def apply_user_update(
     # source is immutable after create
 
     db.flush()
+    record_user_text(db, row)
     return row
 
 

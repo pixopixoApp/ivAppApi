@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from app.models import PublishedVideo
+from app.models import CreatorCreation, CreatorVersion, PublishedVideo
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
     SUPPORTED_RUNTIME_SPEC_VERSIONS,
@@ -76,7 +76,7 @@ def test_continuous_swipe_compiles_as_a_sustained_playback_rule() -> None:
     assert interaction == {
         "id": "action_001",
         "type": "continuous_swipe",
-        "description": "持续往复滑动以播放",
+        "description": "Swipe back and forth to play",
         "offset_time_ms": 1000,
         "pause_video": True,
         "detection": {
@@ -127,7 +127,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
 
     assert spec["version"] == RUNTIME_SPEC_VERSION == "1.2"
     assert interaction["type"] == "continuous_tap"
-    assert interaction["description"] == "持续点击以播放"
+    assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
     assert interaction["detection"] == {
         "confidence_threshold": 0.85,
@@ -373,7 +373,7 @@ def test_camera_motion_requires_a_whitelisted_semantic_target() -> None:
         )
 
 
-def test_backfill_is_all_or_nothing(db) -> None:
+def test_backfill_updates_good_rows_and_preserves_bad_rows(db) -> None:
     legacy_spec = {"schema": "legacy"}
     good = PublishedVideo(
         id="good",
@@ -396,8 +396,53 @@ def test_backfill_is_all_or_nothing(db) -> None:
     db.add_all([good, bad])
     db.commit()
     report = compile_all_runtime_specs(db, apply=True)
-    assert report.updated == 0
+    assert report.updated == 1
     assert [failure.video_id for failure in report.failures] == ["bad"]
     db.refresh(good)
-    assert good.runtime_spec == legacy_spec
-    assert good.runtime_spec_version == "legacy"
+    db.refresh(bad)
+    assert good.runtime_spec["video"][0]["interactions"][0]["description"] == "Tap"
+    assert good.runtime_spec_version != "legacy"
+    assert bad.runtime_spec == legacy_spec
+    assert bad.runtime_spec_version == "legacy"
+
+
+def test_backfill_recompiles_creator_versions_and_active_snapshot(db) -> None:
+    creation = CreatorCreation(
+        id="creator-backfill",
+        user_id="creator-user",
+        upload_id="upload-backfill",
+        status="ready",
+        active_version_id="creator-version",
+    )
+    version = CreatorVersion(
+        id="creator-version",
+        creation_id=creation.id,
+        user_id=creation.user_id,
+        number=1,
+        request_id="creator-request",
+        status="ready",
+        source_timeline={
+            "media": {"duration_ms": 10_000},
+            "interactions": [
+                {
+                    "gesture": "continuous_swipe",
+                    "gate_at_ms": 100,
+                    "hint": "持续往复滑动以播放",
+                }
+            ]
+        },
+    )
+    db.add_all([creation, version])
+    db.commit()
+
+    report = compile_all_runtime_specs(db, apply=True)
+
+    assert report.failures == []
+    assert report.total == report.compilable == report.updated == 2
+    db.refresh(version)
+    db.refresh(creation)
+    assert version.runtime_spec["video"][0]["interactions"][0]["description"] == (
+        "Swipe back and forth to play"
+    )
+    assert creation.runtime_spec == version.runtime_spec
+    assert creation.runtime_spec_version == version.runtime_spec_version

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from dataclasses import asdict, dataclass
 
@@ -10,7 +11,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.html_content import CONTENT_TYPE_RUNTIME
 from app.media_service import MediaServiceError
-from app.models import PublishedVideo
+from app.models import CreatorCreation, CreatorVersion, PublishedVideo
 from app.oss_storage import OssStorageError
 from app.protocol_video import (
     RUNTIME_SPEC_VERSION,
@@ -20,6 +21,7 @@ from app.protocol_video import (
     runtime_spec_version_from_compiled,
 )
 from app.public_origin import canonicalize_public_url
+from app.public_text import record_entity_text
 from app.publication_service import load_published_runtime_urls
 
 
@@ -27,6 +29,7 @@ from app.publication_service import load_published_runtime_urls
 class BackfillFailure:
     video_id: str
     reason: str
+    entity_type: str = "published_video"
 
 
 @dataclass(frozen=True)
@@ -38,13 +41,14 @@ class BackfillReport:
 
 
 def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
+    settings = get_settings()
     rows = (
         db.query(PublishedVideo)
         .filter(PublishedVideo.content_type == CONTENT_TYPE_RUNTIME)
         .order_by(PublishedVideo.id.asc())
         .all()
     )
-    compiled: list[tuple[PublishedVideo, dict]] = []
+    compiled: list[tuple[PublishedVideo | CreatorVersion | CreatorCreation, dict]] = []
     failures: list[BackfillFailure] = []
     for row in rows:
         if not row.video_url:
@@ -58,7 +62,7 @@ def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
             if (row.content_mode or "single") == "story" and row.active_publication_id:
                 story_urls = load_published_runtime_urls(
                     db,
-                    get_settings(),
+                    settings,
                     video_id=row.id,
                     publication_id=row.active_publication_id,
                 )
@@ -66,7 +70,7 @@ def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
                 item_id=row.id,
                 content_mode=row.content_mode or "single",
                 source=source,
-                video_url=canonicalize_public_url(get_settings(), row.video_url) or row.video_url,
+                video_url=canonicalize_public_url(settings, row.video_url) or row.video_url,
                 video_urls=story_urls,
             )
         except (MediaServiceError, OssStorageError, RuntimeSpecError) as exc:
@@ -74,29 +78,87 @@ def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
             continue
         compiled.append((row, spec))
 
-    if failures:
-        db.rollback()
-        return BackfillReport(
-            total=len(rows),
-            compilable=len(compiled),
-            updated=0,
-            failures=failures,
-        )
+    creations = {
+        row.id: row
+        for row in db.query(CreatorCreation).order_by(CreatorCreation.id.asc()).all()
+    }
+    ready_versions = (
+        db.query(CreatorVersion)
+        .filter(CreatorVersion.status == "ready")
+        .order_by(CreatorVersion.id.asc())
+        .all()
+    )
+    compiled_versions: dict[str, dict] = {}
+    for version in ready_versions:
+        creation = creations.get(version.creation_id)
+        if creation is None:
+            failures.append(
+                BackfillFailure(
+                    video_id=version.id,
+                    entity_type="creator_version",
+                    reason="creator creation is missing",
+                )
+            )
+            continue
+        if not creation.upload_id:
+            failures.append(
+                BackfillFailure(
+                    video_id=version.id,
+                    entity_type="creator_version",
+                    reason="creator preview upload_id is missing",
+                )
+            )
+            continue
+        if not isinstance(version.source_timeline, dict):
+            failures.append(
+                BackfillFailure(
+                    video_id=version.id,
+                    entity_type="creator_version",
+                    reason="creator source_timeline is missing",
+                )
+            )
+            continue
+        try:
+            spec = compile_runtime_spec(
+                item_id=f"{creation.id}-v{version.number}",
+                content_mode="single",
+                source=version.source_timeline,
+                video_url=f"/api/v1/creator/previews/{creation.upload_id}",
+            )
+        except RuntimeSpecError as exc:
+            failures.append(
+                BackfillFailure(
+                    video_id=version.id,
+                    entity_type="creator_version",
+                    reason=str(exc),
+                )
+            )
+            continue
+        compiled.append((version, spec))
+        compiled_versions[version.id] = spec
+
+    for creation in creations.values():
+        if not creation.active_version_id:
+            continue
+        spec = compiled_versions.get(creation.active_version_id)
+        if spec is not None:
+            compiled.append((creation, copy.deepcopy(spec)))
 
     updated = 0
     if apply:
         for row, spec in compiled:
             row.runtime_spec = spec
             row.runtime_spec_version = runtime_spec_version_from_compiled(spec)
+            record_entity_text(db, row)
             updated += 1
         db.commit()
     else:
         db.rollback()
     return BackfillReport(
-        total=len(rows),
+        total=len(compiled) + len(failures),
         compilable=len(compiled),
         updated=updated,
-        failures=[],
+        failures=failures,
     )
 
 
@@ -127,8 +189,6 @@ def main() -> int:
             indent=2,
         )
     )
-    if report.failures:
-        return 1
     return 0
 
 

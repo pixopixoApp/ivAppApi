@@ -14,6 +14,7 @@ from app.models import (
     CreatorCreation,
     PublishedVideo,
 )
+from app.public_text import record_creator_creation_text, record_published_video_text
 
 
 class CdnPublicationError(RuntimeError):
@@ -87,12 +88,14 @@ def _apply_payload(
     row.cdn_ready = True
     row.updated_at = _now()
     db.add(row)
+    record_published_video_text(db, row)
     creation = db.get(CreatorCreation, row.id)
     if creation is not None and isinstance(row.runtime_spec, dict):
         creation.runtime_spec = row.runtime_spec
         creation.runtime_spec_version = row.runtime_spec_version
         creation.updated_at = row.updated_at
         db.add(creation)
+        record_creator_creation_text(db, creation)
 
 
 def stage_publication_gate(
