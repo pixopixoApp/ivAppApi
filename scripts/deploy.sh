@@ -116,8 +116,14 @@ if [[ "$SKIP_CHECKS" -eq 0 ]]; then
   "$ROOT_DIR/scripts/check.sh"
 fi
 
-SSH=(ssh -p "$DEPLOY_PORT" -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST")
-RSYNC_SSH="ssh -p $DEPLOY_PORT -o BatchMode=yes"
+SSH=(
+  ssh -p "$DEPLOY_PORT"
+  -o BatchMode=yes
+  -o ConnectTimeout=15
+  -o ConnectionAttempts=4
+  "$DEPLOY_USER@$DEPLOY_HOST"
+)
+RSYNC_SSH="ssh -p $DEPLOY_PORT -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=4"
 RSYNC_FILTERS=(
   --exclude='.git/'
   --exclude='.venv/'
