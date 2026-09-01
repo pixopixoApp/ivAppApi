@@ -97,6 +97,7 @@ from app.schemas_platform import (
     InviteRevokeResponse,
     Platform,
 )
+from app.seo import ensure_seo_row
 from app.share_urls import legacy_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
@@ -1903,6 +1904,7 @@ def publish_creation(
             db.add(version)
         row.updated_at = now
         record_published_video_text(db, published)
+        ensure_seo_row(db, published)
         record_creator_creation_text(db, row)
         if version is not None:
             record_creator_version_text(db, version)

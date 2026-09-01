@@ -22,7 +22,7 @@ from app.cdn_cache import enqueue_prefetch
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.google_auth import GoogleAuthUnavailable, verify_google_id_token
-from app.models import PublishedVideo, User, UserToken
+from app.models import PublishedVideo, PublishedVideoSeo, User, UserToken
 from app.public_origin import canonicalize_public_url
 from app.schemas_web import (
     WebCodeSentOut,
@@ -351,6 +351,15 @@ def list_web_publications(
         .limit(limit)
         .all()
     )
+    seo_slugs = {
+        video_id: slug
+        for video_id, slug in db.query(PublishedVideoSeo.video_id, PublishedVideoSeo.slug)
+        .filter(
+            PublishedVideoSeo.video_id.in_([row.id for row in rows]),
+            PublishedVideoSeo.status == "ready",
+        )
+        .all()
+    }
     return WebPublicationPageOut(
         items=[
             WebPublicationOut(
@@ -363,6 +372,8 @@ def list_web_publications(
                     item_id=row.id,
                     public_game_base_url=settings.public_game_base_url,
                     public_share_base_url=settings.public_share_base_url,
+                    seo_public_base_url=settings.seo_public_base_url,
+                    seo_slug=seo_slugs.get(row.id, ""),
                 ),
                 status=_publication_status(row),
                 review_status=row.review_status,

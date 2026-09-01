@@ -134,6 +134,7 @@ services:
       # production contract used by the API and creator worker.
       PUBLIC_SHARE_BASE_URL: ${PUBLIC_SHARE_BASE_URL:-}
       PUBLIC_GAME_BASE_URL: ${PUBLIC_GAME_BASE_URL:-}
+      SEO_PUBLIC_BASE_URL: ${SEO_PUBLIC_BASE_URL:-}
       OSS_ROOT_PREFIX: ${OSS_ROOT_PREFIX:-ivapp-media/v1}
       CDN_CACHE_ENABLED: ${CDN_CACHE_ENABLED:-false}
       CDN_PREFETCH_ON_PUBLISH: ${CDN_PREFETCH_ON_PUBLISH:-true}

@@ -15,9 +15,12 @@ def _settings(environment: str, database_url: str) -> SimpleNamespace:
             "https://api.pixopixo.com" if production else "https://api.pixopixo.cn"
         ),
         public_game_base_url=(
-            "https://www.pixopixo.com/"
+            "https://pixopixo.com/"
             if production
             else "https://demo.pixopixo.cn/game/"
+        ),
+        seo_public_base_url=(
+            "https://pixopixo.com/" if production else "https://demo.pixopixo.cn/"
         ),
         aliyun_oss_public_base_url="https://video.pixopixo.cn",
     )

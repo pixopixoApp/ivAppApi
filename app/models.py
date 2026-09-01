@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     Index,
     Integer,
     SmallInteger,
@@ -108,6 +109,52 @@ class PublishedVideo(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class PublishedVideoSeo(Base):
+    """Search-facing metadata for one immutable published unit.
+
+    The published payload remains the source of truth for playback.  This row
+    only becomes publicly indexable after the metadata generator has produced
+    and validated a complete English document.
+    """
+
+    __tablename__ = "published_video_seo"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_published_video_seo_slug"),
+        Index("ix_published_video_seo_status_updated", "status", "updated_at"),
+    )
+
+    video_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    slug: Mapped[str] = mapped_column(String(180), nullable=False)
+    page_title: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    page_description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    meta_title: Mapped[str] = mapped_column(String(70), nullable=False, default="")
+    meta_description: Mapped[str] = mapped_column(String(180), nullable=False, default="")
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    interaction_types: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    interaction_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    thumbnail_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", index=True
+    )  # pending | generating | ready | failed | stale
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    ai_title_written: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ai_description_written: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    title_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    description_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class PublicTextIssue(Base):

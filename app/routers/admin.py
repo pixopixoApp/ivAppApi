@@ -51,6 +51,7 @@ from app.models import (
     PublicTextIssue,
     PublishedMediaAsset,
     PublishedVideo,
+    PublishedVideoSeo,
     User,
     VideoView,
 )
@@ -96,6 +97,7 @@ from app.schemas import (
     UnpublishResponse,
     UserImpressionsOut,
 )
+from app.seo import ensure_seo_row, mark_seo_stale
 from app.users import (
     USER_SOURCE_ADMIN,
     USER_SOURCE_APP,
@@ -824,6 +826,7 @@ async def publish(
         )
         db.add(row)
         record_published_video_text(db, row)
+        ensure_seo_row(db, row)
         db.commit()
         log.info(
             "publish created video_id=%s mode=%s user_id=%s version=%s weight=%s tutorial=%s %s url=%s",
@@ -864,6 +867,7 @@ async def publish(
         row.is_tutorial = tutorial_flag
     row.updated_at = now
     record_published_video_text(db, row)
+    mark_seo_stale(db, row)
     db.commit()
     log.info(
         "publish updated video_id=%s mode=%s user_id=%s version=%s weight=%s tutorial=%s %s url=%s",
@@ -1070,6 +1074,7 @@ def publish_assets(
         db.commit()
         raise HTTPException(status_code=503, detail=detail)
     cdn_status = "ready" if gate.state == "active" else "warming"
+    mark_seo_stale(db, row)
     db.commit()
     return PublishResponse(
         video_id=item_id,
@@ -1294,6 +1299,7 @@ def publish_html(
             html_package_public_urls(db, settings, package_id=package.id),
         )
     record_published_video_text(db, row)
+    mark_seo_stale(db, row)
     db.commit()
     log.info(
         "publish html item_id=%s version=%s user_id=%s updated=%s capabilities=%s url=%s",
@@ -1348,6 +1354,7 @@ class _ContentManagementContext:
     authors: dict[str, User]
     covers: dict[str, MediaObject]
     creation_statuses: dict[str, str]
+    seo_rows: dict[str, PublishedVideoSeo]
 
 
 def _load_content_management_context(
@@ -1385,10 +1392,21 @@ def _load_content_management_context(
         if video_ids
         else {}
     )
+    seo_rows = (
+        {
+            row.video_id: row
+            for row in db.query(PublishedVideoSeo)
+            .filter(PublishedVideoSeo.video_id.in_(video_ids))
+            .all()
+        }
+        if video_ids
+        else {}
+    )
     return _ContentManagementContext(
         authors=authors,
         covers=covers,
         creation_statuses=creation_statuses,
+        seo_rows=seo_rows,
     )
 
 
@@ -1431,6 +1449,11 @@ def _content_management_out(
         creation_status = creation.status if creation else "published"
     else:
         creation_status = context.creation_statuses.get(row.id, "published")
+    seo = (
+        context.seo_rows.get(row.id)
+        if context is not None
+        else db.get(PublishedVideoSeo, row.id)
+    )
     return {
         "id": row.id,
         "source": row.content_source or "pgc",
@@ -1457,6 +1480,23 @@ def _content_management_out(
         "reviewed_by": row.reviewed_by or "",
         "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
         "review_note": row.review_note or "",
+        "seo": {
+            "status": seo.status if seo else "missing",
+            "slug": seo.slug if seo else "",
+            "page_title": seo.page_title if seo else "",
+            "page_description": seo.page_description if seo else "",
+            "meta_title": seo.meta_title if seo else "",
+            "meta_description": seo.meta_description if seo else "",
+            "tags": list(seo.tags or []) if seo else [],
+            "interaction_summary": seo.interaction_summary if seo else "",
+            "attempts": int(seo.attempts or 0) if seo else 0,
+            "last_error": seo.last_error if seo else "",
+            "title_locked": bool(seo.title_locked) if seo else False,
+            "description_locked": bool(seo.description_locked) if seo else False,
+            "generated_at": (
+                seo.generated_at.isoformat() if seo and seo.generated_at else None
+            ),
+        },
     }
 
 
@@ -1622,6 +1662,7 @@ def patch_content_management_detail(
 
     row.updated_at = datetime.now(timezone.utc)
     record_published_video_text(db, row)
+    mark_seo_stale(db, row)
     db.commit()
     db.refresh(row)
     detail = _content_management_out(db, settings, row)
@@ -1702,6 +1743,7 @@ def review_video(
         creation.status = "published" if decision == "approved" else "rejected"
         creation.progress_stage = creation.status
         creation.updated_at = row.reviewed_at
+    mark_seo_stale(db, row)
     db.commit()
     return _video_info(row).model_dump() | {"review_status": row.review_status}
 
@@ -1830,6 +1872,7 @@ def recompile_video_runtime_spec(
     row.runtime_spec = spec
     row.runtime_spec_version = runtime_spec_version_from_compiled(spec)
     row.updated_at = datetime.now(timezone.utc)
+    mark_seo_stale(db, row)
     db.commit()
     db.refresh(row)
     return _video_info(row)

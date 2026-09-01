@@ -41,6 +41,7 @@ from app.models import (
     AnalyticsLog,
     Follow,
     PublishedVideo,
+    PublishedVideoSeo,
     RecommendCursor,
     User,
     VideoView,
@@ -118,6 +119,7 @@ class FeedItemContext:
     authors_by_id: dict[str, User]
     play_counts_by_video_id: dict[str, int]
     followed_author_ids: frozenset[str]
+    seo_slugs_by_video_id: dict[str, str]
 
 
 def _load_feed_item_context(
@@ -146,6 +148,16 @@ def _load_feed_item_context(
         else []
     )
     followed_author_ids: frozenset[str] = frozenset()
+    seo_rows = (
+        db.query(PublishedVideoSeo.video_id, PublishedVideoSeo.slug)
+        .filter(
+            PublishedVideoSeo.video_id.in_(video_ids),
+            PublishedVideoSeo.status == "ready",
+        )
+        .all()
+        if video_ids
+        else []
+    )
     eligible_follow_ids = author_ids - ({viewer_user_id} if viewer_user_id else set())
     if viewer_user_id and eligible_follow_ids:
         followed_author_ids = frozenset(
@@ -165,6 +177,7 @@ def _load_feed_item_context(
             video_id: int(count) for video_id, count in play_count_rows
         },
         followed_author_ids=followed_author_ids,
+        seo_slugs_by_video_id={video_id: slug for video_id, slug in seo_rows},
     )
 
 
@@ -272,6 +285,17 @@ def _item_from_published(
             item_id=row.id,
             public_game_base_url=settings.public_game_base_url,
             public_share_base_url=public_share_base_url,
+            seo_public_base_url=settings.seo_public_base_url,
+            seo_slug=(
+                context.seo_slugs_by_video_id.get(row.id, "")
+                if context is not None
+                else (
+                    seo.slug
+                    if (seo := db.get(PublishedVideoSeo, row.id)) is not None
+                    and seo.status == "ready"
+                    else ""
+                )
+            ),
         ),
         user_id=row.user_id,
         nickname=nickname,

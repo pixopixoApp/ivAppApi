@@ -188,6 +188,10 @@ case "$environment" in
       echo 'development .env references the production RDS host' >&2
       exit 1
     fi
+    grep -qx 'PUBLIC_GAME_BASE_URL=https://demo.pixopixo.cn/game/' \
+      "$deploy_path/.env"
+    grep -qx 'SEO_PUBLIC_BASE_URL=https://demo.pixopixo.cn' \
+      "$deploy_path/.env"
     if [[ -e "$deploy_path/.env.target" ]]; then
       echo 'development must not have .env.target' >&2
       exit 1
@@ -199,6 +203,10 @@ case "$environment" in
     grep -qx 'PIXO_ENVIRONMENT=production' "$deploy_path/.env.target"
     grep -qx "RDS_HOST=$expected_rds_host" "$deploy_path/.env.target"
     grep -Eq "^DATABASE_URL=.*@$expected_rds_host:[0-9]+/ivapp" \
+      "$deploy_path/.env.target"
+    grep -qx 'PUBLIC_GAME_BASE_URL=https://pixopixo.com/' \
+      "$deploy_path/.env.target"
+    grep -qx 'SEO_PUBLIC_BASE_URL=https://pixopixo.com' \
       "$deploy_path/.env.target"
     ;;
   *)

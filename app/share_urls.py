@@ -24,7 +24,12 @@ def published_share_url(
     item_id: str,
     public_game_base_url: str,
     public_share_base_url: str,
+    seo_public_base_url: str = "",
+    seo_slug: str = "",
 ) -> str:
+    seo_base = (seo_public_base_url or public_game_base_url).strip().rstrip("/")
+    if seo_base and seo_slug.strip():
+        return f"{seo_base}/experiences/{quote(seo_slug.strip(), safe='-')}"
     if content_type == CONTENT_TYPE_RUNTIME:
         experience_url = runtime_experience_url(public_game_base_url, item_id)
         if experience_url:
