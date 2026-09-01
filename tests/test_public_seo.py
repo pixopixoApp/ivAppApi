@@ -104,7 +104,9 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
     assert listing.json()["total"] == 1
     assert slug.startswith("tap-to-wake-the-city-")
     assert listing.json()["items"][0]["title"] == "Tap to Wake the City"
-    assert listing.json()["items"][0]["embed_url"].endswith("/?play=work-seo-1")
+    assert listing.json()["items"][0]["embed_url"] == (
+        listing.json()["items"][0]["canonical_url"]
+    )
     assert detail.status_code == 200
     assert detail.json()["canonical_url"].endswith(f"/experiences/{slug}")
     assert resolved.json()["canonical_url"] == detail.json()["canonical_url"]

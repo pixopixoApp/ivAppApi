@@ -193,7 +193,10 @@ def seo_public_item(
         "width": seo.width,
         "height": seo.height,
         "content_url": first_runtime_media(row) if row.content_type == CONTENT_TYPE_RUNTIME else "",
-        "embed_url": f"{site_url.rstrip('/')}/?play={row.id}",
+        # The public detail page is now the stable watch/player URL.  Keep the
+        # response field for compatibility without publishing a duplicate
+        # query-parameter URL.
+        "embed_url": canonical,
         "created_at": row.created_at.isoformat() if row.created_at else "",
         "updated_at": max(
             value for value in (row.updated_at, seo.updated_at) if value is not None

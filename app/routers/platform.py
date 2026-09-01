@@ -43,6 +43,7 @@ from app.models import (
     CreatorVersion,
     MediaObject,
     PublishedVideo,
+    PublishedVideoSeo,
     User,
 )
 from app.oss_storage import OssStorageError
@@ -98,7 +99,7 @@ from app.schemas_platform import (
     Platform,
 )
 from app.seo import ensure_seo_row
-from app.share_urls import legacy_share_url, runtime_experience_url
+from app.share_urls import published_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
 from app.video_probe import VideoProbeError, probe_video
@@ -390,9 +391,16 @@ def _creation_out(
     )
 
 
-def _share_url(settings: Settings, video_id: str) -> str:
-    experience_url = runtime_experience_url(settings.public_game_base_url, video_id)
-    return experience_url or legacy_share_url(settings.public_share_base_url, video_id)
+def _share_url(settings: Settings, db: Session, video_id: str) -> str:
+    seo = db.get(PublishedVideoSeo, video_id)
+    return published_share_url(
+        content_type="runtime",
+        item_id=video_id,
+        public_game_base_url=settings.public_game_base_url,
+        public_share_base_url=settings.public_share_base_url,
+        seo_public_base_url=settings.seo_public_base_url,
+        seo_slug=seo.slug if seo is not None and seo.status == "ready" else "",
+    )
 
 
 @public_router.post(
@@ -1778,7 +1786,7 @@ def publish_creation(
             runtime_spec_version=(
                 row.runtime_spec_version or BASE_RUNTIME_SPEC_VERSION
             ),
-            share_url=_share_url(settings, row.published_video_id),
+            share_url=_share_url(settings, db, row.published_video_id),
             cdn_status=cdn_status,
         )
     versions = _creation_versions(db, row.id)
@@ -1935,7 +1943,7 @@ def publish_creation(
         video_id=row.id,
         status="pending_review",
         runtime_spec_version=runtime_spec_version,
-        share_url=_share_url(settings, row.id),
+        share_url=_share_url(settings, db, row.id),
         cdn_status=(
             "ready"
             if not media_mode_is_oss(settings) or (gate is not None and gate.state == "active")
@@ -2024,9 +2032,18 @@ def creator_share_page(
     ):
         raise HTTPException(status_code=404, detail="video not found")
     if video.content_type != "html":
+        seo = db.get(PublishedVideoSeo, video.id)
+        if seo is not None and seo.status == "ready" and seo.slug:
+            return RedirectResponse(
+                url=(
+                    f"{settings.seo_public_base_url.rstrip('/')}/experiences/"
+                    f"{quote(seo.slug, safe='-')}"
+                ),
+                status_code=308,
+            )
         experience_url = runtime_experience_url(settings.public_game_base_url, video.id)
         if experience_url:
-            return RedirectResponse(url=experience_url, status_code=302)
+            return RedirectResponse(url=experience_url, status_code=308)
     title = html.escape(video.title or "Pixo interactive video")
     description = html.escape(video.description or "Play this interactive video on Pixo")
     deep_link = html.escape(f"pixo://work/{quote(video.id, safe='')}", quote=True)

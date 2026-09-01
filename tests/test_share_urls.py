@@ -5,6 +5,13 @@ from app.share_urls import legacy_share_url, published_share_url, runtime_experi
 
 def test_runtime_experience_url_is_stable_and_url_encoded() -> None:
     assert runtime_experience_url(
+        "https://pixopixo.com/",
+        "7e92cae8-a6a9-40f3-9337-232d9a38edc9",
+    ) == (
+        "https://pixopixo.com/experience/"
+        "7e92cae8-a6a9-40f3-9337-232d9a38edc9"
+    )
+    assert runtime_experience_url(
         "https://demo.pixopixo.cn/game/",
         "7e92cae8-a6a9-40f3-9337-232d9a38edc9",
     ) == (

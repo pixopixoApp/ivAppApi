@@ -97,7 +97,7 @@ def test_pending_ugc_is_shareable_by_id_but_not_in_feed_until_reviewed(db):
     assert hidden["head"]["status"] == 100
     assert direct["head"]["status"] == 0
     assert direct["body"]["items"][0]["item_id"] == "ugc-1"
-    assert share.status_code == 302
+    assert share.status_code == 308
     assert listed["total"] == 1
     assert reviewed.status_code == 200
     assert public["body"]["items"][0]["item_id"] == "ugc-1"
