@@ -581,7 +581,7 @@ def test_ready_creation_requires_confirmation_then_persists_final_runtime(db, mo
     assert active_after_delete.json() is None
     assert missing_share.status_code == 404
     assert restored.json() == {"video_id": "cr_test", "deleted": False}
-    assert share.status_code == 302
+    assert share.status_code == 308
     assert share.headers["location"] == (
         "https://demo.pixopixo.cn/game/?experience=cr_test"
     )

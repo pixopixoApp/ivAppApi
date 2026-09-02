@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     public_share_base_url: str = ""
     # Canonical browser player used for shareable Runtime permalinks.
     public_game_base_url: str = "https://demo.pixopixo.cn/game/"
+    # Canonical, indexable Web origin. This deliberately excludes API and
+    # staging hosts so generated permalinks cannot leak across environments.
+    seo_public_base_url: str = "https://demo.pixopixo.cn"
 
     # Immutable, reviewed HTML packages. Comma-separated HTTPS origins only.
     html_trusted_origins: str = ""
@@ -208,6 +211,8 @@ def validate_environment_contract(settings: Settings) -> None:
             raise RuntimeError("development ivapp must publish .cn share URLs")
         if settings.public_game_base_url.rstrip("/") != "https://demo.pixopixo.cn/game":
             raise RuntimeError("development ivapp must use demo.pixopixo.cn/game")
+        if settings.seo_public_base_url.rstrip("/") != "https://demo.pixopixo.cn":
+            raise RuntimeError("development ivapp must use the non-indexable demo SEO origin")
         return
 
     expected_rds_host = settings.rds_host.strip().lower()
@@ -215,8 +220,10 @@ def validate_environment_contract(settings: Settings) -> None:
         raise RuntimeError("production ivapp must use the private RDS endpoint")
     if settings.public_share_base_url.rstrip("/") != "https://api.pixopixo.com":
         raise RuntimeError("production ivapp must publish .com share URLs")
-    if settings.public_game_base_url.rstrip("/") != "https://www.pixopixo.com":
-        raise RuntimeError("production ivapp must use www.pixopixo.com")
+    if settings.public_game_base_url.rstrip("/") != "https://pixopixo.com":
+        raise RuntimeError("production ivapp must use pixopixo.com")
+    if settings.seo_public_base_url.rstrip("/") != "https://pixopixo.com":
+        raise RuntimeError("production ivapp must use the canonical SEO origin")
     if settings.aliyun_oss_public_base_url.rstrip("/") != "https://video.pixopixo.cn":
         raise RuntimeError(
             "production media must remain on video.pixopixo.cn until the CDN cutover"

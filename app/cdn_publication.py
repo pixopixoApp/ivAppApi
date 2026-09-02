@@ -15,6 +15,7 @@ from app.models import (
     PublishedVideo,
 )
 from app.public_text import record_creator_creation_text, record_published_video_text
+from app.seo import mark_seo_stale
 
 
 class CdnPublicationError(RuntimeError):
@@ -89,6 +90,7 @@ def _apply_payload(
     row.updated_at = _now()
     db.add(row)
     record_published_video_text(db, row)
+    mark_seo_stale(db, row)
     creation = db.get(CreatorCreation, row.id)
     if creation is not None and isinstance(row.runtime_spec, dict):
         creation.runtime_spec = row.runtime_spec

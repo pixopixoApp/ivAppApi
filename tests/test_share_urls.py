@@ -5,6 +5,13 @@ from app.share_urls import legacy_share_url, published_share_url, runtime_experi
 
 def test_runtime_experience_url_is_stable_and_url_encoded() -> None:
     assert runtime_experience_url(
+        "https://pixopixo.com/",
+        "7e92cae8-a6a9-40f3-9337-232d9a38edc9",
+    ) == (
+        "https://pixopixo.com/experience/"
+        "7e92cae8-a6a9-40f3-9337-232d9a38edc9"
+    )
+    assert runtime_experience_url(
         "https://demo.pixopixo.cn/game/",
         "7e92cae8-a6a9-40f3-9337-232d9a38edc9",
     ) == (
@@ -29,6 +36,12 @@ def test_published_share_url_is_content_aware() -> None:
     assert published_share_url(content_type="html", **common) == (
         "https://api.pixopixo.cn/api/v1/share/work-1"
     )
+    assert published_share_url(
+        content_type="runtime",
+        seo_slug="play-the-rain-work1",
+        seo_public_base_url="https://demo.pixopixo.cn",
+        **common,
+    ) == "https://demo.pixopixo.cn/experiences/play-the-rain-work1"
 
 
 def test_legacy_share_url_remains_available_without_a_public_origin() -> None:
