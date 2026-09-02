@@ -417,6 +417,12 @@ class ClipOut(BaseModel):
 
 class FeedItemOut(BaseModel):
     item_id: str = Field(description="发布单元 id（publish 的 video_id）")
+    level: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description="质量档位 1~5（由 feed_weight 映射）；0 表示非推荐池内容",
+    )
     content_type: Literal["runtime", "html"] = Field(description="播放协议类型")
     title: str = Field(default="", description="作品标题")
     description: str = Field(default="", description="作品描述")
@@ -515,6 +521,24 @@ class ImpressionRequest(BaseModel):
 
 
 class ImpressionResponse(BaseModel):
+    head: ProtocolHeadOut
+    body: EmptyBody
+
+
+class SeenBodyIn(BaseModel):
+    video_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="用户已访问/播放的发布单元 item_id",
+    )
+
+
+class SeenRequest(BaseModel):
+    head: ProtocolHeadIn = Field(default_factory=ProtocolHeadIn)
+    body: SeenBodyIn
+
+
+class SeenResponse(BaseModel):
     head: ProtocolHeadOut
     body: EmptyBody
 

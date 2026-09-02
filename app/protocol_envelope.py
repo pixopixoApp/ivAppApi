@@ -21,6 +21,7 @@ from app.schemas import (
     GoogleLoginResponse,
     ImpressionResponse,
     MyVideosResponse,
+    SeenResponse,
     ProfileBodyOut,
     ProfileResponse,
     ProfileUpdateResponse,
@@ -165,6 +166,25 @@ def impression_error(
 ) -> ImpressionResponse:
     return ImpressionResponse(
         head=make_head(act="impression", status=status, ver=ver, head_in=head_in),
+        body=EmptyBody(),
+    )
+
+
+def seen_ok(*, ver: str, head_in: ProtocolHeadIn) -> SeenResponse:
+    return SeenResponse(
+        head=make_head(act="seen", status=0, ver=ver, head_in=head_in),
+        body=EmptyBody(),
+    )
+
+
+def seen_error(
+    *,
+    status: int = 100,
+    ver: str,
+    head_in: ProtocolHeadIn,
+) -> SeenResponse:
+    return SeenResponse(
+        head=make_head(act="seen", status=status, ver=ver, head_in=head_in),
         body=EmptyBody(),
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -67,6 +68,8 @@ from app.protocol_envelope import (
     impression_error,
     impression_ok,
     resolve_ssid,
+    seen_error,
+    seen_ok,
     send_code_error,
     send_code_ok,
     track_error,
@@ -92,6 +95,8 @@ from app.schemas import (
     GoogleLoginResponse,
     ImpressionRequest,
     ImpressionResponse,
+    SeenRequest,
+    SeenResponse,
     SendCodeRequest,
     SendCodeResponse,
     TrackRequest,
@@ -285,6 +290,7 @@ def _item_from_published(
         )
     return FeedItemOut(
         item_id=row.id,
+        level=int(row.feed_weight or 0),
         content_type=content_type,
         title=row.title or "",
         description=row.description or "",
@@ -1044,6 +1050,9 @@ def _build_redis_recommend_ids(
                     allow_sampled=True,
                 )
 
+    # 打乱最终顺序，避免前端每次都是按 level1→5 连排
+    random.shuffle(final)
+
     return final, rewind, seen_key
 
 
@@ -1395,3 +1404,59 @@ def post_impression(
 
     log.info("impression ok user_id=%s video_id=%s", user.user_id, video_id)
     return impression_ok(ver=settings.server_ver, head_in=payload.head)
+
+
+@public_router.post(
+    "/seen",
+    response_model=SeenResponse,
+    response_model_exclude_none=True,
+    summary="上报用户已访问/播放，写入 user:seen 去重池",
+    description="登录与游客均可。body.video_id 写入 user:seen:{userId}（登录，7 天）"
+    "或 user:seen:guest:{ssid}（游客，短 TTL），供推荐去重使用。"
+    "成功 status=0；视频不存在/不可见 status=100；Redis 不可用 status=100。",
+)
+def post_seen(
+    payload: SeenRequest,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> SeenResponse:
+    token = resolve_request_token(request, payload.head, act="seen")
+    user = resolve_current_user(request, db, token)
+    ssid = resolve_ssid(payload.head)
+    payload.head.ssid = ssid
+
+    video_id = payload.body.video_id.strip()
+    if not video_id:
+        return seen_error(ver=settings.server_ver, head_in=payload.head)
+
+    video = db.get(PublishedVideo, video_id)
+    if (
+        video is None
+        or video.is_deleted != 0
+        or video.deleted_at is not None
+        or video.review_status != "approved"
+        or not video.distribution_enabled
+        or not video.cdn_ready
+    ):
+        log.warning("seen invalid video_id=%s token=%s", video_id, token)
+        return seen_error(ver=settings.server_ver, head_in=payload.head)
+
+    # seen key：登录用户写 user:seen:{userId}；游客写 user:seen:guest:{ssid}
+    is_guest = user is None
+    seen_key = user_seen_key(user.user_id if user else ssid, is_guest=is_guest)
+
+    try:
+        store = get_recommend_store()
+        ttl = (
+            settings.recommend_guest_seen_ttl_seconds
+            if is_guest
+            else settings.recommend_seen_expire_days * 86400
+        )
+        store.mark_seen(seen_key=seen_key, video_id=video_id, ttl_seconds=ttl)
+    except (RedisError, ImpressionUnavailableError):
+        log.warning("seen redis unavailable token=%s video_id=%s", token, video_id)
+        return seen_error(ver=settings.server_ver, head_in=payload.head)
+
+    log.info("seen ok user_id=%s guest=%s video_id=%s", user.user_id if user else ssid, is_guest, video_id)
+    return seen_ok(ver=settings.server_ver, head_in=payload.head)
