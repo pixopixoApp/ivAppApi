@@ -468,6 +468,10 @@ class VideoBodyOut(BaseModel):
     next_cursor: str | None = Field(default=None, description="下一批不透明游标")
     has_more: bool = Field(default=False, description="是否可继续请求")
     is_circular: bool = Field(default=False, description="是否为可循环的无限推荐流")
+    is_rewind: bool = Field(
+        default=False,
+        description="是否已进入兜底回放（全网未看不足时，放开去重补齐）；兼容旧客户端",
+    )
 
 
 class VideoResponse(BaseModel):

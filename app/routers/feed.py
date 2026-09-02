@@ -35,7 +35,15 @@ from app.html_content import (
     HtmlContentError,
     normalize_required_capabilities,
 )
-from app.impressions import ImpressionUnavailableError, get_impression_store
+from app.impressions import (
+    ImpressionUnavailableError,
+    content_pool_key,
+    content_pool_new_key,
+    get_impression_store,
+    get_recommend_store,
+    user_seen_key,
+)
+from redis.exceptions import RedisError
 from app.logging_config import get_logger
 from app.models import (
     AnalyticsLog,
@@ -827,6 +835,195 @@ def post_google_login(
     return google_login_ok(body=body, ver=settings.server_ver, head_in=payload.head)
 
 
+# ---------------------------------------------------------------------------
+# Redis 推荐内容池（5 档随机采样）
+# ---------------------------------------------------------------------------
+_REC_LEVELS = [1, 2, 3, 4, 5]
+
+
+def _rec_sample_from_key(
+    store,
+    *,
+    key: str,
+    batch: int,
+    need: int,
+    seen_key: str | None,
+    global_sampled: set[str],
+    result: list[str],
+    allow_sampled: bool = False,
+) -> int:
+    """从单个 Redis Set 采样 batch 个，过滤【本次请求已选】+【已看】。
+
+    allow_sampled=True 时跳过“本次请求已选”过滤（用于兜底回放，允许重复）。
+    返回实际新增数量。游客（seen_key=None）只做本次请求内去重。
+    """
+    got = 0
+    cands = store.srandmember(key=key, count=batch)
+    if not cands:
+        return 0
+    if allow_sampled:
+        fresh = list(cands)
+    else:
+        # 本次请求去重
+        fresh = [v for v in cands if v not in global_sampled]
+        if not fresh:
+            return 0
+        global_sampled.update(fresh)
+    if seen_key is not None:
+        seen_flags = store.is_seen(seen_key=seen_key, video_ids=fresh)
+        fresh = [v for v, seen in zip(fresh, seen_flags) if not seen]
+    for v in fresh:
+        if got >= need:
+            break
+        result.append(v)
+        got += 1
+    return got
+
+
+def _rec_sample_level(
+    store,
+    *,
+    level: int,
+    need: int,
+    seen_key: str | None,
+    global_sampled: set[str],
+    new_window_seconds: int,
+    base_sample: int,
+    max_sample: int,
+    max_retry: int,
+) -> list[str]:
+    """单档采样：新内容优先 + 存量补足 + 动态扩采。返回该档选中的 video_id 列表。"""
+    out: list[str] = []
+    got = 0
+    # 1. 新内容优先（新视频不足 4 条时，不足部分由存量补）
+    new_key = content_pool_new_key(level)
+    got += _rec_sample_from_key(
+        store,
+        key=new_key,
+        batch=base_sample,
+        need=need,
+        seen_key=seen_key,
+        global_sampled=global_sampled,
+        result=out,
+    )
+    # 2. 存量补足（动态扩采）
+    all_key = content_pool_key(level)
+    retry = 0
+    while got < need and retry < max_retry:
+        batch = min(base_sample * (retry + 1), max_sample)
+        got += _rec_sample_from_key(
+            store,
+            key=all_key,
+            batch=batch,
+            need=need - got,
+            seen_key=seen_key,
+            global_sampled=global_sampled,
+            result=out,
+        )
+        retry += 1
+    return out
+
+
+def _build_redis_recommend_ids(
+    *,
+    user_id: str | None,
+    ssid: str,
+    settings: Settings,
+) -> tuple[list[str], bool, str]:
+    """Redis 推荐主流程：逐档 4 条 → 补位 → 递增兜底回放。
+
+    返回 (video_ids, is_rewind, seen_key)。
+    """
+    store = get_recommend_store()
+    total_target = settings.recommend_total_target
+    per_level = settings.recommend_per_level_target
+    new_window = settings.recommend_new_video_window_seconds
+    base_sample = settings.recommend_base_sample
+    max_sample = settings.recommend_max_sample
+    max_retry = settings.recommend_max_retry
+
+    # seen key：登录用户免；游客用 ssid 短 TTL 去重
+    is_guest = not user_id
+    seen_key = None
+    if is_guest:
+        seen_key = user_seen_key(ssid, is_guest=True)
+        store.clean_expired_seen(
+            seen_key=seen_key,
+            expire_ts=int(__import__("time").time()) - settings.recommend_guest_seen_ttl_seconds,
+        )
+    else:
+        seen_key = user_seen_key(user_id)
+        store.clean_expired_seen(
+            seen_key=seen_key,
+            expire_ts=int(__import__("time").time())
+            - settings.recommend_seen_expire_days * 86400,
+        )
+
+    global_sampled: set[str] = set()
+    final: list[str] = []
+
+    # 1. 逐档各 4 条
+    for lv in _REC_LEVELS:
+        final.extend(
+            _rec_sample_level(
+                store,
+                level=lv,
+                need=per_level,
+                seen_key=seen_key,
+                global_sampled=global_sampled,
+                new_window_seconds=new_window,
+                base_sample=base_sample,
+                max_sample=max_sample,
+                max_retry=max_retry,
+            )
+        )
+
+    # 2. 全局补位（1→5 高质量优先）
+    gap = total_target - len(final)
+    if gap > 0:
+        for lv in _REC_LEVELS:
+            if gap <= 0:
+                break
+            add = _rec_sample_level(
+                store,
+                level=lv,
+                need=gap,
+                seen_key=seen_key,
+                global_sampled=global_sampled,
+                new_window_seconds=new_window,
+                base_sample=base_sample,
+                max_sample=max_sample,
+                max_retry=max_retry,
+            )
+            final.extend(add)
+            gap -= len(add)
+
+    # 3. 终极兜底：全网未看不足，放开去重回放（递增采样，保证 20 条）
+    rewind = False
+    if len(final) < total_target:
+        rewind = True
+        loop = 0
+        while len(final) < total_target and loop < max_retry:
+            loop += 1
+            batch = min(base_sample * loop, max_sample)
+            for lv in _REC_LEVELS:
+                if len(final) >= total_target:
+                    break
+                _rec_sample_from_key(
+                    store,
+                    key=content_pool_key(lv),
+                    batch=batch,
+                    need=total_target - len(final),
+                    seen_key=None,  # 兜底放开去重（回放）+ 允许本次已选
+                    global_sampled=global_sampled,
+                    result=final,
+                    allow_sampled=True,
+                )
+
+    return final, rewind, seen_key
+
+
+
 @public_router.post(
     "/video",
     response_model=VideoResponse,
@@ -851,27 +1048,94 @@ def post_video(
     )
     ssid = resolve_ssid(payload.head)
     payload.head.ssid = ssid
-    capability_key = ",".join(sorted(supported_runtime_spec_versions)) or "none"
-    state_key = (
-        f"feed:user:{user.user_id}:spec:{capability_key}"
-        if user
-        else f"feed:ssid:{ssid}:spec:{capability_key}"
-    )
-    try:
-        video_ids, next_cursor = _next_video_ids(
-            db,
-            state_key=state_key,
-            limit=limit,
-            user_id=user.user_id if user else None,
-            cursor_token=payload.body.cursor,
-            cursor_secret=settings.cursor_secret or settings.publish_key,
-            supported_runtime_spec_versions=supported_runtime_spec_versions,
+
+    # ---- Redis 推荐方案（开关开启时优先，Redis 不可用自动降级 MySQL）----
+    redis_video_ids: list[str] | None = None
+    redis_is_rewind = False
+    redis_seen_key: str | None = None
+    if settings.feature_recommend_redis:
+        try:
+            redis_video_ids, redis_is_rewind, redis_seen_key = _build_redis_recommend_ids(
+                user_id=user.user_id if user else None,
+                ssid=ssid,
+                settings=settings,
+            )
+        except (RedisError, ImpressionUnavailableError) as exc:
+            log.warning(
+                "video redis recommend unavailable, fallback to mysql token=%s err=%s",
+                token, exc,
+            )
+            redis_video_ids = None
+    if redis_video_ids is None:
+        # ---- 降级：现有 MySQL 直查逻辑 ----
+        capability_key = ",".join(sorted(supported_runtime_spec_versions)) or "none"
+        state_key = (
+            f"feed:user:{user.user_id}:spec:{capability_key}"
+            if user
+            else f"feed:ssid:{ssid}:spec:{capability_key}"
         )
-    except CursorError as exc:
-        log.warning("video invalid cursor err=%s", exc)
-        return video_error(ver=settings.server_ver, head_in=payload.head)
+        try:
+            video_ids, next_cursor = _next_video_ids(
+                db,
+                state_key=state_key,
+                limit=limit,
+                user_id=user.user_id if user else None,
+                cursor_token=payload.body.cursor,
+                cursor_secret=settings.cursor_secret or settings.publish_key,
+                supported_runtime_spec_versions=supported_runtime_spec_versions,
+            )
+        except CursorError as exc:
+            log.warning("video invalid cursor err=%s", exc)
+            return video_error(ver=settings.server_ver, head_in=payload.head)
+        if not video_ids:
+            log.warning("video feed empty pool token=%s", token)
+            return video_error(ver=settings.server_ver, head_in=payload.head)
+
+        rows_by_id = {
+            row.id: row
+            for row in db.query(PublishedVideo)
+            .filter(PublishedVideo.id.in_(video_ids))
+            .all()
+        }
+        context = _load_feed_item_context(
+            db,
+            list(rows_by_id.values()),
+            viewer_user_id=user.user_id if user else None,
+        )
+        items: list[FeedItemOut] = []
+        for vid in video_ids:
+            row = rows_by_id.get(vid)
+            if row is None or row.is_deleted != 0:
+                log.warning("video feed skip missing/deleted id=%s", vid)
+                continue
+            item = _item_from_published(
+                db,
+                row,
+                settings=settings,
+                viewer_user_id=user.user_id if user else None,
+                public_share_base_url=settings.public_share_base_url,
+                supported_runtime_spec_versions=supported_runtime_spec_versions,
+                context=context,
+            )
+            if item is not None:
+                items.append(item)
+
+        if not items:
+            return video_error(ver=settings.server_ver, head_in=payload.head)
+
+        body = VideoBodyOut(
+            items=items,
+            next_cursor=next_cursor,
+            has_more=True,
+            is_circular=True,
+        )
+        log.debug("video feed ok (mysql fallback) token=%s items=%d", token, len(items))
+        return video_ok(body=body, ver=settings.server_ver, head_in=payload.head)
+
+    # ---- Redis 方案：构建 items ----
+    video_ids = redis_video_ids
     if not video_ids:
-        log.warning("video feed empty pool token=%s", token)
+        log.warning("video feed empty redis pool token=%s", token)
         return video_error(ver=settings.server_ver, head_in=payload.head)
 
     rows_by_id = {
@@ -889,7 +1153,6 @@ def post_video(
     for vid in video_ids:
         row = rows_by_id.get(vid)
         if row is None or row.is_deleted != 0:
-            log.warning("video feed skip missing/deleted id=%s", vid)
             continue
         item = _item_from_published(
             db,
@@ -906,13 +1169,31 @@ def post_video(
     if not items:
         return video_error(ver=settings.server_ver, head_in=payload.head)
 
+    # 曝光即标记：本次推荐的视频写入 seen（游客短 TTL，登录 7 天），
+    # 实现游客“一次持续访问内去重”（下拉刷过的不再重复出现）。
+    if redis_seen_key:
+        try:
+            is_guest = user is None
+            ttl = (
+                settings.recommend_guest_seen_ttl_seconds
+                if is_guest
+                else settings.recommend_seen_expire_days * 86400
+            )
+            store = get_recommend_store()
+            for vid in video_ids:
+                store.mark_seen(seen_key=redis_seen_key, video_id=vid, ttl_seconds=ttl)
+        except (RedisError, ImpressionUnavailableError):
+            # 标记失败不影响本次返回（下次可能少量重复，可接受）
+            log.warning("video redis mark_seen failed token=%s", token)
+
     body = VideoBodyOut(
         items=items,
-        next_cursor=next_cursor,
+        next_cursor=None,
         has_more=True,
         is_circular=True,
+        is_rewind=redis_is_rewind,
     )
-    log.debug("video feed ok token=%s items=%d", token, len(items))
+    log.debug("video feed ok (redis) token=%s items=%d is_rewind=%s", token, len(items), redis_is_rewind)
     return video_ok(body=body, ver=settings.server_ver, head_in=payload.head)
 
 

@@ -115,6 +115,29 @@ class Settings(BaseSettings):
     # Redis（曝光去重池）
     redis_url: str = "redis://redis:6379/0"
 
+    # Redis 推荐内容池：启用后 /video 走 Redis 5档随机采样推荐；
+    # Redis 不可用时自动降级为原有 MySQL 直查逻辑。
+    feature_recommend_redis: bool = False
+
+    # 新视频窗口（秒）：feed_weight 分档下，created_at 在此窗口内的视为“新内容”优先曝光
+    recommend_new_video_window_seconds: int = 3 * 86400
+    # 每档目标条数
+    recommend_per_level_target: int = 4
+    # 总目标条数
+    recommend_total_target: int = 20
+    # 基础采样数（单次 SRANDMEMBER 数量，动态扩采基准）
+    recommend_base_sample: int = 12
+    # 单档单次最大采样数
+    recommend_max_sample: int = 60
+    # 单档位最大重试次数
+    recommend_max_retry: int = 3
+    # 登录用户已看记录保留天数
+    recommend_seen_expire_days: int = 7
+    # 游客已看记录保留秒数（TTL 自动过期，防 Redis 膨胀）
+    recommend_guest_seen_ttl_seconds: int = 86400
+    # 内容池 shadow 重建批次大小
+    recommend_pool_batch_size: int = 500
+
     # Creator orchestration. ivapp owns C-end state while ivadmin exclusively
     # owns ivcore/model/Dify execution.
     ivadmin_base_url: str = "http://host.docker.internal:8000"
