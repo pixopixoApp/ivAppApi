@@ -288,9 +288,14 @@ def _item_from_published(
                 is not None
             )
         )
+    # level 约束为 0~5（quality 档位 / 0=非推荐池）。数据库可能存在超出档位范围的
+    # 历史 feed_weight（如 8/10），直接透传会让 FeedItemOut 校验失败导致接口 500，
+    # 故在此 clamp 到合法范围：超过 5 按最高档 5 处理，负数按 0 处理。
+    _raw_level = int(row.feed_weight or 0)
+    level = 5 if _raw_level > 5 else (0 if _raw_level < 0 else _raw_level)
     return FeedItemOut(
         item_id=row.id,
-        level=int(row.feed_weight or 0),
+        level=level,
         content_type=content_type,
         title=row.title or "",
         description=row.description or "",
