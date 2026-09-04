@@ -121,8 +121,12 @@ class Settings(BaseSettings):
 
     # 新视频窗口（秒）：feed_weight 分档下，created_at 在此窗口内的视为“新内容”优先曝光
     recommend_new_video_window_seconds: int = 3 * 86400
-    # 每档目标条数
+    # 每档均匀目标条数（旧字段，保留兼容；一般无需再配置，新逻辑由 recommend_per_level_counts 控制）
     recommend_per_level_target: int = 4
+    # 1~5 档每档目标条数（逗号分隔、按 level1~level5 顺序），需合计 = recommend_total_target。
+    # 留空则使用默认橄榄型 2,3,5,6,4（低档少、中间档为主、高档精品保量）；
+    # 如要完全均匀可显式配置 4,4,4,4,4。
+    recommend_per_level_counts: str = ""
     # 总目标条数
     recommend_total_target: int = 20
     # 基础采样数（单次 SRANDMEMBER 数量，动态扩采基准）

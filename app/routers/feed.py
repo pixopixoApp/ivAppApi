@@ -869,6 +869,84 @@ def post_google_login(
 # Redis 推荐内容池（5 档随机采样）
 # ---------------------------------------------------------------------------
 _REC_LEVELS = [1, 2, 3, 4, 5]
+# 低档少、中间档为主、高档精品保量的橄榄型供给（level1~level5 顺序，合计 20）。
+# 作为 recommend_per_level_counts 未配置时的回退默认值。
+_DEFAULT_PER_LEVEL_COUNTS = [2, 3, 5, 6, 4]
+# 高质量优先遍历顺序（补位时用，保证补进来的也尽量高质量）。
+_REC_LEVELS_HIGH_FIRST = list(reversed(_REC_LEVELS))
+
+
+def _resolve_per_level_counts(settings: Settings) -> list[int]:
+    """解析每档目标条数（level1~level5）。
+
+    优先读取 recommend_per_level_counts（逗号分隔字符串）；未配置时使用默认的
+    橄榄型 _DEFAULT_PER_LEVEL_COUNTS；仅当显式给出 5 个非负整数时才采用，
+    格式非法则回退默认橄榄型。
+    """
+    raw = (settings.recommend_per_level_counts or "").strip()
+    if raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) == len(_REC_LEVELS):
+            try:
+                counts = [int(p) for p in parts]
+                if all(c >= 0 for c in counts):
+                    return counts
+            except ValueError:
+                pass
+    return list(_DEFAULT_PER_LEVEL_COUNTS)
+
+
+# 20 格体验曲线模板（期望档位，5 最高）。
+# 设计意图：高质开场抓人 → 3/4 档为主体承接 → 中后段才回落低档 → 避免单调递减。
+# 计数与默认橄榄型 _DEFAULT_PER_LEVEL_COUNTS(2/3/5/6/4) 一致。
+_EXPERIENCE_LEVEL_TEMPLATE = [
+    5, 4, 5, 4, 3, 4, 5, 4, 3, 4,
+    3, 2, 4, 3, 2, 1, 2, 1, 3, 5,
+]
+
+
+def _arrange_by_experience_template(
+    pool_by_level: dict[int, list[str]],
+    *,
+    template: list[int],
+) -> list[str]:
+    """把已抽到的各档视频按“体验曲线模板”重排。
+
+    逐格按期望档位取出；该档为空时按“高→低”就近递补，避免低质冷场，
+    也避免相邻出现 5→1 式骤降。模板覆盖后仍有剩余（自定义 counts 或缺档
+    导致的数量差）时，按高质量优先追加到尾部，保证不漏内容。
+    """
+    # 每档内部先随机打散，让同档内多条不固定、有新鲜感。
+    iterators: dict[int, list[str]] = {}
+    for lv in _REC_LEVELS:
+        bucket = list(pool_by_level.get(lv, []))
+        random.shuffle(bucket)
+        iterators[lv] = bucket
+
+    def take_from(level: int) -> str | None:
+        bucket = iterators.get(level)
+        if bucket is None:
+            return None
+        return bucket.pop() if bucket else None
+
+    ordered: list[str] = []
+    for want in template:
+        v = take_from(want)
+        if v is None:
+            # 期望档已空：先试更高质档，尽量维持体验不陡降
+            for cand in _REC_LEVELS_HIGH_FIRST:
+                if cand == want:
+                    continue
+                v = take_from(cand)
+                if v is not None:
+                    break
+        if v is not None:
+            ordered.append(v)
+
+    # 兜底：把仍未放入模板的剩余内容（高质量优先）追加到末尾。
+    for lv in _REC_LEVELS_HIGH_FIRST:
+        ordered.extend(iterators.get(lv, ()))
+    return ordered
 
 
 def _rec_sample_from_key(
@@ -884,8 +962,9 @@ def _rec_sample_from_key(
 ) -> int:
     """从单个 Redis Set 采样 batch 个，过滤【本次请求已选】+【已看】。
 
-    allow_sampled=True 时跳过“本次请求已选”过滤（用于兜底回放，允许重复）。
-    返回实际新增数量。游客（seen_key=None）只做本次请求内去重。
+    allow_sampled=True 时跳过“本次请求已选”过滤，允许同一请求内出现重复
+    （仅用于确需同请求重复的场景；回放已不再使用该开关）。
+    返回实际新增数量。seen_key=None 表示放开“已看”过滤（回放/去重穿透用）。
     """
     got = 0
     cands = store.srandmember(key=key, count=batch)
@@ -898,7 +977,6 @@ def _rec_sample_from_key(
         fresh = [v for v in cands if v not in global_sampled]
         if not fresh:
             return 0
-        global_sampled.update(fresh)
     if seen_key is not None:
         seen_flags = store.is_seen(seen_key=seen_key, video_ids=fresh)
         fresh = [v for v, seen in zip(fresh, seen_flags) if not seen]
@@ -906,6 +984,10 @@ def _rec_sample_from_key(
         if got >= need:
             break
         result.append(v)
+        if not allow_sampled:
+            # 只把真正返回的加入“本次已选”，避免把抽到但未返回的候选误标记，
+            # 导致后续补位阶段可选内容被白白浪费 / 提前触发回放。
+            global_sampled.add(v)
         got += 1
     return got
 
@@ -960,13 +1042,13 @@ def _build_redis_recommend_ids(
     ssid: str,
     settings: Settings,
 ) -> tuple[list[str], bool, str]:
-    """Redis 推荐主流程：逐档 4 条 → 补位 → 递增兜底回放。
+    """Redis 推荐主流程：橄榄型逐档抽样 → 高质量补位 → 回放 → 体验曲线排序。
 
-    返回 (video_ids, is_rewind, seen_key)。
+    返回 (video_ids, is_rewind, seen_key)。video_ids 顺序即最终下发顺序。
     """
     store = get_recommend_store()
     total_target = settings.recommend_total_target
-    per_level = settings.recommend_per_level_target
+    per_level_counts = _resolve_per_level_counts(settings)
     new_window = settings.recommend_new_video_window_seconds
     base_sample = settings.recommend_base_sample
     max_sample = settings.recommend_max_sample
@@ -990,15 +1072,21 @@ def _build_redis_recommend_ids(
         )
 
     global_sampled: set[str] = set()
-    final: list[str] = []
+    # 分档收集本次实际抽到的视频，以便最后按“体验曲线模板”重排下发顺序。
+    pool_by_level: dict[int, list[str]] = {lv: [] for lv in _REC_LEVELS}
 
-    # 1. 逐档各 4 条
-    for lv in _REC_LEVELS:
-        final.extend(
+    def total_collected() -> int:
+        return sum(len(v) for v in pool_by_level.values())
+
+    # 1. 按橄榄型比例（中档为主、高档保量、低档少量）逐档抽样
+    for lv, need in zip(_REC_LEVELS, per_level_counts):
+        if need <= 0:
+            continue
+        pool_by_level[lv].extend(
             _rec_sample_level(
                 store,
                 level=lv,
-                need=per_level,
+                need=need,
                 seen_key=seen_key,
                 global_sampled=global_sampled,
                 new_window_seconds=new_window,
@@ -1008,10 +1096,10 @@ def _build_redis_recommend_ids(
             )
         )
 
-    # 2. 全局补位（1→5 高质量优先）
-    gap = total_target - len(final)
+    # 2. 全局补位（高质量优先：5→1），保证不足时补进来的也尽量高质量
+    gap = total_target - total_collected()
     if gap > 0:
-        for lv in _REC_LEVELS:
+        for lv in _REC_LEVELS_HIGH_FIRST:
             if gap <= 0:
                 break
             add = _rec_sample_level(
@@ -1025,33 +1113,41 @@ def _build_redis_recommend_ids(
                 max_sample=max_sample,
                 max_retry=max_retry,
             )
-            final.extend(add)
+            pool_by_level[lv].extend(add)
             gap -= len(add)
 
-    # 3. 终极兜底：全网未看不足，放开去重回放（递增采样，保证 20 条）
+    # 3. 终极兜底：全网未看不足，放开去重回放（尽量补到 20 条）
     rewind = False
-    if len(final) < total_target:
+    if total_collected() < total_target:
         rewind = True
         loop = 0
-        while len(final) < total_target and loop < max_retry:
+        while total_collected() < total_target and loop < max_retry:
             loop += 1
             batch = min(base_sample * loop, max_sample)
+            collected_before_round = total_collected()
             for lv in _REC_LEVELS:
-                if len(final) >= total_target:
+                if total_collected() >= total_target:
                     break
                 _rec_sample_from_key(
                     store,
                     key=content_pool_key(lv),
                     batch=batch,
-                    need=total_target - len(final),
-                    seen_key=None,  # 兜底放开去重（回放）+ 允许本次已选
+                    need=total_target - total_collected(),
+                    seen_key=None,  # 放开“已看”过滤（回放：允许与历史请求重复）
                     global_sampled=global_sampled,
-                    result=final,
-                    allow_sampled=True,
+                    result=pool_by_level[lv],
+                    allow_sampled=False,  # 保留本次请求内去重，避免同一条响应里重复
                 )
+            if total_collected() == collected_before_round:
+                # 整轮没有任何新增：池已不足以再填满，退出防死循环
+                break
 
-    # 打乱最终顺序，避免前端每次都是按 level1→5 连排
-    random.shuffle(final)
+    # 4. 按“体验曲线模板”重排（高质开场/主体承接/避免单调递减/收尾钩子）
+    ordered = _arrange_by_experience_template(
+        pool_by_level,
+        template=_EXPERIENCE_LEVEL_TEMPLATE,
+    )
+    final = ordered[:total_target]
 
     return final, rewind, seen_key
 
@@ -1213,8 +1309,14 @@ def post_video(
                 else settings.recommend_seen_expire_days * 86400
             )
             store = get_recommend_store()
-            for vid in video_ids:
-                store.mark_seen(seen_key=redis_seen_key, video_id=vid, ttl_seconds=ttl)
+            # 只标记真正返回给客户端的 items，避免把候选但未真正返回的
+            # （db 缺失/已删除/构建失败被跳过）误写入 seen 而后续被静默吞掉。
+            for item in items:
+                store.mark_seen(
+                    seen_key=redis_seen_key,
+                    video_id=item.item_id,
+                    ttl_seconds=ttl,
+                )
         except (RedisError, ImpressionUnavailableError):
             # 标记失败不影响本次返回（下次可能少量重复，可接受）
             log.warning("video redis mark_seen failed token=%s", token)
