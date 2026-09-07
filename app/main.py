@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.auth_user import AppAuthError
 from app.cdn_cache import validate_cdn_config
@@ -91,3 +91,15 @@ async def app_auth_error_handler(_request: Request, exc: AppAuthError) -> JSONRe
 )
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get(
+    "/test",
+    response_class=HTMLResponse,
+    summary="推荐算法测试台（本地调试用）",
+    description="加载推荐 + 已看上报表单页面。",
+    include_in_schema=False,
+)
+def recommendation_test_page() -> HTMLResponse:
+    path = Path(__file__).resolve().parent / "test_home.html"
+    return HTMLResponse(content=path.read_text(encoding="utf-8"))

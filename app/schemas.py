@@ -442,6 +442,12 @@ class ClipOut(BaseModel):
 
 class FeedItemOut(BaseModel):
     item_id: str = Field(description="发布单元 id（publish 的 video_id）")
+    level: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description="质量档位 1~5（由 feed_weight 映射）；0 表示非推荐池内容",
+    )
     content_type: Literal["runtime", "html"] = Field(description="播放协议类型")
     title: str = Field(default="", description="作品标题")
     description: str = Field(default="", description="作品描述")
@@ -493,6 +499,10 @@ class VideoBodyOut(BaseModel):
     next_cursor: str | None = Field(default=None, description="下一批不透明游标")
     has_more: bool = Field(default=False, description="是否可继续请求")
     is_circular: bool = Field(default=False, description="是否为可循环的无限推荐流")
+    is_rewind: bool = Field(
+        default=False,
+        description="是否已进入兜底回放（全网未看不足时，放开去重补齐）；兼容旧客户端",
+    )
 
 
 class VideoResponse(BaseModel):
@@ -536,6 +546,24 @@ class ImpressionRequest(BaseModel):
 
 
 class ImpressionResponse(BaseModel):
+    head: ProtocolHeadOut
+    body: EmptyBody
+
+
+class SeenBodyIn(BaseModel):
+    video_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="用户已访问/播放的发布单元 item_id",
+    )
+
+
+class SeenRequest(BaseModel):
+    head: ProtocolHeadIn = Field(default_factory=ProtocolHeadIn)
+    body: SeenBodyIn
+
+
+class SeenResponse(BaseModel):
     head: ProtocolHeadOut
     body: EmptyBody
 

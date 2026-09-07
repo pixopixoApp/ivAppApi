@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>推荐算法测试台</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6fa; color: #2d3436; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; }
+  .card { background: #fff; border-radius: 12px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: #0984e3; }
+  label { display: inline-block; margin: 0 16px 8px 0; font-size: 13px; }
+  input[type=text], select, textarea { padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; min-width: 220px; }
+  button { background: #0984e3; color: #fff; border: 0; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #0873c4; }
+  button.sec { background: #e17055; }
+  button.sec:hover { background: #d06048; }
+  button.gray { background: #636e72; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; vertical-align: middle; }
+  .badge.rewind { background: #ffeaa7; color: #8d6e00; }
+  .badge.ok { background: #55efc4; color: #00695c; }
+  .badge.err { background: #fab1a0; color: #a52d2d; }
+  pre { background: #2d3436; color: #dfe6e9; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; max-height: 380px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border: 1px solid #eee; padding: 8px 10px; text-align: left; vertical-align: top; word-break: break-all; }
+  th { background: #f8f9fa; }
+  .meta { font-size: 12px; color: #888; margin-top: 4px; }
+  .row { display:flex; flex-wrap: wrap; align-items:center; gap: 8px; margin-bottom: 8px; }
+  .chk { display: flex; align-items: center; gap: 6px; margin-right: 16px; }
+  .chk input { width: auto; }
+  .stat { display:inline-block; background:#e2e8f0; padding:2px 8px; border-radius:6px; margin-right:8px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 推荐算法测试台 <span class="meta">/video 推荐 + /seen 已看上报</span></h1>
+
+  <div class="card">
+    <h2>① 请求设置</h2>
+    <div class="row">
+      <label>会话 SSID:<input id="ssid" type="text" value="demo-session-001"></label>
+      <label>支持的体验版本:
+        <select id="spec" multiple size="1">
+          <option selected>1.0</option>
+          <option selected>1.1</option>
+          <option selected>1.2</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="isLogin"> 作为登录用户（带 token）</label>
+      <div id="loginWrap" style="display:none">
+        <label>Token:<input id="token" type="text" placeholder="Bearer token"></label>
+      </div>
+    </div>
+    <div style="margin-top:4px">
+      <button onclick="fetchVideo()">拉取推荐 /video</button>
+      <button class="sec" onclick="reportAllAsSeen()">把本次全部标记为已看 /seen</button>
+      <button class="gray" onclick="clearAllSeen()">清空已看</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>② 推荐结果 <span id="resultMeta"></span></h2>
+    <div id="videoResult">点击上方按钮拉取推荐。</div>
+  </div>
+
+  <div class="card">
+    <h2>③ 原始响应</h2>
+    <pre id="rawResult">—</pre>
+  </div>
+
+  <div class="card">
+    <h2>④ 手动标记单个视频为已看</h2>
+    <div class="row">
+      <label>video_id:<input id="manualVid" type="text" style="min-width:400px" placeholder="粘贴一个 item_id"></label>
+      <button onclick="reportSeen()">上报已看 /seen</button>
+    </div>
+    <div class="meta">调用 POST /seen → 写入 user:seen:{userId}（登录）或 user:seen:guest:{ssid}（游客）</div>
+  </div>
+</div>
+
+<script>
+let lastItems = [];
+const $ = id => document.getElementById(id);
+
+function specVersions() {
+  return Array.from(document.getElementById('spec').selectedOptions).map(o => o.value);
+}
+
+function headObj() {
+  const h = { act: 'video', ver: '1.2', ssid: document.getElementById('ssid').value.trim() };
+  if (document.getElementById('isLogin').checked && document.getElementById('token').value.trim()) {
+    h.token = document.getElementById('token').value.trim();
+  }
+  return h;
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  return json;
+}
+
+function videoUrl(it) {
+  // runtime: video[0].video ; html: html_url
+  try {
+    if (it.video && Array.isArray(it.video) && it.video[0] && it.video[0].video) return it.video[0].video;
+  } catch(e) {}
+  return it.html_url || '';
+}
+
+function mediaCell(it) {
+  const url = videoUrl(it);
+  if (!url) return '<span class="meta">无视频</span>';
+  if (it.content_type === 'runtime') {
+    return '<video controls preload="none" muted style="width:150px;height:260px;background:#000;border-radius:6px" src="' + url + '"></video>';
+  }
+  return '<a href="' + url + '" target="_blank" rel="noopener">查看 HTML</a>';
+}
+
+function levelBadge(lv) {
+  const colors = {5:'#e17055',4:'#e84393',3:'#0984e3',2:'#00b894',1:'#636e72'};
+  const c = colors[lv] || '#b2bec3';
+  return '<span style="display:inline-block;background:' + c + ';color:#fff;border-radius:50%;width:26px;height:26px;line-height:26px;text-align:center;font-weight:bold">' + (lv || '-') + '</span>';
+}
+
+function renderItems(items) {
+  const div = document.getElementById('videoResult');
+  if (!items || items.length === 0) { div.innerHTML = '<div class="meta">（空）</div>'; return; }
+  let html = '<table><tr><th>#</th><th>视频</th><th>档位</th><th>item_id</th><th>昵称</th><th>标题</th><th>操作</th></tr>';
+  items.forEach((it, i) => {
+    html += '<tr>'
+      + '<td>' + (i+1) + '</td>'
+      + '<td>' + mediaCell(it) + '</td>'
+      + '<td style="text-align:center">' + levelBadge(it.level) + '</td>'
+      + '<td style="font-family:monospace;max-width:200px">' + it.item_id + '</td>'
+      + '<td>' + (it.nickname || '-') + '</td>'
+      + '<td style="max-width:220px">' + (it.title || '').substring(0,50) + '</td>'
+      + '<td><button onclick="reportSeen(\'' + it.item_id + '\')">已看</button></td>'
+      + '</tr>';
+  });
+  html += '</table>';
+  div.innerHTML = html;
+}
+
+async function fetchVideo() {
+  lastItems = [];
+  const body = { head: headObj(), body: { limit: 20, supported_experience_spec_versions: specVersions() } };
+  const json = await api('/video', body);
+  document.getElementById('rawResult').textContent = JSON.stringify(json, null, 2);
+  const st = json.head ? json.head.status : -1;
+  const items = (json.body && json.body.items) || [];
+  lastItems = items;
+  const rewind = json.body && json.body.is_rewind;
+  const hasMore = json.body && json.body.has_more;
+  let metaHtml = '<span class="badge ' + (st===0?'ok':'err') + '">' + (st===0?'成功':'失败 status='+st) + '</span>';
+  if (rewind) metaHtml += '<span class="badge rewind">兜底回放 is_rewind</span>';
+  metaHtml += ' <span class="stat">items=' + items.length + '</span><span class="stat">has_more=' + hasMore + '</span>';
+  document.getElementById('resultMeta').innerHTML = metaHtml;
+  renderItems(items);
+}
+
+async function reportSeen(vid) {
+  const v = vid || document.getElementById('manualVid').value.trim();
+  if (!v) { alert('请填写 video_id'); return; }
+  const body = { head: headObj(), body: { video_id: v } };
+  const json = await api('/seen', body);
+  document.getElementById('rawResult').textContent = JSON.stringify(json, null, 2);
+  const st = json.head ? json.head.status : -1;
+  alert('已看上报: status=' + st + (st===0?'（成功）':'（失败）'));
+}
+
+async function reportAllAsSeen() {
+  if (!lastItems.length) { alert('请先拉取推荐'); return; }
+  let ok = 0, fail = 0;
+  for (const it of lastItems) {
+    const json = await api('/seen', { head: headObj(), body: { video_id: it.item_id } });
+    if (json.head && json.head.status === 0) ok++; else fail++;
+  }
+  const result = '已上报 ' + lastItems.length + ' 条: 成功 ' + ok + ', 失败 ' + fail;
+  alert(result);
+  document.getElementById('rawResult').textContent = result;
+}
+
+function clearAllSeen() {
+  alert('请在服务端 Redis 手动执行: DEL user:seen:guest:{ssid} 或 user:seen:{userId}');
+}
+
+document.getElementById('isLogin').addEventListener('change', function(e) {
+  document.getElementById('loginWrap').style.display = e.target.checked ? '' : 'none';
+});
+</script>
+</body>
+</html>

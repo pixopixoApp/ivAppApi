@@ -14,6 +14,9 @@ os.environ.setdefault("MEDIA_ROOT", "/tmp/ivapp-pytest-media")
 # hermetic unless an individual test explicitly opts into the OSS adapter.
 os.environ["MEDIA_STORAGE_MODE"] = "local"
 os.environ["MEDIA_READ_FALLBACK_LOCAL"] = "true"
+# 测试环境默认关闭 Redis 推荐（避免受本地 .env 的 FEATURE_RECOMMEND_REDIS=true 影响，
+# 且测试环境通常没有 Redis 内容池）。
+os.environ["FEATURE_RECOMMEND_REDIS"] = "false"
 os.environ.setdefault("SMTP_HOST", "")
 os.environ.setdefault("HTML_TRUSTED_ORIGINS", "https://html.test")
 
