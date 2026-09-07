@@ -80,7 +80,7 @@ class TimelineInteraction(BaseModel):
     pause_video: bool = True
     vision: dict[str, Any] | None = Field(
         default=None,
-        description="camera_motion 的受控端侧视觉识别配置",
+        description="camera_motion 或 camera_continuous 的受控端侧视觉识别配置",
     )
     region: Region | None = None
 
@@ -286,6 +286,13 @@ class RuntimeCapabilitiesIn(BaseModel):
             "客户端可解析的 ExperienceSpec 版本；不传按旧客户端 1.0/1.1 处理"
         ),
     )
+    supported_camera_continuous_targets: list[str] | None = Field(
+        default=None,
+        max_length=16,
+        description=(
+            "客户端支持的持续摄像头识别目标；不传表示不支持此类目标"
+        ),
+    )
 
     @field_validator("supported_experience_spec_versions")
     @classmethod
@@ -299,6 +306,24 @@ class RuntimeCapabilitiesIn(BaseModel):
                 raise ValueError("experience spec versions must be 1-16 characters")
             if version not in normalized:
                 normalized.append(version)
+        return normalized
+
+    @field_validator("supported_camera_continuous_targets")
+    @classmethod
+    def _validate_camera_continuous_targets(
+        cls, value: list[str] | None
+    ) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for raw in value:
+            target = raw.strip()
+            if not target or len(target) > 64:
+                raise ValueError(
+                    "camera continuous targets must be 1-64 characters"
+                )
+            if target not in normalized:
+                normalized.append(target)
         return normalized
 
 
@@ -428,7 +453,7 @@ class FeedItemOut(BaseModel):
     is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
     following: bool = Field(default=False, description="is_following 的兼容字段")
-    experience_spec_version: Literal["1.0", "1.1", "1.2"] | None = Field(
+    experience_spec_version: Literal["1.0", "1.1", "1.2", "1.3"] | None = Field(
         default=None,
         description="Runtime ExperienceSpec 版本；HTML 内容不携带",
     )
@@ -444,7 +469,7 @@ class FeedItemOut(BaseModel):
         if self.content_type == "runtime":
             if not self.video:
                 raise ValueError("runtime feed item requires video")
-            if self.experience_spec_version not in {"1.0", "1.1", "1.2"}:
+            if self.experience_spec_version not in {"1.0", "1.1", "1.2", "1.3"}:
                 raise ValueError("runtime feed item requires a supported experience_spec_version")
             if self.html_url is not None or self.bridge_version is not None:
                 raise ValueError("runtime feed item cannot contain HTML payload")

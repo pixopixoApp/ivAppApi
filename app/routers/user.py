@@ -803,7 +803,8 @@ def post_user_videos(
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
             supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
-                payload.body.supported_experience_spec_versions
+                payload.body.supported_experience_spec_versions,
+                payload.body.supported_camera_continuous_targets,
             ),
         )
     except CursorError:
@@ -854,7 +855,8 @@ def post_my_videos(
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
             supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
-                payload.body.supported_experience_spec_versions
+                payload.body.supported_experience_spec_versions,
+                payload.body.supported_camera_continuous_targets,
             ),
         )
     except CursorError:
@@ -913,7 +915,8 @@ def post_following_feed(
             cursor_secret=settings.cursor_secret or settings.publish_key,
             public_share_base_url=settings.public_share_base_url,
             supported_runtime_spec_versions=normalize_client_runtime_spec_versions(
-                payload.body.supported_experience_spec_versions
+                payload.body.supported_experience_spec_versions,
+                payload.body.supported_camera_continuous_targets,
             ),
         )
     except CursorError:

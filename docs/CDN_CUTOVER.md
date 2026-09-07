@@ -4,6 +4,28 @@ The canonical public origin is `https://video.pixopixo.cn`. Only immutable
 objects below `/ivapp-media/v1/public/` are eligible. Private objects, signed
 downloads and browser-to-OSS uploads continue to use OSS directly.
 
+Android release APKs use the immutable public sub-prefix
+`/ivapp-media/v1/public/app-releases/android/`. The release command uploads the
+APK directly to OSS, then enqueues the exact CDN URL. Before changing the public
+release manifest it waits only until Alibaba returns a provider task ID:
+
+```bash
+python -m app.cdn_cache prefetch "$CDN_URL" --apply --wait-submitted \
+  --retry-failed
+```
+
+The CDN worker keeps tracking the provider task asynchronously. Android release
+publication does not wait for prefetch to reach 100%; cold requests use the
+normal CDN-to-OSS origin path. Operators can still use `--wait` when a separate
+maintenance workflow genuinely needs completion to be a blocking gate.
+
+If Alibaba Cloud leaves a prefetch task incomplete, an operator may replace only
+that incomplete provider task and submit the same immutable URL again:
+
+```bash
+python -m app.cdn_cache prefetch CDN_URL --apply --resubmit
+```
+
 ## Required environment
 
 ```dotenv

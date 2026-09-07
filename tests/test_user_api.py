@@ -292,6 +292,73 @@ def test_continuous_tap_is_only_served_to_v12_capable_clients(db) -> None:
     assert capable_detail["body"]["items"][0]["item_id"] == "continuous-tap-item"
 
 
+def test_camera_continuous_requires_v13_and_exact_target_capability(db) -> None:
+    _user(db, "snap-author")
+    timeline = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [{
+            "gesture": "camera_continuous",
+            "gate_at_ms": 1000,
+            "vision": {
+                "target": "hand_finger_snap",
+                "camera_facing": "front",
+                "show_preview": True,
+            },
+        }],
+    }
+    spec = compile_runtime_spec(
+        item_id="snap-item",
+        content_mode="single",
+        source=timeline,
+        video_url="/media/snap-item.mp4",
+    )
+    now = datetime.now(timezone.utc)
+    db.add(
+        PublishedVideo(
+            id="snap-item",
+            video_url="/media/snap-item.mp4",
+            timeline=timeline,
+            runtime_spec=spec,
+            runtime_spec_version=spec["version"],
+            version="1",
+            user_id="snap-author",
+            content_mode="single",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.commit()
+    versions_only = {
+        "supported_experience_spec_versions": ["1.0", "1.1", "1.2", "1.3"],
+    }
+    capable = {
+        **versions_only,
+        "supported_camera_continuous_targets": ["hand_finger_snap"],
+    }
+
+    with TestClient(app) as client:
+        missing_target = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "snap-item", **versions_only},
+            },
+        ).json()
+        supported = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {"video_id": "snap-item", **capable},
+            },
+        ).json()
+
+    assert missing_target["head"]["status"] == 100
+    assert supported["head"]["status"] == 0
+    item = supported["body"]["items"][0]
+    assert item["experience_spec_version"] == "1.3"
+    assert item["video"][0]["interactions"][0]["type"] == "camera_continuous"
+
+
 def test_feed_fields_circular_cursor_play_count_and_finite_list_pagination(db, monkeypatch) -> None:
     token = _user(db, "viewer")
     _user(db, "author")

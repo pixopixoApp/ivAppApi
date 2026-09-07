@@ -34,6 +34,7 @@ INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "draw_circle": "Draw a circle",
     "erase": "Rub to erase",
     "camera_motion": "Follow the prompt using the front camera",
+    "camera_continuous": "Keep snapping your thumb and middle finger to play",
     "tilt_left": "Tilt left",
     "tilt_right": "Tilt right",
     "shake": "Shake your phone",

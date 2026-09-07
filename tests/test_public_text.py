@@ -39,7 +39,7 @@ def test_script_detection_allows_latin_and_reports_non_latin() -> None:
 
 
 def test_canonical_runtime_and_vision_copy_is_english() -> None:
-    assert len(INTERACTION_INSTRUCTIONS) == 32
+    assert len(INTERACTION_INSTRUCTIONS) == 33
     assert all(
         not detected_non_english_scripts(instruction)
         for instruction in INTERACTION_INSTRUCTIONS.values()

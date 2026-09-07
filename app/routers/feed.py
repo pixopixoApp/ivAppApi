@@ -871,7 +871,8 @@ def post_video(
     user = resolve_current_user(request, db, token)
     limit = payload.body.limit
     supported_runtime_spec_versions = normalize_client_runtime_spec_versions(
-        payload.body.supported_experience_spec_versions
+        payload.body.supported_experience_spec_versions,
+        payload.body.supported_camera_continuous_targets,
     )
     ssid = resolve_ssid(payload.head)
     payload.head.ssid = ssid
@@ -957,7 +958,8 @@ def post_video_detail(
 ) -> VideoDetailResponse:
     video_id = payload.body.video_id.strip()
     supported_runtime_spec_versions = normalize_client_runtime_spec_versions(
-        payload.body.supported_experience_spec_versions
+        payload.body.supported_experience_spec_versions,
+        payload.body.supported_camera_continuous_targets,
     )
     if not video_id:
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)

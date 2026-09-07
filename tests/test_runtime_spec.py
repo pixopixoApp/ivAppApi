@@ -125,7 +125,8 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     )
     interaction = spec["video"][0]["interactions"][0]
 
-    assert spec["version"] == RUNTIME_SPEC_VERSION == "1.2"
+    assert spec["version"] == "1.2"
+    assert RUNTIME_SPEC_VERSION == "1.3"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -278,7 +279,9 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
-    assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset({"1.0", "1.1", "1.2"})
+    assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
+        {"1.0", "1.1", "1.2", "1.3"}
+    )
     spec = compile_runtime_spec(
         item_id="legacy",
         content_mode="single",
@@ -370,6 +373,68 @@ def test_camera_motion_requires_a_whitelisted_semantic_target() -> None:
             content_mode="single",
             source={"interactions": [{"gesture": "camera_motion", "gate_at_ms": 1}]},
             video_url="/media/demo.mp4",
+        )
+
+
+def test_camera_continuous_compiles_as_v13_finger_snap_lease() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [
+            {
+                "gesture": "camera_continuous",
+                "gate_at_ms": 1000,
+                "vision": {
+                    "target": "hand_finger_snap",
+                    "camera_facing": "front",
+                    "show_preview": True,
+                },
+            },
+            {"gesture": "tap", "gate_at_ms": 6000},
+        ],
+    }
+    spec = compile_runtime_spec(
+        item_id="snap-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/snap-demo.mp4",
+    )
+    interaction = spec["video"][0]["interactions"][0]
+
+    assert spec["version"] == "1.3"
+    assert interaction["type"] == "camera_continuous"
+    assert interaction["pause_video"] is True
+    assert interaction["detection"] == {
+        "confidence_threshold": 0.85,
+        "response_window_ms": 0,
+        "place": "middle_bottom",
+        "idle_timeout_ms": 1100,
+        "vision": {
+            "registry_version": "v1",
+            "target": "hand_finger_snap",
+            "camera_facing": "front",
+            "show_preview": True,
+            "signal_kind": "pulse",
+            "detector_profile": "finger_snap_v1",
+        },
+    }
+    assert read_runtime_spec(
+        spec,
+        item_id="snap-demo",
+        version="1.3",
+    )[0].interactions[0].type == "camera_continuous"
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.2"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.3"):
+        read_runtime_spec(downgraded, item_id="snap-demo", version="1.2")
+
+    source["interactions"][0]["vision"]["target"] = "hand_open_palm"
+    with pytest.raises(RuntimeSpecError, match="must be hand_finger_snap"):
+        compile_runtime_spec(
+            item_id="snap-demo",
+            content_mode="single",
+            source=source,
+            video_url="/media/snap-demo.mp4",
         )
 
 

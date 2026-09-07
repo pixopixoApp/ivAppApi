@@ -8,12 +8,15 @@ import pytest
 
 from app.cdn_cache import (
     AlibabaCdnProvider,
+    CdnCacheError,
     CdnSubmission,
     CdnTaskResult,
     active_public_urls,
     enqueue_prefetch,
     enqueue_refresh,
     process_once,
+    wait_for_cache_jobs,
+    wait_for_cache_jobs_submitted,
 )
 from app.cdn_publication import CdnPublicationError, stage_publication_gate
 from app.config import get_settings
@@ -160,6 +163,124 @@ def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, d
             settings,
             [f"{OLD_OSS}{PUBLIC_PREFIX}runtime/work/pub/single.mp4"],
         )
+
+
+def test_failed_prefetch_can_be_requeued_and_waited_for(monkeypatch, db) -> None:
+    settings = _settings(monkeypatch)
+    url = f"{CDN}{PUBLIC_PREFIX}app-releases/android/pixo.apk"
+    job = enqueue_prefetch(db, settings, [url])[0]
+    job.state = "failed"
+    job.attempts = 3
+    job.error_message = "temporary provider error"
+    db.add(job)
+    db.commit()
+
+    retried = enqueue_prefetch(db, settings, [url], retry_failed=True)
+    db.commit()
+    assert retried[0].state == "pending"
+    assert retried[0].attempts == 0
+    assert retried[0].error_message == ""
+
+    retried[0].provider_task_id = "stuck-provider-task"
+    retried[0].state = "pending"
+    retried[0].attempts = 1
+    db.add(retried[0])
+    db.commit()
+    resubmitted = enqueue_prefetch(db, settings, [url], force=True)
+    db.commit()
+    assert resubmitted[0].state == "pending"
+    assert resubmitted[0].attempts == 0
+    assert resubmitted[0].provider_task_id == ""
+
+    resubmitted[0].state = "succeeded"
+    db.add(resubmitted[0])
+    db.commit()
+    assert wait_for_cache_jobs(db, [resubmitted[0].id], timeout_seconds=1) == {
+        resubmitted[0].id: "succeeded"
+    }
+
+
+def test_wait_for_cache_jobs_reports_failure_and_timeout(monkeypatch, db) -> None:
+    settings = _settings(monkeypatch)
+    failed = enqueue_prefetch(
+        db,
+        settings,
+        [f"{CDN}{PUBLIC_PREFIX}app-releases/android/failed.apk"],
+    )[0]
+    failed.state = "failed"
+    failed.error_message = "provider rejected the APK"
+    pending = enqueue_prefetch(
+        db,
+        settings,
+        [f"{CDN}{PUBLIC_PREFIX}app-releases/android/pending.apk"],
+    )[0]
+    db.add_all([failed, pending])
+    db.commit()
+
+    with pytest.raises(CdnCacheError, match="provider rejected the APK"):
+        wait_for_cache_jobs(db, [failed.id], timeout_seconds=1)
+
+    monotonic = iter([0.0, 1.0])
+    monkeypatch.setattr("app.cdn_cache.time.monotonic", lambda: next(monotonic))
+    with pytest.raises(CdnCacheError, match="timed out"):
+        wait_for_cache_jobs(db, [pending.id], timeout_seconds=0.5)
+
+
+def test_wait_for_cache_jobs_refreshes_the_database_snapshot(monkeypatch) -> None:
+    class SnapshotSession:
+        def __init__(self) -> None:
+            self.rollbacks = 0
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def expire_all(self) -> None:
+            pass
+
+        def get(self, _model, job_id):
+            state = "pending" if self.rollbacks == 1 else "succeeded"
+            return SimpleNamespace(id=job_id, state=state, error_message="")
+
+    session = SnapshotSession()
+    monkeypatch.setattr("app.cdn_cache.time.sleep", lambda _seconds: None)
+    assert wait_for_cache_jobs(
+        session,
+        ["job-1"],
+        timeout_seconds=1,
+        poll_seconds=0.01,
+    ) == {"job-1": "succeeded"}
+    assert session.rollbacks == 2
+
+
+def test_wait_for_cache_jobs_submitted_stops_at_provider_acceptance(monkeypatch) -> None:
+    class SubmissionSession:
+        def __init__(self) -> None:
+            self.rollbacks = 0
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def expire_all(self) -> None:
+            pass
+
+        def get(self, _model, job_id):
+            provider_id = "" if self.rollbacks == 1 else "provider-123"
+            return SimpleNamespace(
+                id=job_id,
+                state="pending",
+                error_message="",
+                provider_task_id=provider_id,
+            )
+
+    session = SubmissionSession()
+    monkeypatch.setattr("app.cdn_cache.time.sleep", lambda _seconds: None)
+    assert wait_for_cache_jobs_submitted(
+        session,
+        ["job-1"],
+        timeout_seconds=1,
+        poll_seconds=0.01,
+    ) == {"job-1": "provider-123"}
+    assert session.rollbacks == 2
 
 
 @pytest.mark.parametrize("provider_status", ["Failed", "Timeout", "Canceled"])

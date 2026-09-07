@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -94,6 +95,7 @@ def enqueue_cache_urls(
     operation: CacheOperation,
     urls: Iterable[str],
     force: bool = False,
+    retry_failed: bool = False,
 ) -> list[CdnCacheJob]:
     """Insert idempotent outbox rows in the caller's existing transaction."""
     if not settings.cdn_cache_enabled:
@@ -132,7 +134,7 @@ def enqueue_cache_urls(
                 updated_at=now,
             )
             db.add(job)
-        elif force:
+        elif force or (retry_failed and job.state == "failed"):
             job.state = "pending"
             job.attempts = 0
             job.next_attempt_at = now
@@ -150,13 +152,108 @@ def enqueue_prefetch(
     db: Session,
     settings: Settings,
     urls: Iterable[str],
+    *,
+    retry_failed: bool = False,
+    force: bool = False,
 ) -> list[CdnCacheJob]:
     return enqueue_cache_urls(
         db,
         settings,
         operation="prefetch",
         urls=urls,
+        retry_failed=retry_failed,
+        force=force,
     )
+
+
+def wait_for_cache_jobs(
+    db: Session,
+    job_ids: Iterable[str],
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 5.0,
+) -> dict[str, str]:
+    """Wait for existing CDN jobs without processing them in this process."""
+    ids = sorted(set(job_ids))
+    if not ids:
+        raise CdnCacheError("no CDN cache jobs were enqueued")
+    if timeout_seconds <= 0:
+        raise CdnCacheError("CDN wait timeout must be positive")
+    if poll_seconds <= 0:
+        raise CdnCacheError("CDN wait poll interval must be positive")
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        # MySQL defaults to REPEATABLE READ. End the previous read-only
+        # transaction so each poll observes commits made by the worker.
+        db.rollback()
+        db.expire_all()
+        rows = [db.get(CdnCacheJob, job_id) for job_id in ids]
+        if any(row is None for row in rows):
+            raise CdnCacheError("a CDN cache job disappeared while waiting")
+        states = {row.id: row.state for row in rows if row is not None}
+        failures = [
+            row for row in rows if row is not None and row.state == "failed"
+        ]
+        if failures:
+            detail = next(
+                (row.error_message for row in failures if row.error_message),
+                "CDN prefetch failed",
+            )
+            raise CdnCacheError(detail)
+        if states and set(states.values()) == {"succeeded"}:
+            return states
+        if time.monotonic() >= deadline:
+            pending = ", ".join(
+                f"{job_id}:{state}" for job_id, state in sorted(states.items())
+            )
+            raise CdnCacheError(f"timed out waiting for CDN jobs: {pending}")
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def wait_for_cache_jobs_submitted(
+    db: Session,
+    job_ids: Iterable[str],
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 1.0,
+) -> dict[str, str]:
+    """Wait only until Alibaba accepts each job and returns a provider task ID."""
+    ids = sorted(set(job_ids))
+    if not ids:
+        raise CdnCacheError("no CDN cache jobs were enqueued")
+    if timeout_seconds <= 0:
+        raise CdnCacheError("CDN submission timeout must be positive")
+    if poll_seconds <= 0:
+        raise CdnCacheError("CDN submission poll interval must be positive")
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        db.rollback()
+        db.expire_all()
+        rows = [db.get(CdnCacheJob, job_id) for job_id in ids]
+        if any(row is None for row in rows):
+            raise CdnCacheError("a CDN cache job disappeared before submission")
+        failures = [row for row in rows if row is not None and row.state == "failed"]
+        if failures:
+            detail = next(
+                (row.error_message for row in failures if row.error_message),
+                "CDN prefetch submission failed",
+            )
+            raise CdnCacheError(detail)
+        provider_ids = {
+            row.id: row.provider_task_id
+            for row in rows
+            if row is not None and row.provider_task_id
+        }
+        if len(provider_ids) == len(ids):
+            return provider_ids
+        if time.monotonic() >= deadline:
+            missing = ", ".join(job_id for job_id in ids if job_id not in provider_ids)
+            raise CdnCacheError(
+                f"timed out waiting for CDN task submission: {missing}"
+            )
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
 
 def enqueue_refresh(
@@ -550,6 +647,26 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     prewarm = subparsers.add_parser("prewarm", help="enqueue active public objects")
     prewarm.add_argument("--apply", action="store_true")
+    prefetch = subparsers.add_parser(
+        "prefetch",
+        help="enqueue exact immutable public URLs",
+    )
+    prefetch.add_argument("urls", nargs="+")
+    prefetch.add_argument("--apply", action="store_true")
+    prefetch.add_argument("--wait", action="store_true")
+    prefetch.add_argument(
+        "--wait-submitted",
+        action="store_true",
+        help="wait only until Alibaba returns a provider task ID",
+    )
+    prefetch.add_argument("--retry-failed", action="store_true")
+    prefetch.add_argument(
+        "--resubmit",
+        action="store_true",
+        help="replace an incomplete provider task and submit the URL again",
+    )
+    prefetch.add_argument("--timeout", type=float, default=2100.0)
+    prefetch.add_argument("--poll-seconds", type=float, default=5.0)
     refresh = subparsers.add_parser("refresh", help="enqueue an exact-file emergency refresh")
     refresh.add_argument("urls", nargs="+")
     refresh.add_argument("--apply", action="store_true")
@@ -566,6 +683,46 @@ def main() -> int:
                 output = {"discovered": len(urls), "enqueued": len(jobs)}
             else:
                 output = {"discovered": len(urls), "enqueued": 0, "dry_run": True}
+        elif args.command == "prefetch":
+            if (args.wait or args.wait_submitted) and not args.apply:
+                raise CdnCacheError("CDN wait options require --apply")
+            if args.wait and args.wait_submitted:
+                raise CdnCacheError("choose --wait or --wait-submitted, not both")
+            if not settings.cdn_cache_enabled:
+                raise CdnCacheError("CDN cache processing is disabled")
+            if not settings.cdn_prefetch_on_publish:
+                raise CdnCacheError("CDN prefetch-on-publish is disabled")
+            urls = [require_canonical_public_url(settings, item) for item in args.urls]
+            if args.apply:
+                jobs = enqueue_prefetch(
+                    db,
+                    settings,
+                    urls,
+                    retry_failed=args.retry_failed,
+                    force=args.resubmit,
+                )
+                db.commit()
+                output: dict[str, object] = {
+                    "validated": len(urls),
+                    "enqueued": len(jobs),
+                    "job_ids": [job.id for job in jobs],
+                }
+                if args.wait:
+                    output["states"] = wait_for_cache_jobs(
+                        db,
+                        [job.id for job in jobs],
+                        timeout_seconds=args.timeout,
+                        poll_seconds=args.poll_seconds,
+                    )
+                elif args.wait_submitted:
+                    output["provider_task_ids"] = wait_for_cache_jobs_submitted(
+                        db,
+                        [job.id for job in jobs],
+                        timeout_seconds=args.timeout,
+                        poll_seconds=args.poll_seconds,
+                    )
+            else:
+                output = {"validated": len(urls), "enqueued": 0, "dry_run": True}
         elif args.command == "refresh":
             urls = [require_canonical_public_url(settings, item) for item in args.urls]
             if args.apply:
