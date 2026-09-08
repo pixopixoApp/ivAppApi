@@ -31,18 +31,18 @@ def utcnow() -> datetime:
 
 
 def _aware_utc_isoformat(value: datetime | None) -> str:
-    """Render a datetime with an explicit UTC offset.
+    """Render a datetime as a pure calendar date (``YYYY-MM-DD``).
 
     MySQL ``DATETIME`` columns are read back as naive datetimes even though we
-    always write UTC.  Google sitemaps reject naive datetimes (for example a
-    ``<video:publication_date>`` of ``2026-09-07T13:40:52``), so attach the UTC
-    offset before serialising: ``2026-09-07T13:40:52+00:00``.
+    always write UTC.  Google sitemaps are most robust with plain dates (for
+    example ``<lastmod>`` and ``<video:publication_date>`` accept ``YYYY-MM-DD``),
+    so serialise only the calendar date part.
     """
     if value is None:
         return ""
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.isoformat()
+    return value.date().isoformat()
 
 
 def is_placeholder_text(value: str | None) -> bool:

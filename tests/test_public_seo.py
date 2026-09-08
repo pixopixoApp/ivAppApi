@@ -108,9 +108,9 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
         listing.json()["items"][0]["canonical_url"]
     )
     item = listing.json()["items"][0]
-    # Google sitemaps reject naive datetimes, so dates must carry an offset.
-    assert item["created_at"].endswith("+00:00")
-    assert item["updated_at"].endswith("+00:00")
+    # Google sitemaps prefer a pure calendar date over a datetime.
+    assert item["created_at"] == item["created_at"][:10]
+    assert item["updated_at"] == item["updated_at"][:10]
     assert detail.status_code == 200
     assert detail.json()["canonical_url"].endswith(f"/experiences/{slug}")
     assert resolved.json()["canonical_url"] == detail.json()["canonical_url"]
