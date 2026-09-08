@@ -30,6 +30,21 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _aware_utc_isoformat(value: datetime | None) -> str:
+    """Render a datetime with an explicit UTC offset.
+
+    MySQL ``DATETIME`` columns are read back as naive datetimes even though we
+    always write UTC.  Google sitemaps reject naive datetimes (for example a
+    ``<video:publication_date>`` of ``2026-09-07T13:40:52``), so attach the UTC
+    offset before serialising: ``2026-09-07T13:40:52+00:00``.
+    """
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
 def is_placeholder_text(value: str | None) -> bool:
     text = re.sub(r"\s+", " ", (value or "").strip()).lower()
     if not text or text in _PLACEHOLDERS:
@@ -197,8 +212,10 @@ def seo_public_item(
         # response field for compatibility without publishing a duplicate
         # query-parameter URL.
         "embed_url": canonical,
-        "created_at": row.created_at.isoformat() if row.created_at else "",
-        "updated_at": max(
-            value for value in (row.updated_at, seo.updated_at) if value is not None
-        ).isoformat(),
+        "created_at": _aware_utc_isoformat(row.created_at),
+        "updated_at": _aware_utc_isoformat(
+            max(
+                value for value in (row.updated_at, seo.updated_at) if value is not None
+            )
+        ),
     }
