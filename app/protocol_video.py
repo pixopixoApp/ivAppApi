@@ -29,16 +29,24 @@ log = logging.getLogger(__name__)
 
 _CONF = 0.85
 # v1.1 adds ``video[].on_end`` and continuous_swipe. v1.2 adds
-# continuous_tap. v1.3 adds camera_continuous. Compilation deliberately keeps
-# content on the oldest compatible version so clients can negotiate safely.
+# continuous_tap. v1.3 adds finger-snap camera_continuous; v1.4 adds the
+# finger-gun recoil target; v1.5 adds sustained microphone blowing; v1.6 adds
+# sustained microphone voice/level playback.
+# Compilation deliberately keeps content on the oldest compatible version.
 BASE_RUNTIME_SPEC_VERSION = "1.1"
 CONTINUOUS_TAP_RUNTIME_SPEC_VERSION = "1.2"
-RUNTIME_SPEC_VERSION = "1.3"
+CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION = "1.3"
+FINGER_GUN_RUNTIME_SPEC_VERSION = "1.4"
+CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION = "1.5"
+RUNTIME_SPEC_VERSION = "1.6"
 SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
     {
         "1.0",
         BASE_RUNTIME_SPEC_VERSION,
         CONTINUOUS_TAP_RUNTIME_SPEC_VERSION,
+        CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION,
+        FINGER_GUN_RUNTIME_SPEC_VERSION,
+        CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
         RUNTIME_SPEC_VERSION,
     }
 )
@@ -112,11 +120,25 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
         "min_duration_ms": 300,
         "min_volume_score": 55,
     },
+    "mic_level_continuous": {
+        **_MOTION_BOT,
+        "response_window_ms": 0,
+        "min_duration_ms": 160,
+        "min_volume_score": 45,
+        "idle_timeout_ms": 450,
+    },
     "mic_blow": {
         **_MOTION_BOT,
         "response_window_ms": 0,
         "min_duration_ms": 300,
         "min_volume_score": 55,
+    },
+    "mic_blow_continuous": {
+        **_MOTION_BOT,
+        "response_window_ms": 0,
+        "min_duration_ms": 160,
+        "min_volume_score": 55,
+        "idle_timeout_ms": 450,
     },
     "mic_clap": {**_MOTION_BOT, "response_window_ms": 0, "min_volume_score": 55},
     "mic_quiet": {
@@ -182,8 +204,15 @@ def normalize_client_runtime_spec_versions(
     camera_targets = frozenset(
         declared_camera_continuous_targets or []
     ).intersection(supported_camera_continuous_targets())
-    if not camera_targets:
-        versions = versions.difference({RUNTIME_SPEC_VERSION})
+    required_camera_targets = {
+        CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION: frozenset({"hand_finger_snap"}),
+        FINGER_GUN_RUNTIME_SPEC_VERSION: frozenset(
+            {"hand_finger_snap", "hand_finger_gun_recoil"}
+        ),
+    }
+    for version, required_targets in required_camera_targets.items():
+        if not required_targets.issubset(camera_targets):
+            versions = versions.difference({version})
     return versions
 
 
@@ -231,6 +260,8 @@ def _validate_sustained_source(
         "continuous_swipe",
         "continuous_tap",
         "camera_continuous",
+        "mic_blow_continuous",
+        "mic_level_continuous",
     }
     if not any(
         isinstance(item, dict) and item.get("gesture") in sustained_types
@@ -329,6 +360,8 @@ def _one_interaction(item: dict, *, index: int) -> dict:
         "continuous_swipe",
         "continuous_tap",
         "camera_continuous",
+        "mic_blow_continuous",
+        "mic_level_continuous",
     }
     if sustained:
         on_success, on_miss = dict(_ACTION_CONTINUE), dict(_ACTION_CONTINUE)
@@ -582,8 +615,20 @@ def compile_runtime_spec(
         for clip in clips
         for interaction in clip["interactions"]
     }
-    if "camera_continuous" in interaction_types:
+    camera_continuous_targets = {
+        interaction.get("detection", {}).get("vision", {}).get("target")
+        for clip in clips
+        for interaction in clip["interactions"]
+        if interaction["type"] == "camera_continuous"
+    }
+    if "mic_level_continuous" in interaction_types:
         compiled_version = RUNTIME_SPEC_VERSION
+    elif "mic_blow_continuous" in interaction_types:
+        compiled_version = CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION
+    elif "hand_finger_gun_recoil" in camera_continuous_targets:
+        compiled_version = FINGER_GUN_RUNTIME_SPEC_VERSION
+    elif "camera_continuous" in interaction_types:
+        compiled_version = CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION
     elif "continuous_tap" in interaction_types:
         compiled_version = CONTINUOUS_TAP_RUNTIME_SPEC_VERSION
     else:
@@ -647,9 +692,16 @@ def read_runtime_spec(
                 raise RuntimeSpecError("continuous_swipe requires runtime spec version 1.1")
             if version in {"1.0", "1.1"} and interaction.type == "continuous_tap":
                 raise RuntimeSpecError("continuous_tap requires runtime spec version 1.2")
-            if version != "1.3" and interaction.type == "camera_continuous":
+            if (
+                version not in {
+                    CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION,
+                    FINGER_GUN_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }
+                and interaction.type == "camera_continuous"
+            ):
                 raise RuntimeSpecError(
-                    "camera_continuous requires runtime spec version 1.3"
+                    "camera_continuous requires runtime spec version 1.3 or later"
                 )
             if interaction.detection.response_window_ms < 0:
                 raise RuntimeSpecError("interaction response_window_ms must be non-negative")
@@ -730,11 +782,79 @@ def read_runtime_spec(
                         "camera_continuous must end at a later interaction"
                     )
                 try:
-                    normalize_camera_continuous_config(
+                    normalized_camera = normalize_camera_continuous_config(
                         (interaction.detection.model_extra or {}).get("vision")
                     )
                 except CameraContinuousTargetError as exc:
                     raise RuntimeSpecError(str(exc)) from exc
+                if (
+                    version == CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION
+                    and normalized_camera["target"] != "hand_finger_snap"
+                ):
+                    raise RuntimeSpecError(
+                        "hand_finger_gun_recoil requires runtime spec version 1.4"
+                    )
+            if interaction.type == "mic_blow_continuous":
+                detection = interaction.detection
+                if version not in {
+                    CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }:
+                    raise RuntimeSpecError(
+                        "mic_blow_continuous requires runtime spec version 1.5"
+                    )
+                if (
+                    interaction.offset_time_ms is None
+                    or interaction.pause_video is not True
+                    or detection.response_window_ms != 0
+                    or detection.place != "middle_bottom"
+                    or detection.min_duration_ms != 160
+                    or detection.min_volume_score != 55
+                    or detection.idle_timeout_ms != 450
+                    or interaction.on_success.action != "continue"
+                    or interaction.on_miss.action != "continue"
+                ):
+                    raise RuntimeSpecError(
+                        "mic_blow_continuous persisted contract is invalid"
+                    )
+                next_offset = (
+                    clip.interactions[index + 1].offset_time_ms
+                    if index + 1 < len(clip.interactions)
+                    else None
+                )
+                if next_offset is not None and next_offset <= interaction.offset_time_ms:
+                    raise RuntimeSpecError(
+                        "mic_blow_continuous must end at a later interaction"
+                    )
+            if interaction.type == "mic_level_continuous":
+                detection = interaction.detection
+                if version != RUNTIME_SPEC_VERSION:
+                    raise RuntimeSpecError(
+                        "mic_level_continuous requires runtime spec version 1.6"
+                    )
+                if (
+                    interaction.offset_time_ms is None
+                    or interaction.pause_video is not True
+                    or detection.response_window_ms != 0
+                    or detection.place != "middle_bottom"
+                    or detection.min_duration_ms != 160
+                    or detection.min_volume_score != 45
+                    or detection.idle_timeout_ms != 450
+                    or interaction.on_success.action != "continue"
+                    or interaction.on_miss.action != "continue"
+                ):
+                    raise RuntimeSpecError(
+                        "mic_level_continuous persisted contract is invalid"
+                    )
+                next_offset = (
+                    clip.interactions[index + 1].offset_time_ms
+                    if index + 1 < len(clip.interactions)
+                    else None
+                )
+                if next_offset is not None and next_offset <= interaction.offset_time_ms:
+                    raise RuntimeSpecError(
+                        "mic_level_continuous must end at a later interaction"
+                    )
     for clip in clips:
         if (
             clip.on_end is not None
