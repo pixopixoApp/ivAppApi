@@ -459,7 +459,9 @@ class FeedItemOut(BaseModel):
     is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
     following: bool = Field(default=False, description="is_following 的兼容字段")
-    experience_spec_version: Literal["1.0", "1.1", "1.2", "1.3"] | None = Field(
+    experience_spec_version: Literal[
+        "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"
+    ] | None = Field(
         default=None,
         description="Runtime ExperienceSpec 版本；HTML 内容不携带",
     )
@@ -475,7 +477,9 @@ class FeedItemOut(BaseModel):
         if self.content_type == "runtime":
             if not self.video:
                 raise ValueError("runtime feed item requires video")
-            if self.experience_spec_version not in {"1.0", "1.1", "1.2", "1.3"}:
+            if self.experience_spec_version not in {
+                "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"
+            }:
                 raise ValueError("runtime feed item requires a supported experience_spec_version")
             if self.html_url is not None or self.bridge_version is not None:
                 raise ValueError("runtime feed item cannot contain HTML payload")

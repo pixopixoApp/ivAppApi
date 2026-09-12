@@ -126,7 +126,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     interaction = spec["video"][0]["interactions"][0]
 
     assert spec["version"] == "1.2"
-    assert RUNTIME_SPEC_VERSION == "1.3"
+    assert RUNTIME_SPEC_VERSION == "1.6"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -150,6 +150,118 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
             downgraded,
             item_id="continuous-tap-demo",
             version="1.1",
+        )
+
+
+def test_continuous_blow_compiles_as_v15_with_fixed_audio_lease() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [
+            {"gesture": "mic_blow_continuous", "gate_at_ms": 1000},
+            {"gesture": "tap", "gate_at_ms": 6000},
+        ],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-blow-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/continuous-blow-demo.mp4",
+    )
+    interaction = spec["video"][0]["interactions"][0]
+
+    assert spec["version"] == "1.5"
+    assert interaction == {
+        "id": "action_001",
+        "type": "mic_blow_continuous",
+        "description": "Keep blowing at the target volume to play",
+        "offset_time_ms": 1000,
+        "pause_video": True,
+        "detection": {
+            "confidence_threshold": 0.85,
+            "response_window_ms": 0,
+            "place": "middle_bottom",
+            "min_duration_ms": 160,
+            "min_volume_score": 55,
+            "idle_timeout_ms": 450,
+        },
+        "feedback": {
+            "animation": "none",
+            "animation_duration_ms": 0,
+            "vibrate": False,
+            "sound_effect": "",
+        },
+        "on_success": {"action": "continue"},
+        "on_miss": {"action": "continue"},
+    }
+    assert read_runtime_spec(
+        spec,
+        item_id="continuous-blow-demo",
+        version="1.5",
+    )[0].interactions[0].type == "mic_blow_continuous"
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.4"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.5"):
+        read_runtime_spec(
+            downgraded,
+            item_id="continuous-blow-demo",
+            version="1.4",
+        )
+
+
+def test_continuous_voice_compiles_as_v16_with_fixed_audio_lease() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [
+            {"gesture": "mic_level_continuous", "gate_at_ms": 1000},
+            {"gesture": "tap", "gate_at_ms": 6000},
+        ],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-voice-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/continuous-voice-demo.mp4",
+    )
+    interaction = spec["video"][0]["interactions"][0]
+
+    assert spec["version"] == "1.6"
+    assert interaction == {
+        "id": "action_001",
+        "type": "mic_level_continuous",
+        "description": "Keep your voice in the target pitch range",
+        "offset_time_ms": 1000,
+        "pause_video": True,
+        "detection": {
+            "confidence_threshold": 0.85,
+            "response_window_ms": 0,
+            "place": "middle_bottom",
+            "min_duration_ms": 160,
+            "min_volume_score": 45,
+            "idle_timeout_ms": 450,
+        },
+        "feedback": {
+            "animation": "none",
+            "animation_duration_ms": 0,
+            "vibrate": False,
+            "sound_effect": "",
+        },
+        "on_success": {"action": "continue"},
+        "on_miss": {"action": "continue"},
+    }
+    assert read_runtime_spec(
+        spec,
+        item_id="continuous-voice-demo",
+        version="1.6",
+    )[0].interactions[0].type == "mic_level_continuous"
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.5"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.6"):
+        read_runtime_spec(
+            downgraded,
+            item_id="continuous-voice-demo",
+            version="1.5",
         )
 
 
@@ -280,7 +392,7 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
     assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
-        {"1.0", "1.1", "1.2", "1.3"}
+        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}
     )
     spec = compile_runtime_spec(
         item_id="legacy",
@@ -425,17 +537,63 @@ def test_camera_continuous_compiles_as_v13_finger_snap_lease() -> None:
 
     downgraded = copy.deepcopy(spec)
     downgraded["version"] = "1.2"
-    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.3"):
+    with pytest.raises(RuntimeSpecError, match="version 1.3 or later"):
         read_runtime_spec(downgraded, item_id="snap-demo", version="1.2")
 
     source["interactions"][0]["vision"]["target"] = "hand_open_palm"
-    with pytest.raises(RuntimeSpecError, match="must be hand_finger_snap"):
+    with pytest.raises(RuntimeSpecError, match="target is unsupported"):
         compile_runtime_spec(
             item_id="snap-demo",
             content_mode="single",
             source=source,
             video_url="/media/snap-demo.mp4",
         )
+
+
+def test_finger_gun_recoil_compiles_as_v14_camera_continuous_target() -> None:
+    source = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [{
+            "gesture": "camera_continuous",
+            "gate_at_ms": 1000,
+            "vision": {"target": "hand_finger_gun_recoil"},
+        }],
+    }
+
+    spec = compile_runtime_spec(
+        item_id="finger-gun-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/finger-gun-demo.mp4",
+    )
+    vision = spec["video"][0]["interactions"][0]["detection"]["vision"]
+
+    assert spec["version"] == "1.4"
+    assert vision == {
+        "registry_version": "v1",
+        "target": "hand_finger_gun_recoil",
+        "camera_facing": "front",
+        "show_preview": True,
+        "signal_kind": "pulse",
+        "detector_profile": "finger_gun_recoil_v1",
+    }
+    assert read_runtime_spec(
+        spec,
+        item_id="finger-gun-demo",
+        version="1.4",
+    )[0].interactions[0].type == "camera_continuous"
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.3"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.4"):
+        read_runtime_spec(downgraded, item_id="finger-gun-demo", version="1.3")
+
+    mismatched = copy.deepcopy(spec)
+    mismatched["video"][0]["interactions"][0]["detection"]["vision"][
+        "detector_profile"
+    ] = "finger_snap_v1"
+    with pytest.raises(RuntimeSpecError, match="detector_profile does not match"):
+        read_runtime_spec(mismatched, item_id="finger-gun-demo", version="1.4")
 
 
 def test_backfill_updates_good_rows_and_preserves_bad_rows(db) -> None:

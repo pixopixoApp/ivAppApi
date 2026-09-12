@@ -359,6 +359,122 @@ def test_camera_continuous_requires_v13_and_exact_target_capability(db) -> None:
     assert item["video"][0]["interactions"][0]["type"] == "camera_continuous"
 
 
+def test_finger_gun_requires_v14_and_complete_camera_target_capability(db) -> None:
+    _user(db, "finger-gun-author")
+    timeline = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [{
+            "gesture": "camera_continuous",
+            "gate_at_ms": 1000,
+            "vision": {"target": "hand_finger_gun_recoil"},
+        }],
+    }
+    spec = compile_runtime_spec(
+        item_id="finger-gun-item",
+        content_mode="single",
+        source=timeline,
+        video_url="/media/finger-gun-item.mp4",
+    )
+    now = datetime.now(timezone.utc)
+    db.add(
+        PublishedVideo(
+            id="finger-gun-item",
+            video_url="/media/finger-gun-item.mp4",
+            timeline=timeline,
+            runtime_spec=spec,
+            runtime_spec_version=spec["version"],
+            version="1",
+            user_id="finger-gun-author",
+            content_mode="single",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.commit()
+    versions = {
+        "supported_experience_spec_versions": ["1.0", "1.1", "1.2", "1.3", "1.4"],
+    }
+
+    def detail_for(targets: list[str]) -> dict:
+        with TestClient(app) as client:
+            return client.post(
+                "/video_detail",
+                json={
+                    "head": {"act": "video_detail", "ver": "1.2"},
+                    "body": {
+                        "video_id": "finger-gun-item",
+                        **versions,
+                        "supported_camera_continuous_targets": targets,
+                    },
+                },
+            ).json()
+
+    assert detail_for(["hand_finger_snap"])["head"]["status"] == 100
+    assert detail_for(["hand_finger_gun_recoil"])["head"]["status"] == 100
+    supported = detail_for(
+        ["hand_finger_snap", "hand_finger_gun_recoil"]
+    )
+    assert supported["head"]["status"] == 0
+    assert supported["body"]["items"][0]["experience_spec_version"] == "1.4"
+
+
+def test_continuous_voice_is_only_served_to_v16_capable_clients(db) -> None:
+    _user(db, "voice-author")
+    timeline = {
+        "media": {"duration_ms": 10_000},
+        "interactions": [{
+            "gesture": "mic_level_continuous",
+            "gate_at_ms": 1000,
+        }],
+    }
+    spec = compile_runtime_spec(
+        item_id="continuous-voice-item",
+        content_mode="single",
+        source=timeline,
+        video_url="/media/continuous-voice-item.mp4",
+    )
+    now = datetime.now(timezone.utc)
+    db.add(
+        PublishedVideo(
+            id="continuous-voice-item",
+            video_url="/media/continuous-voice-item.mp4",
+            timeline=timeline,
+            runtime_spec=spec,
+            runtime_spec_version=spec["version"],
+            version="1",
+            user_id="voice-author",
+            content_mode="single",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.commit()
+
+    def detail_for(versions: list[str]) -> dict:
+        with TestClient(app) as client:
+            return client.post(
+                "/video_detail",
+                json={
+                    "head": {"act": "video_detail", "ver": "1.2"},
+                    "body": {
+                        "video_id": "continuous-voice-item",
+                        "supported_experience_spec_versions": versions,
+                    },
+                },
+            ).json()
+
+    assert detail_for(["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"])[
+        "head"
+    ]["status"] == 100
+    supported = detail_for(
+        ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"]
+    )
+    assert supported["head"]["status"] == 0
+    item = supported["body"]["items"][0]
+    assert item["experience_spec_version"] == "1.6"
+    assert item["video"][0]["interactions"][0]["type"] == "mic_level_continuous"
+
+
 def test_feed_fields_circular_cursor_play_count_and_finite_list_pagination(db, monkeypatch) -> None:
     token = _user(db, "viewer")
     _user(db, "author")

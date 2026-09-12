@@ -1,13 +1,13 @@
 """Canonical English copy embedded in public runtime specifications.
 
-The values mirror Pixo Runtime interaction catalog 3.2.0.  Source timelines and
+The values mirror Pixo Runtime interaction catalog 3.5.0.  Source timelines and
 model output are editable evidence; this catalog owns the text presented by
 published App/Web experiences.
 """
 
 from __future__ import annotations
 
-PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.2.0-en"
+PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.5.0-en"
 
 INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "tap": "Tap",
@@ -34,13 +34,15 @@ INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "draw_circle": "Draw a circle",
     "erase": "Rub to erase",
     "camera_motion": "Follow the prompt using the front camera",
-    "camera_continuous": "Keep snapping your thumb and middle finger to play",
+    "camera_continuous": "Keep performing the camera gesture to play",
     "tilt_left": "Tilt left",
     "tilt_right": "Tilt right",
     "shake": "Shake your phone",
     "rotate": "Rotate your phone",
     "mic_level": "Make some noise",
+    "mic_level_continuous": "Keep your voice in the target pitch range",
     "mic_blow": "Blow at the mic",
+    "mic_blow_continuous": "Keep blowing at the target volume to play",
     "mic_clap": "Clap once",
     "mic_quiet": "Stay quiet",
 }
