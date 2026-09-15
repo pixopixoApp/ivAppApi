@@ -54,12 +54,47 @@ class AccountDeletionResponse(BaseModel):
 
 
 class CreatorGenerationQuotaOut(BaseModel):
+    unlimited: bool = True
     enabled: bool
     limit: int
     used: int
     reserved: int
     remaining: int
     resets_at: str
+
+
+class CreatorInteractionCapabilityOut(BaseModel):
+    type: str
+    lifecycle: Literal["discrete", "sustained"]
+    capability: Literal["touch", "device_motion", "microphone", "vision"]
+    story_enabled: bool
+
+
+class CreatorInteractionPresetOut(BaseModel):
+    id: str
+    type: str
+    label: str
+    instruction: str
+    category: Literal["screen", "camera", "device_motion", "microphone"]
+    family: str
+    variant_group: str | None = None
+    lifecycle: Literal["discrete", "sustained"]
+    capability: Literal["touch", "device_motion", "microphone", "vision"]
+    story_enabled: bool
+    minimum_runtime_version: str
+    recommended: bool = False
+
+
+class CreatorCapabilitiesOut(BaseModel):
+    creator_contract_version: str = "2"
+    ai_source_enabled: bool = False
+    branch_story_enabled: bool = False
+    ai_source_duration_seconds: int = 3
+    ai_ending_duration_seconds: int = 3
+    credit_per_generated_second: int = 1
+    referral_reward_credits: int = 10
+    supported_interactions: list[CreatorInteractionCapabilityOut] = Field(default_factory=list)
+    interaction_presets: list[CreatorInteractionPresetOut] = Field(default_factory=list)
 
 
 class CreatorAccessOut(BaseModel):
@@ -164,6 +199,9 @@ class CreatorApplicationDecisionRequest(BaseModel):
 
 
 class CreatorUploadOut(BaseModel):
+    original_duration_ms: int | None = None
+    was_trimmed: bool = False
+    prepared_source_url: str | None = None
     upload_id: str
     original_filename: str
     size_bytes: int
@@ -179,6 +217,7 @@ class CreatorUploadOut(BaseModel):
 
 
 class CreatorCreationRequest(BaseModel):
+    defer_analysis: bool = False
     source_mode: Literal["upload", "prompt"] | None = None
     upload_id: str | None = Field(default=None, min_length=1, max_length=64)
     prompt: str = Field(default="", max_length=1000)
@@ -203,6 +242,7 @@ class CreatorSourceRegenerateRequest(BaseModel):
 
 
 class CreatorSourceAcceptRequest(BaseModel):
+    defer_analysis: bool = False
     generation_id: str = Field(min_length=1, max_length=64)
     request_id: str = Field(min_length=1, max_length=128)
 
@@ -232,7 +272,29 @@ class CreatorVersionRequest(BaseModel):
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class CreatorInteractionEdit(BaseModel):
+    model_config = {"extra": "forbid"}
+    interaction_id: str = Field(min_length=1, max_length=64)
+    clip_id: str | None = Field(default=None, max_length=64)
+    type: str = Field(min_length=1, max_length=64)
+    preset_id: str | None = Field(default=None, min_length=1, max_length=96)
+    pinch_direction: Literal["inward", "outward"] | None = None
+    rotation_direction: Literal["clockwise", "counterclockwise"] | None = None
+    vision_target: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class CreatorManualEditRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    base_version_id: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1, max_length=128)
+    edits: list[CreatorInteractionEdit] = Field(min_length=1, max_length=64)
+    preview_interactions: list[dict[str, Any]] = Field(min_length=1, max_length=64)
+    previewed_paths: list[Literal["B", "C"]] = Field(default_factory=list, max_length=2)
+
+
 class CreatorVersionOut(BaseModel):
+    previewed_paths: list[str] = Field(default_factory=list)
+    experience_mode: str = "auto"
     version_id: str
     number: int
     request: str
@@ -243,13 +305,36 @@ class CreatorVersionOut(BaseModel):
     preview_url: str | None = None
     runtime_spec: dict[str, Any] | None = None
     runtime_spec_version: str | None = None
+    manual_edit_options: dict[str, Any] = Field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None
     created_at: str
     updated_at: str
 
 
+class CreatorDraftSummaryOut(BaseModel):
+    creation_id: str
+    initial_request_id: str | None = None
+    title: str
+    source_mode: str
+    experience_mode: str
+    status: str
+    progress_stage: str
+    progress_percent: int
+    duration_ms: int
+    updated_at: str
+
+
+class CreatorDraftPageOut(BaseModel):
+    items: list[CreatorDraftSummaryOut]
+    total: int
+    next_cursor: str | None = None
+
+
 class CreatorCreationOut(BaseModel):
+    experience_mode: str = "auto"
+    source_duration_ms: int = 0
+    story: dict[str, Any] | None = None
     creation_id: str
     upload_id: str | None
     source_mode: Literal["upload", "prompt"] = "upload"
@@ -274,6 +359,33 @@ class CreatorCreationOut(BaseModel):
     updated_at: str
 
 
+class CreatorStoryPlanRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    revision: int = Field(default=0, ge=0)
+    interaction_type: str = Field(min_length=1, max_length=64)
+    interaction_preset_id: str | None = Field(default=None, min_length=1, max_length=96)
+    pinch_direction: Literal["inward", "outward"] | None = None
+    rotation_direction: Literal["clockwise", "counterclockwise"] | None = None
+    vision_target: str | None = Field(default=None, min_length=1, max_length=64)
+    success_prompt: str = Field(default="", max_length=1000)
+    miss_prompt: str = Field(default="", max_length=1000)
+    source_tail_owner: Literal["B", "C"] | None = None
+    split_ms: int = Field(default=0, ge=0)
+
+
+class CreatorStoryGenerationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    revision: int = Field(ge=1)
+    request_id: str = Field(min_length=1, max_length=100)
+    targets: list[Literal["B", "C"]] = Field(min_length=1, max_length=2)
+    operation: Literal["generate", "retry", "regenerate"] = "generate"
+
+
+class CreatorPreviewConfirmationRequest(BaseModel):
+    version_id: str = Field(min_length=1, max_length=64)
+    path: Literal["B", "C"]
+
+
 class CreatorPublishRequest(BaseModel):
     confirm: bool = Field(description="Must be true after the user reviews the preview")
     version_id: str | None = Field(default=None, max_length=64)
@@ -292,3 +404,22 @@ class CreatorPublishResponse(BaseModel):
 class CreatorPublishedMutationOut(BaseModel):
     video_id: str
     deleted: bool
+
+
+class CreditLedgerEntryOut(BaseModel):
+    id: str
+    kind: str
+    amount: int
+    note: str
+    created_at: str
+
+
+class CreditBalanceOut(BaseModel):
+    balance: int
+    entries: list[CreditLedgerEntryOut] = Field(default_factory=list)
+
+
+class ReferralInviteOut(BaseModel):
+    code: str
+    url: str
+    status: Literal["none", "pending_activation", "activated"] = "none"

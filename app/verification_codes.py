@@ -10,6 +10,12 @@ from app.config import Settings
 from app.logging_config import get_logger
 from app.mail import send_verification_code
 from app.models import EmailCode
+from app.review_login import (
+    ReviewLoginCode,
+    is_review_login_email,
+    matches_review_login_code,
+    review_login_user,
+)
 
 log = get_logger(__name__)
 
@@ -39,6 +45,12 @@ def issue_email_code(
     """
     if purpose not in ALLOWED_PURPOSES:
         raise ValueError(f"unsupported verification purpose: {purpose}")
+
+    if purpose == PURPOSE_LOGIN and is_review_login_email(email):
+        # Store reviewers use their supplied code, without inbox access or SMTP.
+        if review_login_user(db, email) is None:
+            return IssueCodeResult(ok=False, error_code="EMAIL_UNAVAILABLE")
+        return IssueCodeResult(ok=True)
 
     now = datetime.now(timezone.utc)
     latest = (
@@ -101,9 +113,13 @@ def find_valid_code(
     code: str,
     purpose: str,
     now: datetime | None = None,
-) -> EmailCode | None:
+) -> EmailCode | ReviewLoginCode | None:
     if purpose not in ALLOWED_PURPOSES:
         raise ValueError(f"unsupported verification purpose: {purpose}")
+    if purpose == PURPOSE_LOGIN and is_review_login_email(email):
+        if review_login_user(db, email) is not None and matches_review_login_code(code):
+            return ReviewLoginCode()
+        return None
     current = now or datetime.now(timezone.utc)
     row = (
         db.query(EmailCode)

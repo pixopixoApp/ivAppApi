@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
+from redis.exceptions import RedisError
 from sqlalchemy import and_, func, or_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -21,6 +22,7 @@ from app.auth_user import (
     resolve_request_token,
 )
 from app.config import Settings, get_settings
+from app.credits import activate_referral_from_android
 from app.db import get_db
 from app.feed_rank import (
     build_feed_sequence,
@@ -44,17 +46,18 @@ from app.impressions import (
     get_recommend_store,
     user_seen_key,
 )
-from redis.exceptions import RedisError
 from app.logging_config import get_logger
 from app.models import (
     AnalyticsLog,
     Follow,
+    MediaObject,
     PublishedVideo,
     PublishedVideoSeo,
     RecommendCursor,
     User,
     VideoView,
 )
+from app.oss_storage import OssStorageError
 from app.pagination import (
     CursorError,
     datetime_from_cursor_value,
@@ -87,7 +90,12 @@ from app.protocol_video import (
     normalize_client_runtime_spec_versions,
     read_runtime_spec,
 )
-from app.public_origin import canonicalize_public_payload, canonicalize_public_url
+from app.public_origin import (
+    PublicOriginError,
+    canonical_public_url_for_key,
+    canonicalize_public_payload,
+    canonicalize_public_url,
+)
 from app.safety import blocked_peer_ids, users_blocked_between
 from app.schemas import (
     FeedItemOut,
@@ -130,9 +138,11 @@ def _valid_email(email: str) -> bool:
 @dataclass(frozen=True)
 class FeedItemContext:
     authors_by_id: dict[str, User]
+    covers_by_id: dict[str, MediaObject]
     play_counts_by_video_id: dict[str, int]
     followed_author_ids: frozenset[str]
     seo_slugs_by_video_id: dict[str, str]
+    seo_thumbnails_by_video_id: dict[str, str]
 
 
 def _load_feed_item_context(
@@ -147,9 +157,25 @@ def _load_feed_item_context(
         for row in rows
         if row.user_id is not None and row.user_id.strip()
     }
+    cover_ids = {
+        row.cover_media_object_id
+        for row in rows
+        if row.cover_media_object_id
+    }
     authors = (
         db.query(User).filter(User.user_id.in_(author_ids)).all()
         if author_ids
+        else []
+    )
+    covers = (
+        db.query(MediaObject)
+        .filter(
+            MediaObject.id.in_(cover_ids),
+            MediaObject.visibility == "public",
+            MediaObject.state == "ready",
+        )
+        .all()
+        if cover_ids
         else []
     )
     play_count_rows = (
@@ -162,7 +188,11 @@ def _load_feed_item_context(
     )
     followed_author_ids: frozenset[str] = frozenset()
     seo_rows = (
-        db.query(PublishedVideoSeo.video_id, PublishedVideoSeo.slug)
+        db.query(
+            PublishedVideoSeo.video_id,
+            PublishedVideoSeo.slug,
+            PublishedVideoSeo.thumbnail_url,
+        )
         .filter(
             PublishedVideoSeo.video_id.in_(video_ids),
             PublishedVideoSeo.status == "ready",
@@ -186,11 +216,15 @@ def _load_feed_item_context(
         )
     return FeedItemContext(
         authors_by_id={author.user_id: author for author in authors},
+        covers_by_id={cover.id: cover for cover in covers},
         play_counts_by_video_id={
             video_id: int(count) for video_id, count in play_count_rows
         },
         followed_author_ids=followed_author_ids,
-        seo_slugs_by_video_id={video_id: slug for video_id, slug in seo_rows},
+        seo_slugs_by_video_id={video_id: slug for video_id, slug, _thumbnail in seo_rows},
+        seo_thumbnails_by_video_id={
+            video_id: thumbnail for video_id, _slug, thumbnail in seo_rows
+        },
     )
 
 
@@ -211,6 +245,7 @@ def _item_from_published(
     if not bool(getattr(row, "cdn_ready", True)):
         return None
     avatar_url = ""
+    thumbnail_url = ""
     nickname = ""
     if row.user_id:
         author = (
@@ -221,6 +256,35 @@ def _item_from_published(
         if author is not None:
             avatar_url = canonicalize_public_url(settings, author.avatar_url) or ""
             nickname = author.nickname or ""
+
+    cover = (
+        context.covers_by_id.get(row.cover_media_object_id or "")
+        if context is not None
+        else (
+            db.get(MediaObject, row.cover_media_object_id)
+            if row.cover_media_object_id
+            else None
+        )
+    )
+    if cover is not None and cover.visibility == "public" and cover.state == "ready":
+        try:
+            thumbnail_url = canonical_public_url_for_key(settings, cover.object_key)
+        except (OssStorageError, PublicOriginError) as exc:
+            log.warning("invalid cover media binding item_id=%s err=%s", row.id, exc)
+    if not thumbnail_url:
+        seo_thumbnail = (
+            context.seo_thumbnails_by_video_id.get(row.id, "")
+            if context is not None
+            else (
+                seo.thumbnail_url
+                if (seo := db.get(PublishedVideoSeo, row.id)) is not None
+                and seo.status == "ready"
+                else ""
+            )
+        )
+        candidate = canonicalize_public_url(settings, seo_thumbnail) or ""
+        if candidate.startswith("https://media.pixopixo.com/"):
+            thumbnail_url = candidate
 
     content_type = row.content_type or CONTENT_TYPE_RUNTIME
     clips = None
@@ -292,7 +356,7 @@ def _item_from_published(
     # 历史 feed_weight（如 8/10），直接透传会让 FeedItemOut 校验失败导致接口 500，
     # 故在此 clamp 到合法范围：超过 5 按最高档 5 处理，负数按 0 处理。
     _raw_level = int(row.feed_weight or 0)
-    level = 5 if _raw_level > 5 else (0 if _raw_level < 0 else _raw_level)
+    level = 5 if _raw_level > 5 else (max(_raw_level, 0))
     return FeedItemOut(
         item_id=row.id,
         level=level,
@@ -319,6 +383,7 @@ def _item_from_published(
         user_id=row.user_id,
         nickname=nickname,
         avatar_url=avatar_url,
+        thumbnail_url=thumbnail_url,
         play_count=play_count,
         is_following=viewer_following_author,
         viewer_following_author=viewer_following_author,
@@ -766,6 +831,7 @@ def post_verify(
         db.commit()
         log.warning("verify disabled user email=%s user_id=%s", email, user.user_id)
         return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
+    activate_referral_from_android(db, user.user_id)
     session = issue_user_token(
         db,
         user_id=user.user_id,
@@ -844,6 +910,7 @@ def post_google_login(
         )
         return google_login_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
+    activate_referral_from_android(db, user.user_id)
     session = issue_user_token(
         db,
         user_id=user.user_id,

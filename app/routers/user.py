@@ -15,7 +15,6 @@ from app.auth_user import (
     resolve_multipart_token,
 )
 from app.avatar_storage import AvatarStorageError, store_user_avatar
-from app.cdn_cache import enqueue_prefetch
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.logging_config import get_logger
@@ -288,7 +287,6 @@ async def post_avatar(
         user.avatar_url = relative
         user.avatar_media_object_id = media_object_id
         db.add(user)
-        enqueue_prefetch(db, settings, [relative])
         db.commit()
         db.refresh(user)
     except AvatarStorageError:

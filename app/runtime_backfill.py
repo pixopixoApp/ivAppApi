@@ -40,6 +40,99 @@ class BackfillReport:
     failures: list[BackfillFailure]
 
 
+KNOWN_ROTATION_DIRECTIONS: dict[str, dict[int, str]] = {
+    # These prompts contain an explicit counterclockwise arrow in their media.
+    "5d71abc9-d3a2-4fe5-9843-22b729c3c384": {3620: "counterclockwise"},
+    "87299ca4-ab06-4fb4-98b7-24b5b29b74a5": {3780: "counterclockwise"},
+}
+
+
+def backfill_known_rotation_directions(db: Session, *, apply: bool) -> BackfillReport:
+    """Persist audited rotate directions in source timelines and compiled specs."""
+    settings = get_settings()
+    rows = {
+        row.id: row
+        for row in db.query(PublishedVideo)
+        .filter(PublishedVideo.id.in_(KNOWN_ROTATION_DIRECTIONS))
+        .order_by(PublishedVideo.id.asc())
+        .all()
+    }
+    compiled: list[tuple[PublishedVideo, dict, dict]] = []
+    failures: list[BackfillFailure] = []
+    for video_id, directions_by_gate in KNOWN_ROTATION_DIRECTIONS.items():
+        row = rows.get(video_id)
+        if row is None:
+            failures.append(BackfillFailure(video_id=video_id, reason="published video is missing"))
+            continue
+        if not row.video_url:
+            failures.append(BackfillFailure(video_id=video_id, reason="runtime video_url is missing"))
+            continue
+        source = copy.deepcopy(row.timeline) if isinstance(row.timeline, dict) else {}
+        interactions = source.get("interactions")
+        if not isinstance(interactions, list):
+            failures.append(BackfillFailure(video_id=video_id, reason="source interactions are missing"))
+            continue
+        invalid = False
+        for gate_at_ms, direction in directions_by_gate.items():
+            matches = [
+                item
+                for item in interactions
+                if isinstance(item, dict)
+                and item.get("gesture") == "rotate"
+                and item.get("gate_at_ms") == gate_at_ms
+            ]
+            if len(matches) != 1:
+                failures.append(
+                    BackfillFailure(
+                        video_id=video_id,
+                        reason=f"expected one rotate interaction at {gate_at_ms}ms, found {len(matches)}",
+                    )
+                )
+                invalid = True
+                break
+            matches[0]["rotation_direction"] = direction
+        if invalid:
+            continue
+        try:
+            story_urls = None
+            if (row.content_mode or "single") == "story" and row.active_publication_id:
+                story_urls = load_published_runtime_urls(
+                    db,
+                    settings,
+                    video_id=row.id,
+                    publication_id=row.active_publication_id,
+                )
+            spec = compile_runtime_spec(
+                item_id=row.id,
+                content_mode=row.content_mode or "single",
+                source=source,
+                video_url=canonicalize_public_url(settings, row.video_url) or row.video_url,
+                video_urls=story_urls,
+            )
+        except (MediaServiceError, OssStorageError, RuntimeSpecError) as exc:
+            failures.append(BackfillFailure(video_id=video_id, reason=str(exc)))
+            continue
+        compiled.append((row, source, spec))
+
+    updated = 0
+    if apply:
+        for row, source, spec in compiled:
+            row.timeline = source
+            row.runtime_spec = spec
+            row.runtime_spec_version = runtime_spec_version_from_compiled(spec)
+            record_entity_text(db, row)
+            updated += 1
+        db.commit()
+    else:
+        db.rollback()
+    return BackfillReport(
+        total=len(KNOWN_ROTATION_DIRECTIONS),
+        compilable=len(compiled),
+        updated=updated,
+        failures=failures,
+    )
+
+
 def compile_all_runtime_specs(db: Session, *, apply: bool) -> BackfillReport:
     settings = get_settings()
     rows = (
@@ -171,10 +264,19 @@ def main() -> int:
         action="store_true",
         help="Persist the result. Without this flag the command is a dry run.",
     )
+    parser.add_argument(
+        "--rotation-directions",
+        action="store_true",
+        help="Backfill only audited rotate directions into published source timelines.",
+    )
     args = parser.parse_args()
 
     with SessionLocal() as db:
-        report = compile_all_runtime_specs(db, apply=args.apply)
+        report = (
+            backfill_known_rotation_directions(db, apply=args.apply)
+            if args.rotation_directions
+            else compile_all_runtime_specs(db, apply=args.apply)
+        )
     print(
         json.dumps(
             {

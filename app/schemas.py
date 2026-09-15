@@ -360,6 +360,8 @@ class DetectionOut(BaseModel):
     max_motion_score: int | None = None
     min_angle_deg: float | None = None
     min_shake_score: int | None = None
+    rotation_direction: Literal["clockwise", "counterclockwise"] | None = None
+    pinch_direction: Literal["inward", "outward"] | None = None
 
     @model_serializer(mode="wrap")
     def _omit_nulls(self, handler: Any) -> dict[str, Any]:
@@ -455,6 +457,10 @@ class FeedItemOut(BaseModel):
     user_id: str | None = Field(default=None, description="作者 user_id；存量可空")
     nickname: str = Field(default="", description="作者昵称；无作者或未设置则为空串")
     avatar_url: str = Field(default="", description="作者头像相对路径；无作者或未设置则为空串")
+    thumbnail_url: str = Field(
+        default="",
+        description="作品封面；存在时为 media.pixopixo.com 上的不可变资源",
+    )
     play_count: int = Field(default=0, ge=0, description="去重登录用户播放量")
     is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")

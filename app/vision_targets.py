@@ -15,22 +15,22 @@ VISION_REGISTRY_VERSION = "v1"
 # Targets are deliberately product semantics, not raw model blendshape names.
 # Left/right always mean the participant's own left/right, not screen position.
 VISION_TARGETS: dict[str, dict[str, Any]] = {
-    "hand_victory": {"family": "hand", "label": "Victory sign", "instruction": "Show a victory sign to the camera", "camera_facing": "front"},
-    "hand_thumb_up": {"family": "hand", "label": "Thumbs up", "instruction": "Give the camera a thumbs up", "camera_facing": "front"},
-    "hand_thumb_down": {"family": "hand", "label": "Thumbs down", "instruction": "Give the camera a thumbs down", "camera_facing": "front"},
-    "hand_open_palm": {"family": "hand", "label": "Open palm", "instruction": "Show an open palm to the camera", "camera_facing": "front"},
-    "hand_closed_fist": {"family": "hand", "label": "Closed fist", "instruction": "Show a closed fist to the camera", "camera_facing": "front"},
-    "hand_pointing_up": {"family": "hand", "label": "Pointing up", "instruction": "Point one finger up at the camera", "camera_facing": "front"},
-    "hand_i_love_you": {"family": "hand", "label": "I love you sign", "instruction": "Show the I love you sign to the camera", "camera_facing": "front"},
-    "face_smile": {"family": "face", "label": "Smile", "instruction": "Smile at the camera", "camera_facing": "front"},
-    "face_wink_left": {"family": "face", "label": "Wink left eye", "instruction": "Wink your left eye at the camera", "camera_facing": "front"},
-    "face_wink_right": {"family": "face", "label": "Wink right eye", "instruction": "Wink your right eye at the camera", "camera_facing": "front"},
-    "face_blink": {"family": "face", "label": "Blink", "instruction": "Blink both eyes at the camera", "camera_facing": "front"},
-    "face_mouth_open": {"family": "face", "label": "Open mouth", "instruction": "Open your mouth at the camera", "camera_facing": "front"},
-    "face_mouth_pucker": {"family": "face", "label": "Pucker lips", "instruction": "Pucker your lips at the camera", "camera_facing": "front"},
-    "face_brow_raise": {"family": "face", "label": "Raise eyebrows", "instruction": "Raise your eyebrows at the camera", "camera_facing": "front"},
-    "face_brow_furrow": {"family": "face", "label": "Furrow eyebrows", "instruction": "Furrow your eyebrows at the camera", "camera_facing": "front"},
-    "face_cheek_puff": {"family": "face", "label": "Puff cheeks", "instruction": "Puff your cheeks at the camera", "camera_facing": "front"},
+    "hand_victory": {"family": "hand", "label": "Victory sign", "instruction": "Show a victory sign to the camera", "camera_facing": "front", "min_confidence": 0.82, "stable_for_ms": 400},
+    "hand_thumb_up": {"family": "hand", "label": "Thumbs up", "instruction": "Give the camera a thumbs up", "camera_facing": "front", "min_confidence": 0.60, "stable_for_ms": 250},
+    "hand_thumb_down": {"family": "hand", "label": "Thumbs down", "instruction": "Give the camera a thumbs down", "camera_facing": "front", "min_confidence": 0.82, "stable_for_ms": 400},
+    "hand_open_palm": {"family": "hand", "label": "Open palm", "instruction": "Show an open palm to the camera", "camera_facing": "front", "min_confidence": 0.55, "stable_for_ms": 250},
+    "hand_closed_fist": {"family": "hand", "label": "Closed fist", "instruction": "Show a closed fist to the camera", "camera_facing": "front", "min_confidence": 0.82, "stable_for_ms": 400},
+    "hand_pointing_up": {"family": "hand", "label": "Pointing up", "instruction": "Point one finger up at the camera", "camera_facing": "front", "min_confidence": 0.55, "stable_for_ms": 250},
+    "hand_i_love_you": {"family": "hand", "label": "I love you sign", "instruction": "Show the I love you sign to the camera", "camera_facing": "front", "min_confidence": 0.60, "stable_for_ms": 250},
+    "face_smile": {"family": "face", "label": "Smile", "instruction": "Smile at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_wink_left": {"family": "face", "label": "Wink left eye", "instruction": "Wink your left eye at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_wink_right": {"family": "face", "label": "Wink right eye", "instruction": "Wink your right eye at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_blink": {"family": "face", "label": "Blink", "instruction": "Blink both eyes at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_mouth_open": {"family": "face", "label": "Open mouth", "instruction": "Open your mouth at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_mouth_pucker": {"family": "face", "label": "Pucker lips", "instruction": "Pucker your lips at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_brow_raise": {"family": "face", "label": "Raise eyebrows", "instruction": "Raise your eyebrows at the camera", "camera_facing": "front", "min_confidence": 0.65, "stable_for_ms": 250},
+    "face_brow_furrow": {"family": "face", "label": "Furrow eyebrows", "instruction": "Furrow your eyebrows at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
+    "face_cheek_puff": {"family": "face", "label": "Puff cheeks", "instruction": "Puff your cheeks at the camera", "camera_facing": "front", "min_confidence": 0.50, "stable_for_ms": 150},
 }
 
 
@@ -88,3 +88,18 @@ def normalize_vision_config(value: Any) -> dict[str, Any]:
         "min_confidence": confidence,
         "stable_for_ms": stable_for_ms,
     }
+
+
+def creator_vision_config(target: str) -> dict[str, Any]:
+    """Visible, target-calibrated config used by Creator camera presets."""
+    try:
+        metadata = VISION_TARGETS[target]
+    except KeyError as exc:
+        raise VisionTargetError(f"unsupported vision target: {target!r}") from exc
+    return normalize_vision_config({
+        "target": target,
+        "camera_facing": metadata["camera_facing"],
+        "show_preview": True,
+        "min_confidence": metadata["min_confidence"],
+        "stable_for_ms": metadata["stable_for_ms"],
+    })

@@ -42,6 +42,7 @@ _DOWNLOAD_MAX_ATTEMPTS = 6
 _DOWNLOAD_MULTIGET_THRESHOLD_BYTES = 8 * 1024 * 1024
 _DOWNLOAD_PART_SIZE_BYTES = 4 * 1024 * 1024
 _DOWNLOAD_MAX_THREADS = 4
+_PUBLIC_IMMUTABLE_CACHE_SECONDS = 31_536_000
 
 
 def _oss2():
@@ -213,19 +214,39 @@ def delete_object(settings: Settings, *, key: str) -> None:
         _bucket(settings).delete_object(owned)
 
 
+def immutable_cache_control(*, public: bool, private_max_age_seconds: int) -> str:
+    """Return the origin policy consumed by the media CDN.
+
+    Final object keys are immutable. Public objects can therefore stay at the
+    edge for a year. Private objects use a shorter shared-cache lifetime that
+    matches the reusable signed delivery URL; ingress and other mutable objects
+    remain explicitly non-cacheable.
+    """
+    seconds = (
+        _PUBLIC_IMMUTABLE_CACHE_SECONDS
+        if public
+        else max(30, min(3600, int(private_max_age_seconds)))
+    )
+    return f"public, max-age={seconds}, immutable"
+
+
 def _headers(
     *,
     content_type: str,
     public: bool,
     immutable: bool,
+    private_max_age_seconds: int,
     extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     headers = {
         "Content-Type": content_type,
         "Content-Disposition": "inline" if public else "attachment",
         "Cache-Control": (
-            "public, max-age=31536000, immutable"
-            if public and immutable
+            immutable_cache_control(
+                public=public,
+                private_max_age_seconds=private_max_age_seconds,
+            )
+            if immutable
             else "no-store"
         ),
         "x-oss-object-acl": "public-read" if public else "private",
@@ -257,6 +278,7 @@ def upload_file(
                 content_type=media_type,
                 public=public,
                 immutable=immutable,
+                private_max_age_seconds=settings.private_media_cdn_ttl_seconds,
                 extra=extra_headers,
             ),
         )
@@ -282,6 +304,7 @@ def upload_bytes(
                 content_type=content_type,
                 public=public,
                 immutable=immutable,
+                private_max_age_seconds=settings.private_media_cdn_ttl_seconds,
                 extra=extra_headers,
             ),
         )
@@ -303,6 +326,68 @@ def head_object(settings: Settings, *, key: str) -> OssObjectMetadata:
         etag=str(getattr(result, "etag", "") or headers.get("etag") or "") or None,
         headers=headers,
     )
+
+
+def update_object_cache_control(
+    settings: Settings,
+    *,
+    key: str,
+    cache_control: str,
+    public: bool,
+    expected_etag: str | None = None,
+) -> bool:
+    """Replace cache metadata without changing an immutable object's bytes."""
+    owned = assert_owned_key(settings, key)
+    metadata = head_object(settings, key=owned)
+    if expected_etag and (
+        not metadata.etag
+        or expected_etag.strip().strip('"') != metadata.etag.strip().strip('"')
+    ):
+        raise OssImmutableConflictError(
+            "immutable OSS object changed before metadata update"
+        )
+    if metadata.headers.get("cache-control", "").strip() == cache_control:
+        return False
+
+    preserved: dict[str, str] = {}
+    standard_names = {
+        "content-type": "Content-Type",
+        "content-disposition": "Content-Disposition",
+        "content-encoding": "Content-Encoding",
+        "content-language": "Content-Language",
+        "expires": "Expires",
+    }
+    for name, value in metadata.headers.items():
+        lowered = name.lower()
+        if lowered.startswith("x-oss-meta-"):
+            preserved[lowered] = value
+        elif lowered in standard_names:
+            preserved[standard_names[lowered]] = value
+    preserved.setdefault(
+        "Content-Type",
+        metadata.content_type or "application/octet-stream",
+    )
+    preserved.setdefault("Content-Disposition", "inline" if public else "attachment")
+    preserved["Cache-Control"] = cache_control
+    preserved["x-oss-object-acl"] = "public-read" if public else "private"
+    if metadata.etag:
+        etag = metadata.etag
+        preserved["x-oss-copy-source-if-match"] = (
+            etag if etag.startswith('"') else f'"{etag}"'
+        )
+
+    oss2 = _oss2()
+    try:
+        with _slot(settings):
+            _bucket(settings).update_object_meta(owned, preserved)
+    except oss2.exceptions.ServerError as exc:
+        status = int(getattr(exc, "status", 0) or 0)
+        if status == 412:
+            raise OssImmutableConflictError(
+                "immutable OSS object changed during metadata update"
+            ) from exc
+        raise
+    return True
 
 
 def download_file(
@@ -424,6 +509,7 @@ def copy_object(
         content_type=content_type,
         public=public,
         immutable=immutable,
+        private_max_age_seconds=settings.private_media_cdn_ttl_seconds,
         extra=extra_headers,
     )
     headers["x-oss-metadata-directive"] = "REPLACE"

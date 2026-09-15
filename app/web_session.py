@@ -100,6 +100,27 @@ def require_web_user(
     return user
 
 
+def require_app_or_web_user(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+) -> AppUser:
+    """Authenticate shared account endpoints from Android or the Web Studio."""
+    bearer = bearer_token_from_request(request)
+    if bearer:
+        loaded = load_app_user(db, bearer)
+        if loaded is None:
+            raise HTTPException(status_code=401, detail="valid Bearer token required")
+        user = replace(loaded, channel="android")
+    else:
+        verify_web_csrf(request)
+        user = optional_web_user(request, db)
+        if user is None:
+            raise HTTPException(status_code=401, detail="sign in required")
+    request.state.app_user = user
+    request.state.app_token = user.token
+    return user
+
+
 def _policy_allows(settings: Settings, channel: str) -> bool:
     mode = settings.creator_access_mode
     return mode == "all_open" or mode == f"{channel}_open"
@@ -149,4 +170,3 @@ def require_creator_user(
     request.state.app_user = user
     request.state.app_token = user.token
     return user
-

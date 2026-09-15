@@ -9,7 +9,14 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
-from app.models import PublishedVideo, PublishedVideoSeo
+from app.models import (
+    MediaObject,
+    PublishedVideo,
+    PublishedVideoSeo,
+    PublishedVideoSeoSlugAlias,
+)
+from app.oss_storage import OssStorageError
+from app.public_origin import PublicOriginError, canonical_public_url_for_key
 from app.schemas_seo import (
     SeoAdminEdit,
     SeoBackfillRequest,
@@ -22,8 +29,8 @@ from app.seo import (
     is_placeholder_text,
     mark_seo_stale,
     seo_public_item,
-    slugify,
     source_hash,
+    unique_slug,
     utcnow,
     visible_experience_query,
 )
@@ -86,7 +93,7 @@ def resolve_public_experience(
     return {
         "id": row.id,
         "slug": seo.slug,
-        "canonical_url": f"{_site_url(settings)}/experiences/{seo.slug}",
+        "canonical_url": f"{_site_url(settings)}/videos/{seo.slug}",
     }
 
 
@@ -98,6 +105,14 @@ def get_public_experience(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
     result = visible_experience_query(db).filter(PublishedVideoSeo.slug == slug).one_or_none()
+    if result is None:
+        alias = db.get(PublishedVideoSeoSlugAlias, slug)
+        if alias is not None:
+            result = (
+                visible_experience_query(db)
+                .filter(PublishedVideo.id == alias.video_id)
+                .one_or_none()
+            )
     if result is None:
         raise HTTPException(status_code=404, detail="experience not found")
     row, seo, author = result
@@ -240,6 +255,7 @@ def put_seo_metadata(
     video_id: str,
     payload: SeoMetadataWrite,
     db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, Any]:
     row = db.get(PublishedVideo, video_id)
     if row is None or row.is_deleted != 0 or row.deleted_at is not None:
@@ -259,7 +275,7 @@ def put_seo_metadata(
     # Source content may have been filled above. Bind readiness to the final row.
     final_hash = source_hash(row)
     if seo.generated_at is None and seo.status != "ready":
-        seo.slug = slugify(payload.title, video_id=row.id)
+        seo.slug = unique_slug(db, payload.title, video_id=row.id)
     seo.page_title = payload.title.strip()
     seo.page_description = payload.description.strip()
     seo.meta_title = payload.meta_title.strip()
@@ -270,7 +286,13 @@ def put_seo_metadata(
     seo.duration_seconds = payload.duration_seconds
     seo.width = payload.width
     seo.height = payload.height
-    if payload.thumbnail_url.strip():
+    cover = db.get(MediaObject, row.cover_media_object_id) if row.cover_media_object_id else None
+    if cover is not None and cover.visibility == "public" and cover.state == "ready":
+        try:
+            seo.thumbnail_url = canonical_public_url_for_key(settings, cover.object_key)
+        except (OssStorageError, PublicOriginError) as exc:
+            raise HTTPException(status_code=409, detail=f"invalid cover media binding: {exc}")
+    elif payload.thumbnail_url.strip():
         seo.thumbnail_url = payload.thumbnail_url.strip()
     seo.source_hash = final_hash
     seo.model = payload.model.strip()

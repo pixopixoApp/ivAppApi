@@ -23,6 +23,7 @@ from app.models import (
     PublishedMediaAsset,
     PublishedVideo,
 )
+from app.oss_cache_metadata import migrate_cache_metadata
 from app.oss_storage import (
     OssImmutableConflictError,
     OssObjectMetadata,
@@ -32,6 +33,9 @@ from app.oss_storage import (
     create_post_upload,
     download_file,
     head_object,
+    immutable_cache_control,
+    update_object_cache_control,
+    upload_bytes,
     validate_oss_config,
 )
 from app.publication_service import load_published_runtime_urls
@@ -82,7 +86,174 @@ def test_post_policy_is_exact_key_size_type_and_never_exposes_secret(monkeypatch
     assert ["eq", "$key", "ivapp-media/v1/ingress/client/session/object.mp4"] in policy["conditions"]
     assert ["content-length-range", 1234, 1234] in policy["conditions"]
     assert ["eq", "$x-oss-content-type", "video/mp4"] in policy["conditions"]
+    assert fields["Cache-Control"] == "no-store"
     assert "test-secret" not in json.dumps(fields)
+
+
+def test_final_private_objects_publish_short_shared_cache_metadata(monkeypatch) -> None:
+    settings = _oss_settings(monkeypatch)
+    captured = {}
+
+    class Bucket:
+        @staticmethod
+        def put_object(_key, _payload, *, headers):
+            captured.update(headers)
+
+    monkeypatch.setattr("app.oss_storage._bucket", lambda _settings: Bucket())
+    upload_bytes(
+        settings,
+        key="ivapp-media/v1/private/creator-sources/aa/source.mp4",
+        payload=b"video",
+        content_type="video/mp4",
+        public=False,
+        immutable=True,
+    )
+
+    assert captured["x-oss-object-acl"] == "private"
+    assert captured["Cache-Control"] == "public, max-age=900, immutable"
+
+
+def test_cache_metadata_migration_repairs_only_finalized_objects(
+    monkeypatch,
+    db,
+) -> None:
+    settings = _oss_settings(monkeypatch)
+    private = MediaObject(
+        id="mo_private_cache",
+        purpose="creator_video",
+        origin="client_upload",
+        visibility="private",
+        state="ready",
+        staging_key="ivapp-media/v1/ingress/client/session/private.mp4",
+        object_key="ivapp-media/v1/private/creator-sources/aa/source.mp4",
+        original_filename="source.mp4",
+        content_type="video/mp4",
+        size_bytes=5,
+        sha256="a" * 64,
+        etag="private-etag",
+        extra_json={},
+    )
+    pending = MediaObject(
+        id="mo_pending_cache",
+        purpose="creator_video",
+        origin="client_upload",
+        visibility="private",
+        state="declared",
+        staging_key="ivapp-media/v1/ingress/client/session/pending.mp4",
+        object_key="ivapp-media/v1/private/creator-sources/bb/source.mp4",
+        original_filename="source.mp4",
+        content_type="video/mp4",
+        size_bytes=5,
+        sha256="b" * 64,
+        etag="",
+        extra_json={},
+    )
+    db.add_all([private, pending])
+    db.commit()
+
+    metadata = {
+        private.object_key: OssObjectMetadata(
+            size_bytes=5,
+            content_type="video/mp4",
+            etag="private-etag",
+            headers={"cache-control": "no-store"},
+        )
+    }
+    updates = []
+
+    def fake_head(_settings, *, key):
+        return metadata[key]
+
+    def fake_update(_settings, *, key, cache_control, public, expected_etag):
+        updates.append((key, cache_control, public, expected_etag))
+        metadata[key] = OssObjectMetadata(
+            size_bytes=5,
+            content_type="video/mp4",
+            etag="private-etag",
+            headers={"cache-control": cache_control},
+        )
+        return True
+
+    monkeypatch.setattr("app.oss_cache_metadata.head_object", fake_head)
+    monkeypatch.setattr(
+        "app.oss_cache_metadata.update_object_cache_control",
+        fake_update,
+    )
+
+    dry_run = migrate_cache_metadata(db, settings)
+    assert dry_run.scanned == 1
+    assert dry_run.changes == 1
+    assert updates == []
+
+    applied = migrate_cache_metadata(db, settings, apply=True)
+    assert applied.failures == []
+    assert updates == [
+        (
+            private.object_key,
+            immutable_cache_control(
+                public=False,
+                private_max_age_seconds=900,
+            ),
+            False,
+            "private-etag",
+        )
+    ]
+
+    verified = migrate_cache_metadata(db, settings, verify=True)
+    assert verified.changes == 0
+    assert verified.compliant == 1
+
+
+def test_cache_metadata_update_preserves_content_and_custom_metadata(
+    monkeypatch,
+) -> None:
+    settings = _oss_settings(monkeypatch)
+    captured = {}
+
+    class ServerError(Exception):
+        pass
+
+    class Bucket:
+        @staticmethod
+        def update_object_meta(key, headers):
+            captured["key"] = key
+            captured["headers"] = dict(headers)
+
+    metadata = OssObjectMetadata(
+        size_bytes=5,
+        content_type="video/mp4",
+        etag="same-bytes",
+        headers={
+            "content-type": "video/mp4",
+            "content-disposition": "attachment",
+            "cache-control": "no-store",
+            "x-oss-meta-sha256": "a" * 64,
+        },
+    )
+    monkeypatch.setattr("app.oss_storage.head_object", lambda *_args, **_kwargs: metadata)
+    monkeypatch.setattr("app.oss_storage._bucket", lambda _settings: Bucket())
+    monkeypatch.setattr(
+        "app.oss_storage._oss2",
+        lambda: SimpleNamespace(exceptions=SimpleNamespace(ServerError=ServerError)),
+    )
+
+    changed = update_object_cache_control(
+        settings,
+        key="ivapp-media/v1/private/creator-sources/aa/source.mp4",
+        cache_control="public, max-age=900, immutable",
+        public=False,
+        expected_etag="same-bytes",
+    )
+
+    assert changed is True
+    assert captured["headers"]["Content-Type"] == "video/mp4"
+    assert captured["headers"]["Content-Disposition"] == "attachment"
+    assert captured["headers"]["Cache-Control"] == (
+        "public, max-age=900, immutable"
+    )
+    assert captured["headers"]["x-oss-meta-sha256"] == "a" * 64
+    assert captured["headers"]["x-oss-object-acl"] == "private"
+    assert captured["headers"]["x-oss-copy-source-if-match"] == '"same-bytes"'
 
 
 def test_archived_motioncue_oss_environment_names_remain_reusable(monkeypatch) -> None:

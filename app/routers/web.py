@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from datetime import datetime, timezone
 from typing import Annotated
@@ -14,15 +15,23 @@ from fastapi import (
     Response,
     UploadFile,
 )
+from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, issue_user_token
 from app.avatar_storage import AvatarStorageError, store_user_avatar
-from app.cdn_cache import enqueue_prefetch
 from app.config import Settings, get_settings
+from app.credits import bind_referral_for_new_user
 from app.db import get_db
 from app.google_auth import GoogleAuthUnavailable, verify_google_id_token
-from app.models import PublishedVideo, PublishedVideoSeo, User, UserToken
+from app.models import (
+    AppVersion,
+    PublishedVideo,
+    PublishedVideoSeo,
+    ReferralInvite,
+    User,
+    UserToken,
+)
 from app.public_origin import canonicalize_public_url
 from app.schemas_web import (
     WebCodeSentOut,
@@ -57,11 +66,39 @@ from app.web_session import (
 )
 
 router = APIRouter(prefix="/api/v1/web", tags=["web"])
+invite_router = APIRouter(tags=["invite"])
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _email(raw: str) -> str:
     return raw.strip().lower()
+
+
+def _new_identity(db: Session, *, provider: str, subject: str) -> bool:
+    return (
+        db.query(User)
+        .filter(User.provider == provider, User.subject == subject)
+        .one_or_none()
+        is None
+    )
+
+
+def _bind_web_invite_if_present(
+    db: Session,
+    *,
+    user: User,
+    was_new: bool,
+    code: str,
+) -> None:
+    normalized = code.strip().upper()
+    if not normalized:
+        return
+    if not was_new:
+        raise HTTPException(status_code=409, detail="Only a new account can use an invite link.")
+    try:
+        bind_referral_for_new_user(db, user=user, code=normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
@@ -127,9 +164,11 @@ def get_web_config(
             max_bytes=settings.creator_video_max_bytes,
             max_duration_seconds=settings.creator_video_max_duration_seconds,
             supported_transports=transports,
+            preparation_profile="first-30s-v1" if transports else None,
+            max_source_bytes=max(settings.creator_video_max_bytes, settings.creator_web_source_max_bytes) if transports else settings.creator_video_max_bytes,
             text_to_video_enabled=settings.creator_text_to_video_enabled,
             daily_generation_quota=max(0, settings.creator_video_daily_quota),
-            generated_duration_seconds=10,
+            generated_duration_seconds=settings.creator_video_duration_seconds,
             generated_ratio="9:16",
             generated_resolution="720p",
         ),
@@ -202,7 +241,14 @@ def verify_web_email_code(
     if code_row is None:
         raise HTTPException(status_code=400, detail="That code is invalid or has expired.")
     code_row.used_at = now
+    was_new = _new_identity(db, provider="email", subject=email)
     user = get_or_create_user(db, provider="email", subject=email)
+    _bind_web_invite_if_present(
+        db,
+        user=user,
+        was_new=was_new,
+        code=payload.invite_code,
+    )
     if not user.enabled:
         db.commit()
         raise HTTPException(status_code=403, detail="This account is unavailable.")
@@ -232,7 +278,14 @@ def login_web_google(
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Google sign-in could not be verified.") from exc
     now = datetime.now(timezone.utc)
+    was_new = _new_identity(db, provider="google", subject=identity.subject)
     user = get_or_create_user(db, provider="google", subject=identity.subject)
+    _bind_web_invite_if_present(
+        db,
+        user=user,
+        was_new=was_new,
+        code=payload.invite_code,
+    )
     if not user.enabled:
         db.commit()
         raise HTTPException(status_code=403, detail="This account is unavailable.")
@@ -314,7 +367,6 @@ async def update_web_avatar(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     row.avatar_url = relative
     row.avatar_media_object_id = media_object_id
-    enqueue_prefetch(db, settings, [relative])
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -387,4 +439,29 @@ def list_web_publications(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@invite_router.get("/invite/{code}", response_class=HTMLResponse, include_in_schema=False)
+def referral_landing_page(
+    code: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> HTMLResponse:
+    normalized = code.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9-]{6,32}", normalized):
+        raise HTTPException(status_code=404, detail="invite not found")
+    invite = db.query(ReferralInvite).filter(ReferralInvite.code == normalized).one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="invite not found")
+    android = db.get(AppVersion, "android")
+    store_url = (android.store_url if android is not None else "").strip()
+    safe_code = html.escape(normalized)
+    safe_store_url = html.escape(store_url, quote=True)
+    open_uri = html.escape(f"pixo://invite/{normalized}", quote=True)
+    return HTMLResponse(
+        content=f"""<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join Pixo</title>
+<style>body{{margin:0;background:#0d100d;color:#f0f3eb;font:16px Inter,Arial,sans-serif}}main{{max-width:390px;min-height:100vh;margin:auto;box-sizing:border-box;padding:52px 24px;background:radial-gradient(circle at top,#1c2812,#0d100d 55%)}}.tag{{color:#c8ff3d;font-size:12px;letter-spacing:.12em;text-transform:uppercase}}h1{{font-size:34px;line-height:1.08;margin:14px 0}}p{{color:#8e9888;line-height:1.5}}.card{{margin-top:28px;padding:20px;border:1px solid #3a4237;border-radius:18px;background:#141a12}}input,button,a{{box-sizing:border-box;width:100%;border-radius:12px;font:inherit}}input{{padding:14px;margin:8px 0;background:#0d100d;color:#f0f3eb;border:1px solid #3a4237}}button,a{{display:block;padding:14px;border:0;text-align:center;text-decoration:none;font-weight:700}}button{{background:#c8ff3d;color:#10140b;cursor:pointer}}a{{margin-top:10px;background:#20281d;color:#f0f3eb}}#code{{display:none}}#message{{min-height:24px;font-size:13px}}</style>
+<main><div class=\"tag\">Pixo invite</div><h1>Create together.</h1><p>Create a new Pixo account with this invitation, then sign in to the Android app to activate the invitation.</p><section class=\"card\"><div id=\"step1\"><label>Email<input id=\"email\" type=\"email\" autocomplete=\"email\" placeholder=\"you@example.com\"></label><button id=\"send\">Send code</button></div><div id=\"code\"><label>6-digit code<input id=\"otp\" inputmode=\"numeric\" maxlength=\"6\"></label><button id=\"verify\">Create account</button></div><p id=\"message\"></p><div id=\"finish\" hidden><a href=\"{open_uri}\">Open Pixo</a>{f'<a href="{safe_store_url}">Download Pixo for Android</a>' if safe_store_url else ''}</div></section></main>
+<script>const invite={safe_code!r};const message=document.querySelector('#message');const csrf=()=>document.cookie.split('; ').find(x=>x.startsWith('pixo_web_csrf='))?.split('=')[1]||'';async function api(path,body){{await fetch('/api/v1/web/auth/session',{{credentials:'same-origin'}});const r=await fetch(path,{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json','X-Pixo-CSRF':csrf()}},body:JSON.stringify(body)}});const d=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(typeof d.detail==='string'?d.detail:'Please try again.');return d}}document.querySelector('#send').onclick=async()=>{{try{{await api('/api/v1/web/auth/email/send-code',{{email:document.querySelector('#email').value}});document.querySelector('#code').style.display='block';message.textContent='Check your email for the six-digit code.'}}catch(e){{message.textContent=e.message}}}};document.querySelector('#verify').onclick=async()=>{{try{{await api('/api/v1/web/auth/email/verify',{{email:document.querySelector('#email').value,code:document.querySelector('#otp').value,invite_code:invite}});document.querySelector('#finish').hidden=false;message.textContent='Account created. Sign in to Pixo with this same email to activate the invite.'}}catch(e){{message.textContent=e.message}}}};</script></html>"""
     )

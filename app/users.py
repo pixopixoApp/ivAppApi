@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.credits import provision_new_user
 from app.models import Follow, User
 from app.public_text import record_user_text
 
@@ -45,6 +46,7 @@ def get_or_create_user(db: Session, *, provider: str, subject: str) -> User:
     )
     db.add(user)
     db.flush()
+    provision_new_user(db, user)
     return user
 
 

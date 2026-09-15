@@ -1,8 +1,10 @@
-# Pixo public-media CDN runbook
+# Pixo media CDN runbook
 
-The canonical public origin is `https://media.pixopixo.com`. Only immutable
-objects below `/ivapp-media/v1/public/` are eligible. Private objects, signed
-downloads and browser-to-OSS uploads continue to use OSS directly.
+The canonical delivery origin is `https://media.pixopixo.com`. Immutable
+objects below `/ivapp-media/v1/public/` use a one-year origin cache policy.
+Finalized signed objects below `/ivapp-media/v1/private/` use the reusable
+signed-URL lifetime (900 seconds by default). Browser ingress remains
+non-cacheable and uploads directly to OSS before finalization.
 
 Android release APKs use the immutable public sub-prefix
 `/ivapp-media/v1/public/app-releases/android/`. The release command uploads the
@@ -16,8 +18,30 @@ python -m app.cdn_cache prefetch "$CDN_URL" --apply --wait-submitted \
 
 The CDN worker keeps tracking the provider task asynchronously. Android release
 publication does not wait for prefetch to reach 100%; cold requests use the
-normal CDN-to-OSS origin path. Operators can still use `--wait` when a separate
+normal CDN-to-OSS origin path. Android APK paths may use the reserved part of
+the daily prefetch budget. Operators can still use `--wait` when a separate
 maintenance workflow genuinely needs completion to be a blocking gate.
+
+## Prefetch policy
+
+Every persisted business URL uses the CDN, so a cache miss automatically pulls
+the immutable object from OSS and stores it at the edge. Active prefetch is used
+only to remove first-view latency from the highest-value entry resources:
+
+- a new runtime publication warms its entry video only;
+- a newly uploaded public cover warms immediately;
+- a new Android release APK has reserved daily capacity;
+- private creator media uses a direct CDN GET warm and does not consume the
+  Alibaba `PushObjectCache` URL quota;
+- Story branch clips, avatars, and HTML package subresources fill on demand.
+
+Routine provider submissions stop at 400 URLs per Alibaba UTC+8 day. Another 50 are
+reserved for Android APKs, leaving headroom below the provider's 500-URL limit.
+The manual/scheduled `prewarm` command selects at most 100 URLs, prioritizing
+visible tutorials, feed weight and recent updates, and includes only covers and
+entrypoints. URLs beyond a budget, or requests rejected with
+`QuotaExceeded.Preload`, are marked as on-demand fallbacks so publication is
+never blocked by an optional warming quota.
 
 If Alibaba Cloud leaves a prefetch task incomplete, an operator may replace only
 that incomplete provider task and submit the same immutable URL again:
@@ -32,10 +56,15 @@ python -m app.cdn_cache prefetch CDN_URL --apply --resubmit
 ALIYUN_OSS_PUBLIC_BASE_URL=https://media.pixopixo.com
 PUBLIC_MEDIA_LEGACY_ORIGINS=https://pixopixo-us.oss-us-east-1.aliyuncs.com,https://api.pixopixo.cn,https://video.pixopixo.cn
 HTML_PUBLIC_BASE_URL=https://media.pixopixo.com/ivapp-media/v1/public/html
-HTML_TRUSTED_ORIGINS=https://media.pixopixo.com,https://api.pixopixo.cn,https://pixopixo-us.oss-us-east-1.aliyuncs.com
+HTML_TRUSTED_ORIGINS=https://media.pixopixo.com,https://api.pixopixo.cn
 CDN_CACHE_ENABLED=true
 CDN_PREFETCH_ON_PUBLISH=true
 CDN_DOMAIN=media.pixopixo.com
+CDN_PREFETCH_DAILY_BUDGET=400
+CDN_PREFETCH_PRIORITY_RESERVE=50
+CDN_BACKGROUND_PREWARM_MAX_URLS=100
+PRIVATE_MEDIA_CDN_BASE_URL=https://media.pixopixo.com
+PRIVATE_MEDIA_CDN_TTL_SECONDS=900
 ALIBABA_CLOUD_IMDSV1_DISABLED=true
 ```
 
@@ -61,6 +90,9 @@ the new API image:
 python -m app.public_origin_migration
 python -m app.public_origin_migration --apply
 python -m app.public_origin_migration --verify
+python -m app.oss_cache_metadata
+python -m app.oss_cache_metadata --apply
+python -m app.oss_cache_metadata --verify
 python -m app.cdn_cache prewarm --apply
 python -m app.cdn_cache drain-once
 python -m app.cdn_cache status
@@ -70,11 +102,16 @@ The first migration command is a dry run. Apply is atomic and does not change
 content `updated_at` values. The API also canonicalizes every public response,
 so an overlooked compatible legacy URL cannot leak back to clients.
 
-The `cdn-worker` service continuously handles new publication, HTML package and
-avatar prefetch tasks. A runtime publication remains hidden (or its previous
-immutable version remains active) until `DescribeRefreshTaskById` reports every
-prefetch item as `Complete`. Provider failures are retried with bounded
-exponential backoff; a final failure keeps the new runtime publication closed.
+The cache-metadata command changes headers only; it does not rewrite object
+bytes, database rows or URLs. New finalized objects already receive the same
+origin-owned policy. CDN operations therefore do not need to maintain a
+special private-path cache override.
+
+The `cdn-worker` service continuously handles critical new-publication and cover
+prefetch tasks. A runtime publication remains hidden (or its previous immutable
+version remains active) until its entrypoint is ready. Normal provider failures
+are retried with bounded exponential backoff; only daily preload exhaustion or
+the local daily budget uses the non-blocking on-demand fallback.
 
 Alibaba standard prefetch fills its L2 origin-pull cache, not every possible L1
 edge node. Enable **Range Origin Fetch / Match Client** for the CDN domain so an

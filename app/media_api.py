@@ -42,6 +42,7 @@ class InternalUploadSessionRequest(BaseModel):
 
 
 class CreatorDirectUploadRequest(BaseModel):
+    preparation_profile: Literal["first-30s-v1"] | None = None
     filename: str = Field(min_length=1, max_length=255)
     content_type: str = Field(default="video/mp4", min_length=1, max_length=128)
     size_bytes: int = Field(gt=0)

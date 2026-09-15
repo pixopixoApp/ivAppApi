@@ -10,7 +10,7 @@
   "feed_weight": 1000000,
   "content_mode": "single",
   "source_media": {
-    "public_url": "https://video.pixopixo.cn/ivapp-media/v1/public/runtime/c3b1cbd2-743b-4b79-869b-750a837fffd8/pubm_9a0c8eb9f477910430f868a2168aec71a551be67/single.mp4",
+    "public_url": "https://media.pixopixo.com/ivapp-media/v1/public/runtime/c3b1cbd2-743b-4b79-869b-750a837fffd8/pubm_9a0c8eb9f477910430f868a2168aec71a551be67/single.mp4",
     "duration_ms": 21433,
     "reuse_policy": "Resolve this existing owned OSS object to its MediaObject record, then publish through /internal/v1/publish-assets. The publish service must make a new immutable OSS copy under this item_id; do not reuse the source publication folder."
   },

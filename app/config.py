@@ -85,11 +85,12 @@ class Settings(BaseSettings):
     oss_upload_ttl_seconds: int = 600
     oss_private_get_ttl_seconds: int = 300
     oss_max_concurrency: int = 16
-    # Type-A authenticated CDN origin for private draft/original playback.
-    # The CDN origin must be configured to read the private OSS bucket.
+    # CDN origin for signed private draft/original playback. Leaving the CDN
+    # auth key empty preserves the existing OSS signature on the CDN URL.
     private_media_cdn_base_url: str = ""
     private_media_cdn_auth_key: str = ""
     private_media_cdn_auth_uid: str = "0"
+    # Also controls finalized private-object origin cache metadata.
     private_media_cdn_ttl_seconds: int = 900
 
     # Email auth — 阿里企业邮箱（465 SSL）
@@ -149,9 +150,18 @@ class Settings(BaseSettings):
     creator_ivadmin_timeout_seconds: float = 30.0
     creator_worker_poll_seconds: float = 2.0
     creator_video_max_bytes: int = 120 * 1024 * 1024
+    creator_web_source_max_bytes: int = 1024 * 1024 * 1024
     creator_video_max_duration_seconds: int = 30
+    # Product clip length. The provider may use a longer supported duration
+    # and normalize down to this exact value before ivapp accepts the result.
+    creator_video_duration_seconds: int = 3
     creator_text_to_video_enabled: bool = False
-    creator_video_daily_quota: int = 3
+    # Both flags stay fail-closed until a real provider smoke test confirms
+    # the configured source and conditioned-ending duration contract.
+    creator_branch_story_enabled: bool = False
+    # Legacy response compatibility only. Credits are the authoritative limit;
+    # there is no hidden daily generation cap.
+    creator_video_daily_quota: int = 0
     creator_video_draft_ttl_days: int = 30
     creator_access_mode: Literal[
         "invite", "web_open", "android_open", "all_open"
@@ -182,6 +192,7 @@ class Settings(BaseSettings):
     # key. A dedicated least-privilege principal remains preferred.
     cdn_cache_enabled: bool = False
     cdn_prefetch_on_publish: bool = True
+    creator_media_cdn_prefetch_enabled: bool = True
     cdn_domain: str = ""
     cdn_api_region: str = "cn-hangzhou"
     # Prefer an ECS RAM role. These optional keys also support an existing
@@ -193,6 +204,12 @@ class Settings(BaseSettings):
     cdn_worker_batch_size: int = 50
     cdn_worker_max_attempts: int = 6
     cdn_worker_lease_seconds: int = 300
+    # Keep routine prefetch below Alibaba's daily URL allowance. The reserve is
+    # available only to Android release artifacts; everything beyond either
+    # budget remains valid and fills the CDN on first access.
+    cdn_prefetch_daily_budget: int = 400
+    cdn_prefetch_priority_reserve: int = 50
+    cdn_background_prewarm_max_urls: int = 100
 
 
 @lru_cache
@@ -202,6 +219,12 @@ def get_settings() -> Settings:
 
 def validate_environment_contract(settings: Settings) -> None:
     """Fail closed when an explicitly configured runtime crosses environments."""
+    branch_enabled = bool(getattr(settings, "creator_branch_story_enabled", False))
+    text_video_enabled = bool(getattr(settings, "creator_text_to_video_enabled", False))
+    if branch_enabled and not text_video_enabled:
+        raise RuntimeError("Branch Story requires CREATOR_TEXT_TO_VIDEO_ENABLED")
+    if text_video_enabled and not str(getattr(settings, "creator_internal_key", "")).strip():
+        raise RuntimeError("creator video generation requires CREATOR_INTERNAL_KEY")
     environment = settings.pixo_environment
     if environment is None:
         return

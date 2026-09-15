@@ -7,7 +7,15 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.main import app
-from app.models import CreatorAccessGrant, EmailCode, PublishedVideo, User, UserToken
+from app.models import (
+    CreatorAccessGrant,
+    EmailCode,
+    PublishedVideo,
+    ReferralBinding,
+    User,
+    UserToken,
+)
+from app.protocol_video import supported_gestures
 from app.web_session import WEB_CSRF_COOKIE, WEB_SESSION_COOKIE
 
 
@@ -114,6 +122,49 @@ def test_web_email_login_keeps_existing_android_session(db) -> None:
     assert {row.token for row in tokens} == {android_token, web_token}
 
 
+def test_web_invite_binds_only_a_new_web_account_pending_android_activation(db) -> None:
+    now = datetime.now(timezone.utc)
+    _, inviter_token = _identity(db, "inviter")
+    with TestClient(app) as client:
+        invite = client.get(
+            "/api/v1/referrals/me",
+            headers={"Authorization": f"Bearer {inviter_token}"},
+        )
+        landing = client.get(invite.json()["url"])
+
+    db.add(
+        EmailCode(
+            email="new-invite@example.com",
+            purpose="login",
+            code="654321",
+            created_at=now,
+            expires_at=now + timedelta(minutes=10),
+        )
+    )
+    db.commit()
+
+    with _web_client() as client:
+        verified = client.post(
+            "/api/v1/web/auth/email/verify",
+            headers=_csrf(client),
+            json={
+                "email": "new-invite@example.com",
+                "code": "654321",
+                "invite_code": invite.json()["code"],
+            },
+        )
+
+    assert invite.status_code == 200
+    assert landing.status_code == 200
+    assert 'pixo://invite/' in landing.text
+    assert verified.status_code == 200
+    invitee = db.query(User).filter_by(subject="new-invite@example.com").one()
+    binding = db.get(ReferralBinding, invitee.user_id)
+    assert binding is not None
+    assert binding.inviter_user_id == "inviter"
+    assert binding.status == "pending_activation"
+
+
 def test_creator_access_modes_create_permanent_cross_client_grants(db, monkeypatch) -> None:
     _, token = _identity(db, "policy-user")
     monkeypatch.setenv("CREATOR_ACCESS_MODE", "web_open")
@@ -132,6 +183,43 @@ def test_creator_access_modes_create_permanent_cross_client_grants(db, monkeypat
         )
     assert android_access.json()["granted"] is True
     assert db.get(CreatorAccessGrant, "policy-user") is not None
+
+
+def test_web_session_can_read_shared_credits_referral_and_creator_capabilities(db) -> None:
+    _, token = _identity(db, "web-account-data")
+    db.add(CreatorAccessGrant(user_id="web-account-data", source="test"))
+    db.commit()
+
+    with _web_client(token) as client:
+        credits = client.get("/api/v1/credits")
+        referral = client.get("/api/v1/referrals/me")
+        capabilities = client.get("/api/v1/creator/capabilities")
+
+    assert credits.status_code == 200
+    assert referral.status_code == 200
+    assert referral.json()["code"]
+    assert capabilities.status_code == 200
+    body = capabilities.json()
+    assert body["creator_contract_version"] == "2"
+    assert body["credit_per_generated_second"] == 1
+    assert body["referral_reward_credits"] == 10
+    assert len(body["supported_interactions"]) == 35
+    assert {item["type"] for item in body["supported_interactions"]} == set(supported_gestures())
+    assert len(body["interaction_presets"]) == 53
+    assert len({item["id"] for item in body["interaction_presets"]}) == 53
+    assert sum(item["story_enabled"] for item in body["interaction_presets"]) == 47
+    assert {
+        "pinch_in", "pinch_out", "rotate_clockwise", "rotate_counterclockwise",
+        "camera_motion.face_smile", "camera_motion.hand_open_palm",
+        "camera_continuous.hand_finger_snap",
+        "camera_continuous.hand_finger_gun_recoil",
+    } <= {item["id"] for item in body["interaction_presets"]}
+    assert next(item for item in body["supported_interactions"] if item["type"] == "camera_continuous") == {
+        "type": "camera_continuous",
+        "lifecycle": "sustained",
+        "capability": "vision",
+        "story_enabled": False,
+    }
 
 
 def test_browser_resumable_upload_computes_checksum_on_finalize(db, monkeypatch, tmp_path) -> None:
