@@ -228,7 +228,7 @@ def validate_environment_contract(settings: Settings) -> None:
         raise RuntimeError("production ivapp must use pixopixo.com")
     if settings.seo_public_base_url.rstrip("/") != "https://pixopixo.com":
         raise RuntimeError("production ivapp must use the canonical SEO origin")
-    if settings.aliyun_oss_public_base_url.rstrip("/") != "https://video.pixopixo.cn":
+    if settings.aliyun_oss_public_base_url.rstrip("/") != "https://media.pixopixo.com":
         raise RuntimeError(
-            "production media must remain on video.pixopixo.cn until the CDN cutover"
+            "production media must use the canonical media.pixopixo.com origin"
         )

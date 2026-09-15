@@ -1,6 +1,6 @@
 # Pixo public-media CDN runbook
 
-The canonical public origin is `https://video.pixopixo.cn`. Only immutable
+The canonical public origin is `https://media.pixopixo.com`. Only immutable
 objects below `/ivapp-media/v1/public/` are eligible. Private objects, signed
 downloads and browser-to-OSS uploads continue to use OSS directly.
 
@@ -29,13 +29,13 @@ python -m app.cdn_cache prefetch CDN_URL --apply --resubmit
 ## Required environment
 
 ```dotenv
-ALIYUN_OSS_PUBLIC_BASE_URL=https://video.pixopixo.cn
-PUBLIC_MEDIA_LEGACY_ORIGINS=https://pixopixo-us.oss-us-east-1.aliyuncs.com,https://api.pixopixo.cn
-HTML_PUBLIC_BASE_URL=https://video.pixopixo.cn/ivapp-media/v1/public/html
-HTML_TRUSTED_ORIGINS=https://video.pixopixo.cn,https://api.pixopixo.cn,https://pixopixo-us.oss-us-east-1.aliyuncs.com
+ALIYUN_OSS_PUBLIC_BASE_URL=https://media.pixopixo.com
+PUBLIC_MEDIA_LEGACY_ORIGINS=https://pixopixo-us.oss-us-east-1.aliyuncs.com,https://api.pixopixo.cn,https://video.pixopixo.cn
+HTML_PUBLIC_BASE_URL=https://media.pixopixo.com/ivapp-media/v1/public/html
+HTML_TRUSTED_ORIGINS=https://media.pixopixo.com,https://api.pixopixo.cn,https://pixopixo-us.oss-us-east-1.aliyuncs.com
 CDN_CACHE_ENABLED=true
 CDN_PREFETCH_ON_PUBLISH=true
-CDN_DOMAIN=video.pixopixo.cn
+CDN_DOMAIN=media.pixopixo.com
 ALIBABA_CLOUD_IMDSV1_DISABLED=true
 ```
 
@@ -94,7 +94,7 @@ refresh, then publish a corrected immutable version as soon as possible:
 
 ```bash
 python -m app.cdn_cache refresh \
-  https://video.pixopixo.cn/ivapp-media/v1/public/path/to/object.mp4 --apply
+  https://media.pixopixo.com/ivapp-media/v1/public/path/to/object.mp4 --apply
 ```
 
 Directory refresh is intentionally unsupported. The command rejects other
@@ -105,9 +105,9 @@ domains, private paths, query strings and fragments.
 Check an HTML object and a byte range from a video through CDN:
 
 ```bash
-curl -fsSI https://video.pixopixo.cn/ivapp-media/v1/public/html/ITEM/VERSION/index.html
+curl -fsSI https://media.pixopixo.com/ivapp-media/v1/public/html/ITEM/VERSION/index.html
 curl -fsSI -H 'Range: bytes=0-1048575' \
-  https://video.pixopixo.cn/ivapp-media/v1/public/runtime/ITEM/PUBLICATION/single.mp4
+  https://media.pixopixo.com/ivapp-media/v1/public/runtime/ITEM/PUBLICATION/single.mp4
 ```
 
 Expect HTML to be served inline and the video request to return `206` with a

@@ -22,7 +22,7 @@ def _settings(environment: str, database_url: str) -> SimpleNamespace:
         seo_public_base_url=(
             "https://pixopixo.com/" if production else "https://demo.pixopixo.cn/"
         ),
-        aliyun_oss_public_base_url="https://video.pixopixo.cn",
+        aliyun_oss_public_base_url="https://media.pixopixo.com",
     )
 
 

@@ -40,7 +40,8 @@ from app.public_origin_migration import migrate_public_origins
 
 OLD_OSS = "https://pixopixo-us.oss-us-east-1.aliyuncs.com"
 OLD_API = "https://api.pixopixo.cn"
-CDN = "https://video.pixopixo.cn"
+OLD_CDN = "https://video.pixopixo.cn"
+CDN = "https://media.pixopixo.com"
 PUBLIC_PREFIX = "/ivapp-media/v1/public/"
 
 
@@ -52,11 +53,11 @@ def _settings(monkeypatch, *, cdn_enabled: bool = True):
         "ALIYUN_OSS_ACCESS_KEY_ID": "test-id",
         "ALIYUN_OSS_ACCESS_KEY_SECRET": "test-secret",
         "ALIYUN_OSS_PUBLIC_BASE_URL": CDN,
-        "PUBLIC_MEDIA_LEGACY_ORIGINS": f"{OLD_OSS},{OLD_API}",
+        "PUBLIC_MEDIA_LEGACY_ORIGINS": f"{OLD_OSS},{OLD_API},{OLD_CDN}",
         "OSS_ROOT_PREFIX": "ivapp-media/v1",
         "CDN_CACHE_ENABLED": "true" if cdn_enabled else "false",
         "CDN_PREFETCH_ON_PUBLISH": "true",
-        "CDN_DOMAIN": "video.pixopixo.cn",
+        "CDN_DOMAIN": "media.pixopixo.com",
         "CDN_WORKER_BATCH_SIZE": "50",
         "CDN_WORKER_MAX_ATTEMPTS": "3",
     }
