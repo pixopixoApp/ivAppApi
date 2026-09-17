@@ -54,6 +54,7 @@ from app.models import (
     PublishedVideo,
     PublishedVideoSeo,
     RecommendCursor,
+    RecommendStat,
     User,
     VideoView,
 )
@@ -632,6 +633,56 @@ def _locked_recommend_cursor(db: Session, *, state_key: str) -> RecommendCursor:
         .with_for_update()
         .one()
     )
+
+
+def _record_recommend_stats(db: Session, *, video_ids: list[str]) -> None:
+    """累计每个视频被推荐下发的次数（同步、幂等 UPSERT）。
+
+    仅由正常的 Redis 推荐下发流程调用；回放（rewind）批次不计数，以便该
+    统计反映“算法正常产出”的能力而非池子耗尽后的兜底重复。写入失败只告警、
+    不影响本次 feed 返回。
+    """
+    unique_ids = list(dict.fromkeys(video_ids))
+    if not unique_ids:
+        return
+    now = datetime.now(timezone.utc)
+    dialect = db.get_bind().dialect.name
+    try:
+        for vid in unique_ids:
+            values = {
+                "video_id": vid,
+                "count": 1,
+                "first_recommended_at": now,
+                "last_recommended_at": now,
+            }
+            if dialect == "mysql":
+                statement = mysql_insert(RecommendStat).values(**values)
+                statement = statement.on_duplicate_key_update(
+                    count=RecommendStat.count + 1,
+                    last_recommended_at=now,
+                )
+            elif dialect == "sqlite":
+                statement = sqlite_insert(RecommendStat).values(**values)
+                statement = statement.on_conflict_do_update(
+                    index_elements=[RecommendStat.video_id],
+                    set_={
+                        "count": RecommendStat.count + 1,
+                        "last_recommended_at": now,
+                    },
+                )
+            else:
+                row = db.get(RecommendStat, vid)
+                if row is None:
+                    db.add(RecommendStat(**values))
+                else:
+                    row.count = (row.count or 0) + 1
+                    row.last_recommended_at = now
+                continue
+            db.execute(statement)
+        db.commit()
+    except Exception:  # noqa: BLE001 - 统计失败不能影响推荐主流程
+        db.rollback()
+        log.warning("recommend stats write failed count=%d", len(unique_ids), exc_info=True)
 
 
 def _next_video_ids(
@@ -1393,6 +1444,10 @@ def post_video(
         except (RedisError, ImpressionUnavailableError):
             # 标记失败不影响本次返回（下次可能少量重复，可接受）
             log.warning("video redis mark_seen failed token=%s", token)
+
+    # 推荐次数统计：正常下发即累计（排除 rewind 回放），用于评估算法产出。
+    if not redis_is_rewind:
+        _record_recommend_stats(db, video_ids=[item.item_id for item in items])
 
     body = VideoBodyOut(
         items=items,

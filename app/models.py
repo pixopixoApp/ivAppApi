@@ -210,6 +210,26 @@ class RecommendCursor(Base):
     cursor: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class RecommendStat(Base):
+    """Per-video cumulative recommendation counter.
+
+    Incremented when an item is actually handed to a client by the Redis
+    recommendation path (rewind/replay batches are excluded so the number
+    reflects the algorithm's normal output rather than pool exhaustion).
+    """
+
+    __tablename__ = "recommend_stats"
+
+    video_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    first_recommended_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    last_recommended_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
 class AnalyticsLog(Base):
     __tablename__ = "analytics_logs"
 
