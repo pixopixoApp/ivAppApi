@@ -685,6 +685,32 @@ def _record_recommend_stats(db: Session, *, video_ids: list[str]) -> None:
         log.warning("recommend stats write failed count=%d", len(unique_ids), exc_info=True)
 
 
+def _seen_ttl_seconds(settings: Settings, *, is_guest: bool) -> int:
+    """已看去重池 TTL：游客短 TTL，登录 7 天（可配）。"""
+    if is_guest:
+        return settings.recommend_guest_seen_ttl_seconds
+    return settings.recommend_seen_expire_days * 86400
+
+
+def _write_user_seen(
+    store,
+    *,
+    settings: Settings,
+    seen_key: str,
+    video_id: str,
+    is_guest: bool,
+) -> None:
+    """写入推荐去重池 user:seen（供 /seen 与 /impression 共用）。
+
+    失败时抛 ImpressionUnavailableError，由调用方决定如何响应。
+    """
+    store.mark_seen(
+        seen_key=seen_key,
+        video_id=video_id,
+        ttl_seconds=_seen_ttl_seconds(settings, is_guest=is_guest),
+    )
+
+
 def _next_video_ids(
     db: Session,
     *,
@@ -1422,24 +1448,22 @@ def post_video(
     if not items:
         return video_error(ver=settings.server_ver, head_in=payload.head)
 
-    # 曝光即标记：本次推荐的视频写入 seen（游客短 TTL，登录 7 天），
-    # 实现游客“一次持续访问内去重”（下拉刷过的不再重复出现）。
-    if redis_seen_key:
+    # 曝光即标记（默认开启）：本次推荐的整页写入 seen（游客短 TTL，登录 7 天），
+    # 保证“下拉刷过的不再重复出现”。当 feature_seen_client_report=True 时关闭它，
+    # 改为仅依赖客户端上报（/seen 或 /impression），只标记用户真正看过/播放的内容。
+    if redis_seen_key and not settings.feature_seen_client_report:
         try:
             is_guest = user is None
-            ttl = (
-                settings.recommend_guest_seen_ttl_seconds
-                if is_guest
-                else settings.recommend_seen_expire_days * 86400
-            )
             store = get_recommend_store()
             # 只标记真正返回给客户端的 items，避免把候选但未真正返回的
             # （db 缺失/已删除/构建失败被跳过）误写入 seen 而后续被静默吞掉。
             for item in items:
-                store.mark_seen(
+                _write_user_seen(
+                    store,
+                    settings=settings,
                     seen_key=redis_seen_key,
                     video_id=item.item_id,
-                    ttl_seconds=ttl,
+                    is_guest=is_guest,
                 )
         except (RedisError, ImpressionUnavailableError):
             # 标记失败不影响本次返回（下次可能少量重复，可接受）
@@ -1620,6 +1644,21 @@ def post_impression(
         log.warning("impression redis unavailable user_id=%s", user.user_id)
         return impression_error(ver=settings.server_ver, head_in=payload.head)
 
+    # /impression 是客户端在“真正播放”时的上报，因此额外把它写入推荐去重池
+    # user:seen:{user_id}，让 Redis 推荐路径也能感知“已看过”的内容。
+    # 这样即使 /video 的“曝光即标记”关闭，去重仍由真实观看驱动。
+    # 该写入是“加分项”：失败只告警，不影响 /impression 本身的成功与播放周期记录。
+    try:
+        _write_user_seen(
+            get_recommend_store(),
+            settings=settings,
+            seen_key=user_seen_key(user.user_id),
+            video_id=video_id,
+            is_guest=False,
+        )
+    except (RedisError, ImpressionUnavailableError):
+        log.warning("impression user:seen write failed user_id=%s", user.user_id)
+
     exists = (
         db.query(VideoView)
         .filter(VideoView.video_id == video_id, VideoView.user_id == user.user_id)
@@ -1678,13 +1717,13 @@ def post_seen(
     seen_key = user_seen_key(user.user_id if user else ssid, is_guest=is_guest)
 
     try:
-        store = get_recommend_store()
-        ttl = (
-            settings.recommend_guest_seen_ttl_seconds
-            if is_guest
-            else settings.recommend_seen_expire_days * 86400
+        _write_user_seen(
+            get_recommend_store(),
+            settings=settings,
+            seen_key=seen_key,
+            video_id=video_id,
+            is_guest=is_guest,
         )
-        store.mark_seen(seen_key=seen_key, video_id=video_id, ttl_seconds=ttl)
     except (RedisError, ImpressionUnavailableError):
         log.warning("seen redis unavailable token=%s video_id=%s", token, video_id)
         return seen_error(ver=settings.server_ver, head_in=payload.head)

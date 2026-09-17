@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     # Redis 推荐内容池：启用后 /video 走 Redis 5档随机采样推荐；
     # Redis 不可用时自动降级为原有 MySQL 直查逻辑。
     feature_recommend_redis: bool = False
+    # 已看去重来源开关：
+    #   False（默认）= 保留 /video 的“曝光即标记”（整页写入 user:seen）。
+    #   True = 关闭曝光即标记，推荐去重改为仅依赖客户端上报（/seen 或 /impression）。
+    # 切换前必须确认客户端已在可靠上报，否则去重会失效、重复增加。
+    feature_seen_client_report: bool = False
 
     # 新视频窗口（秒）：feed_weight 分档下，created_at 在此窗口内的视为“新内容”优先曝光
     recommend_new_video_window_seconds: int = 3 * 86400
