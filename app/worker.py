@@ -43,6 +43,7 @@ from app.public_text import (
     record_creator_generation_text,
     record_creator_version_text,
 )
+from app.recommend_pool_builder import rebuild_once
 
 log = get_logger(__name__)
 _stop = False
@@ -1163,6 +1164,12 @@ def main() -> int:
     # A submission with no remote job id is safe to replay: request_id makes
     # the private ivadmin endpoint idempotent. Existing remote jobs stay running
     # and are simply polled after a process restart.
+    #
+    # The Redis recommendation pool is rebuilt periodically from this process
+    # (the only long-lived worker) so newly labeled/updated published_videos
+    # actually reach the 5-tier content pool without a manual step.
+    rebuild_interval = settings.recommend_pool_rebuild_interval_seconds
+    next_rebuild_at = 0.0  # rebuild once right after startup
     while not _stop:
         processed = False
         with _global_worker_slot() as acquired:
@@ -1172,6 +1179,11 @@ def main() -> int:
                 created = process_next_creator_version(settings)
                 expired = process_next_expired_source(settings)
                 processed = normalized or generated or created or expired
+        if rebuild_interval > 0:
+            now = time.monotonic()
+            if now >= next_rebuild_at:
+                rebuild_once()
+                next_rebuild_at = now + rebuild_interval
         interval = 0.25 if processed else settings.creator_worker_poll_seconds
         time.sleep(max(0.25, interval))
     log.info("creator coordinator stopped")

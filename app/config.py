@@ -142,6 +142,9 @@ class Settings(BaseSettings):
     recommend_guest_seen_ttl_seconds: int = 86400
     # 内容池 shadow 重建批次大小
     recommend_pool_batch_size: int = 500
+    # 内容池自动重建周期（秒）；worker 常驻进程按此间隔重建 5 档 Redis 内容池，
+    # <=0 表示禁用自动重建（仅手动触发）。默认 30 分钟。
+    recommend_pool_rebuild_interval_seconds: int = 1800
 
     # Creator orchestration. ivapp owns C-end state while ivadmin exclusively
     # owns ivcore/model/Dify execution.
