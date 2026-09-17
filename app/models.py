@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     SmallInteger,
@@ -157,6 +158,20 @@ class PublishedVideoSeo(Base):
     )
 
 
+class PublishedVideoSeoSlugAlias(Base):
+    """Permanent legacy permalink mapped to the current SEO document."""
+
+    __tablename__ = "published_video_seo_slug_aliases"
+
+    slug: Mapped[str] = mapped_column(String(180), primary_key=True)
+    video_id: Mapped[str] = mapped_column(
+        ForeignKey("published_video_seo.video_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class PublicTextIssue(Base):
     """Non-blocking audit record for text that may not be English.
 
@@ -259,6 +274,69 @@ class UserToken(Base):
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CreditLedgerEntry(Base):
+    """Append-only account-credit movements.
+
+    Holds reduce the spendable balance immediately.  A later settlement is a
+    zero-value audit event; releases credit the held amount back.  This keeps
+    the balance derivable from immutable rows while ``CreditReservation``
+    carries the small amount of workflow state that must change over time.
+    """
+
+    __tablename__ = "credit_ledger_entries"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    reservation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    reference_id: Mapped[str] = mapped_column(String(128), nullable=False, default="", index=True)
+    note: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CreditReservation(Base):
+    """Idempotent lifecycle for one billable AI generation request."""
+
+    __tablename__ = "credit_reservations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "reference_id", name="uq_credit_reservation_reference"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    reference_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="reserved", index=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ReferralInvite(Base):
+    """Stable, non-secret referral code owned by a user."""
+
+    __tablename__ = "referral_invites"
+
+    owner_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ReferralBinding(Base):
+    """One invitee can be attributed once and activates from Android once."""
+
+    __tablename__ = "referral_bindings"
+
+    invitee_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    inviter_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    invite_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending_activation", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Follow(Base):
@@ -457,8 +535,12 @@ class CreatorUpload(Base):
 
 class CreatorCreation(Base):
     __tablename__ = "creator_creations"
+    __table_args__ = (Index("ix_creator_drafts_user_updated", "user_id", "updated_at", "id"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    experience_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
+    story_plan: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     upload_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source_mode: Mapped[str] = mapped_column(
@@ -515,6 +597,8 @@ class CreatorSourceGeneration(Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     original_prompt: Mapped[str] = mapped_column(String(1000), nullable=False)
+    generation_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="source")
+    input_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     prompt_summary: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     generation_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
     interaction_brief: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
@@ -568,6 +652,7 @@ class CreatorVersion(Base):
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     brief: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    previewed_paths: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="queued", index=True
     )

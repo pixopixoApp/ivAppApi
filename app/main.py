@@ -68,6 +68,7 @@ app.include_router(platform.operations_router)
 app.include_router(safety.client_router)
 app.include_router(safety.operations_router)
 app.include_router(web.router)
+app.include_router(web.invite_router)
 app.include_router(seo.public_router)
 app.include_router(seo.internal_router)
 

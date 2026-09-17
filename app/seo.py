@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
@@ -11,7 +12,12 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.html_content import CONTENT_TYPE_HTML, CONTENT_TYPE_RUNTIME
-from app.models import PublishedVideo, PublishedVideoSeo, User
+from app.models import (
+    PublishedVideo,
+    PublishedVideoSeo,
+    PublishedVideoSeoSlugAlias,
+    User,
+)
 
 SEO_STATUSES = frozenset({"pending", "generating", "ready", "failed", "stale"})
 _PLACEHOLDERS = frozenset(
@@ -24,6 +30,55 @@ _PLACEHOLDERS = frozenset(
         "video",
     }
 )
+_SLUG_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "in",
+        "on",
+        "at",
+        "for",
+        "to",
+        "with",
+        "and",
+        "or",
+        "of",
+        "by",
+        "is",
+        "are",
+    }
+)
+_SLUG_PROMOTIONAL_WORDS = frozenset(
+    {
+        "ultimate",
+        "best",
+        "amazing",
+        "awesome",
+        "easy",
+        "simple",
+    }
+)
+_SLUG_EDITORIAL_FILLER = frozenset(
+    {
+        "complete",
+        "guide",
+        "how",
+        "overview",
+        "review",
+        "step",
+        "steps",
+        "tips",
+        "top",
+        "tricks",
+        "ways",
+    }
+)
+_SLUG_EXCLUDED_WORDS = (
+    _SLUG_STOP_WORDS | _SLUG_PROMOTIONAL_WORDS | _SLUG_EDITORIAL_FILLER
+)
+_SLUG_MAX_WORDS = 5
+_SLUG_RANDOM_ATTEMPTS = 32
 
 
 def utcnow() -> datetime:
@@ -52,13 +107,54 @@ def is_placeholder_text(value: str | None) -> bool:
     return bool(re.fullmatch(r"(?:video|experience|story)[-_ ]?\d*", text))
 
 
-def slugify(value: str, *, video_id: str) -> str:
-    ascii_text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
-    stem = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")[:120]
-    if not stem:
-        stem = "interactive-experience"
-    suffix = hashlib.sha256(video_id.encode("utf-8")).hexdigest()[:16]
-    return f"{stem}-{suffix}"
+def seo_slug_stem(value: str) -> str:
+    """Extract a short, lower-case ASCII keyword stem from an English title."""
+    ascii_text = (
+        unicodedata.normalize("NFKD", value)
+        .encode("ascii", "ignore")
+        .decode()
+        .lower()
+    )
+    # Apostrophes and periods inside words add no useful URL boundary. Other
+    # punctuation is naturally treated as a separator by the token matcher.
+    ascii_text = ascii_text.replace("'", "").replace(".", "")
+    words = []
+    for word in re.findall(r"[a-z0-9]+", ascii_text):
+        if word in _SLUG_EXCLUDED_WORDS:
+            continue
+        if word.isdigit() or re.fullmatch(r"(?:top|best)\d+|\d+(?:top|best)|v\d+", word):
+            continue
+        words.append(word[:40])
+        if len(words) == _SLUG_MAX_WORDS:
+            break
+    stem = "-".join(words).strip("-")[:120].rstrip("-")
+    return stem or "interactive-video"
+
+
+def slugify(value: str, *, suffix: int | None = None) -> str:
+    """Build a readable slug with one persisted five-digit random suffix."""
+    number = suffix if suffix is not None else secrets.randbelow(90_000) + 10_000
+    if not 10_000 <= number <= 99_999:
+        raise ValueError("slug suffix must be a five-digit integer")
+    return f"{seo_slug_stem(value)}-{number:05d}"
+
+
+def unique_slug(db: Session, value: str, *, video_id: str) -> str:
+    """Generate an unused slug without changing another video's permalink."""
+    for _attempt in range(_SLUG_RANDOM_ATTEMPTS):
+        candidate = slugify(value)
+        current_collision = (
+            db.query(PublishedVideoSeo.video_id)
+            .filter(
+                PublishedVideoSeo.slug == candidate,
+                PublishedVideoSeo.video_id != video_id,
+            )
+            .first()
+        )
+        alias_collision = db.get(PublishedVideoSeoSlugAlias, candidate)
+        if current_collision is None and alias_collision is None:
+            return candidate
+    raise RuntimeError("could not allocate a unique five-digit SEO slug")
 
 
 def source_document(row: PublishedVideo) -> dict[str, Any]:
@@ -96,7 +192,7 @@ def ensure_seo_row(db: Session, row: PublishedVideo) -> PublishedVideoSeo:
     now = utcnow()
     seo = PublishedVideoSeo(
         video_id=row.id,
-        slug=slugify(row.title or "", video_id=row.id),
+        slug=unique_slug(db, row.title or "", video_id=row.id),
         status="pending",
         source_hash=source_hash(row),
         thumbnail_url=(
@@ -174,7 +270,7 @@ def seo_public_item(
     *,
     site_url: str,
 ) -> dict[str, Any]:
-    canonical = f"{site_url.rstrip('/')}/experiences/{seo.slug}"
+    canonical = f"{site_url.rstrip('/')}/videos/{seo.slug}"
     thumbnail_path = seo.thumbnail_url or (
         f"/posters/{row.id}.jpg"
         if row.content_type == CONTENT_TYPE_RUNTIME

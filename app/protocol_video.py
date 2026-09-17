@@ -38,7 +38,8 @@ CONTINUOUS_TAP_RUNTIME_SPEC_VERSION = "1.2"
 CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION = "1.3"
 FINGER_GUN_RUNTIME_SPEC_VERSION = "1.4"
 CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION = "1.5"
-RUNTIME_SPEC_VERSION = "1.6"
+CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION = "1.6"
+RUNTIME_SPEC_VERSION = "1.7"
 SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
     {
         "1.0",
@@ -47,6 +48,7 @@ SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
         CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION,
         FINGER_GUN_RUNTIME_SPEC_VERSION,
         CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
+        CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
         RUNTIME_SPEC_VERSION,
     }
 )
@@ -56,6 +58,10 @@ RUNTIME_SPEC_SCHEMA = "pixo.runtime.v1"
 # Per-gesture detection defaults (App interaction-type catalog).
 _TOUCH_MID = {"confidence_threshold": _CONF, "place": "middle_middle"}
 _MOTION_BOT = {"confidence_threshold": _CONF, "place": "middle_bottom"}
+ROTATION_DIRECTIONS = frozenset({"clockwise", "counterclockwise"})
+DEFAULT_ROTATION_DIRECTION = "counterclockwise"
+PINCH_DIRECTIONS = frozenset({"inward", "outward"})
+DEFAULT_PINCH_DIRECTION = "inward"
 
 _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
     "tap": {**_TOUCH_MID, "response_window_ms": 0},
@@ -92,7 +98,8 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
         "response_window_ms": 0,
         "idle_timeout_ms": 500,
     },
-    "pinch": {**_TOUCH_MID, "response_window_ms": 0, "min_scale_delta": 0.2},
+    "pinch": {**_TOUCH_MID, "response_window_ms": 0, "min_scale_delta": 0.06,
+              "pinch_direction": DEFAULT_PINCH_DIRECTION},
     "draw_circle": {
         **_TOUCH_MID,
         "response_window_ms": 0,
@@ -113,7 +120,12 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
     "tilt_left": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
     "tilt_right": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
     "shake": {**_MOTION_BOT, "response_window_ms": 0, "min_shake_score": 60},
-    "rotate": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 75},
+    "rotate": {
+        **_MOTION_BOT,
+        "response_window_ms": 0,
+        "min_angle_deg": 75,
+        "rotation_direction": DEFAULT_ROTATION_DIRECTION,
+    },
     "mic_level": {
         **_MOTION_BOT,
         "response_window_ms": 0,
@@ -189,8 +201,26 @@ class RuntimeSpecError(ValueError):
     """Source cannot be compiled or persisted runtime data is invalid."""
 
 
+def normalize_rotation_direction(value: Any) -> str:
+    """Return the stable rotate direction, preserving legacy behavior by default."""
+    if value is None:
+        return DEFAULT_ROTATION_DIRECTION
+    if not isinstance(value, str) or value not in ROTATION_DIRECTIONS:
+        choices = ", ".join(sorted(ROTATION_DIRECTIONS))
+        raise RuntimeSpecError(f"rotation_direction must be one of: {choices}")
+    return value
+
+
 def supported_gestures() -> frozenset[str]:
     return frozenset(_DETECTION_BY_GESTURE)
+
+
+def normalize_pinch_direction(value: Any) -> str:
+    if value is None:
+        return DEFAULT_PINCH_DIRECTION
+    if not isinstance(value, str) or value not in PINCH_DIRECTIONS:
+        raise RuntimeSpecError("pinch_direction must be inward or outward")
+    return value
 
 
 def normalize_client_runtime_spec_versions(
@@ -228,6 +258,12 @@ def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
     if base is None:
         raise RuntimeSpecError(f"unsupported gesture: {gesture}")
     detection = dict(base)
+    if gesture == "rotate":
+        detection["rotation_direction"] = normalize_rotation_direction(
+            item.get("rotation_direction")
+        )
+    if gesture == "pinch":
+        detection["pinch_direction"] = normalize_pinch_direction(item.get("pinch_direction"))
     region = item.get("region")
     if isinstance(region, dict):
         detection["place"] = region_to_place(region)
@@ -371,6 +407,8 @@ def _one_interaction(item: dict, *, index: int) -> dict:
     if not isinstance(pause_video, bool):
         raise RuntimeSpecError(f"interaction[{index}] pause_video must be boolean")
     description = interaction_instruction(gesture)
+    if gesture == "pinch":
+        description = "Spread two fingers outward" if detection["pinch_direction"] == "outward" else "Pinch inward"
     if gesture == "camera_motion":
         vision = detection.get("vision")
         target = vision.get("target") if isinstance(vision, dict) else None
@@ -621,8 +659,12 @@ def compile_runtime_spec(
         for interaction in clip["interactions"]
         if interaction["type"] == "camera_continuous"
     }
-    if "mic_level_continuous" in interaction_types:
+    if any(interaction["type"] == "pinch"
+           and interaction.get("detection", {}).get("pinch_direction") == "outward"
+           for clip in clips for interaction in clip["interactions"]):
         compiled_version = RUNTIME_SPEC_VERSION
+    elif "mic_level_continuous" in interaction_types:
+        compiled_version = CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION
     elif "mic_blow_continuous" in interaction_types:
         compiled_version = CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION
     elif "hand_finger_gun_recoil" in camera_continuous_targets:
@@ -688,6 +730,10 @@ def read_runtime_spec(
         for index, interaction in enumerate(clip.interactions):
             if interaction.type not in _DETECTION_BY_GESTURE:
                 raise RuntimeSpecError(f"unsupported gesture: {interaction.type}")
+            if interaction.type == "pinch":
+                direction = normalize_pinch_direction(interaction.detection.pinch_direction)
+                if direction == "outward" and version != RUNTIME_SPEC_VERSION:
+                    raise RuntimeSpecError("outward pinch requires runtime spec version 1.7")
             if version == "1.0" and interaction.type == "continuous_swipe":
                 raise RuntimeSpecError("continuous_swipe requires runtime spec version 1.1")
             if version in {"1.0", "1.1"} and interaction.type == "continuous_tap":
@@ -696,6 +742,8 @@ def read_runtime_spec(
                 version not in {
                     CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION,
                     FINGER_GUN_RUNTIME_SPEC_VERSION,
+                    CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
+                    CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }
                 and interaction.type == "camera_continuous"
@@ -798,6 +846,7 @@ def read_runtime_spec(
                 detection = interaction.detection
                 if version not in {
                     CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
+                    CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(
@@ -828,7 +877,7 @@ def read_runtime_spec(
                     )
             if interaction.type == "mic_level_continuous":
                 detection = interaction.detection
-                if version != RUNTIME_SPEC_VERSION:
+                if version not in {CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION, RUNTIME_SPEC_VERSION}:
                     raise RuntimeSpecError(
                         "mic_level_continuous requires runtime spec version 1.6"
                     )

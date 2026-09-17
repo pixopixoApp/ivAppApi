@@ -17,7 +17,9 @@ import httpx
 from sqlalchemy import case, text
 from sqlalchemy.orm import Session
 
+from app.cdn_cache import enqueue_private_media_prefetch
 from app.config import Settings, get_settings, validate_environment_contract
+from app.credits import release_reference, settle_reference
 from app.db import SessionLocal, engine
 from app.logging_config import get_logger, setup_logging
 from app.media_cache import local_path_for_sha256
@@ -130,12 +132,13 @@ def _request(
     url = f"{settings.ivadmin_base_url.rstrip('/')}{path}"
     headers = dict(kwargs.pop("headers", {}))
     headers["X-Creator-Internal-Key"] = settings.creator_internal_key
+    timeout = kwargs.pop("timeout", settings.creator_ivadmin_timeout_seconds)
     try:
         response = httpx.request(
             method,
             url,
             headers=headers,
-            timeout=settings.creator_ivadmin_timeout_seconds,
+            timeout=timeout,
             trust_env=False,
             **kwargs,
         )
@@ -258,6 +261,7 @@ def process_next_upload_normalization(settings: Settings | None = None) -> bool:
     if media_mode_is_oss(settings):
         candidate = pending | (
             (CreatorUpload.normalization_status == "ready")
+            & (CreatorUpload.upload_transport != "story-cut")
             & (
                 (CreatorUpload.media_object_id.is_(None))
                 | (CreatorUpload.playable_media_object_id.is_(None))
@@ -324,10 +328,23 @@ def _sync_source_creation(
     creation: CreatorCreation,
     generation: CreatorSourceGeneration,
 ) -> None:
+    if generation.generation_kind in {"B", "C"}:
+        from app.creator_story import sync_story
+        locked = (
+            db.query(CreatorCreation)
+            .filter(CreatorCreation.id == creation.id)
+            .populate_existing()
+            .with_for_update()
+            .one_or_none()
+        )
+        if locked is not None:
+            sync_story(db, locked)
+        return
     if creation.source_generation_id != generation.id or creation.status == "abandoned":
         return
     creation.source_prompt = generation.original_prompt
-    creation.upload_id = generation.upload_id
+    if generation.upload_id:
+        creation.upload_id = generation.upload_id
     creation.progress_stage = generation.progress_stage
     creation.progress_percent = generation.progress_percent
     creation.error_code = generation.error_code
@@ -347,6 +364,7 @@ def _sync_source_creation(
 
 def _generated_upload(
     db: Session,
+    settings: Settings,
     generation: CreatorSourceGeneration,
     payload: dict[str, Any],
 ) -> CreatorUpload:
@@ -366,6 +384,11 @@ def _generated_upload(
         raise CreatorTransportError("ivadmin returned an invalid generated video checksum")
     if size_bytes <= 0 or duration_ms <= 0 or not local_uri or not storage_key:
         raise CreatorTransportError("ivadmin returned incomplete generated video metadata")
+    expected_duration_ms = settings.creator_video_duration_seconds * 1_000
+    if abs(duration_ms - expected_duration_ms) > 500:
+        raise CreatorTransportError(
+            "generated source duration does not match the configured contract"
+        )
     if media_object_id:
         media = db.get(MediaObject, media_object_id)
         if (
@@ -407,11 +430,35 @@ def _finish_source_from_upload(
     upload: CreatorUpload,
 ) -> None:
     if upload.normalization_status == "ready":
+        playable_media_id = upload.playable_media_object_id or upload.media_object_id
+        playable_media = db.get(MediaObject, playable_media_id) if playable_media_id else None
+        if (
+            upload.origin == "ai_generated"
+            and playable_media is not None
+            and playable_media.state == "ready"
+            and playable_media.visibility == "private"
+        ):
+            enqueue_private_media_prefetch(
+                db,
+                settings,
+                [playable_media.object_key],
+            )
         generation.status = "ready"
         generation.progress_stage = "review_source"
         generation.progress_percent = 100
         generation.error_code = ""
         generation.error_message = ""
+        settle_reference(
+            db,
+            user_id=generation.user_id,
+            reference_id=f"source:{generation.id}",
+        )
+        if generation.quota_state == "reserved":
+            generation.quota_state = "charged"
+        # Story endings are accepted as soon as their preview is durable. They
+        # must survive independently while the other ending is retried.
+        if generation.generation_kind in {"B", "C"}:
+            generation.accepted_at = generation.accepted_at or _now()
     elif upload.normalization_status == "failed":
         generation.status = "failed"
         generation.progress_stage = "failed"
@@ -419,6 +466,11 @@ def _finish_source_from_upload(
         generation.error_message = (
             upload.normalization_error or "The generated video could not be prepared."
         )[:500]
+        release_reference(
+            db,
+            user_id=generation.user_id,
+            reference_id=f"source:{generation.id}",
+        )
     else:
         generation.status = "running"
         generation.progress_stage = "preparing_preview"
@@ -457,8 +509,6 @@ def _apply_source_job(
     accepted = bool(payload.get("provider_task_accepted"))
     if accepted:
         generation.provider_task_accepted = True
-        if generation.quota_state == "reserved":
-            generation.quota_state = "charged"
     try:
         generation.progress_percent = max(
             0,
@@ -494,8 +544,13 @@ def _apply_source_job(
         )
         if generation.quota_state == "reserved":
             generation.quota_state = "released"
+        release_reference(
+            db,
+            user_id=generation.user_id,
+            reference_id=f"source:{generation.id}",
+        )
     else:
-        upload = _generated_upload(db, generation, payload)
+        upload = _generated_upload(db, settings, generation, payload)
         _finish_source_from_upload(db, settings, creation, generation, upload)
 
     generation.updated_at = _now()
@@ -513,12 +568,25 @@ def process_source_generation(
     creation = db.get(CreatorCreation, generation.creation_id)
     if creation is None or creation.user_id != generation.user_id:
         raise CreationError("CREATION_MISSING", "Creator session no longer exists.")
+    started = generation.created_at.replace(tzinfo=timezone.utc) if generation.created_at.tzinfo is None else generation.created_at
+    if (_now() - started).total_seconds() > 2400:
+        raise CreationError("GENERATION_TIMEOUT", "Generation took too long. Your reserved Credits will be released; please retry.")
+    if generation.generation_kind in {"B", "C"}:
+        from app.creator_story import prepare_assets
+        prepare_assets(db, creation, _request)
 
     if generation.cancel_requested and generation.upload_id:
         generation.status = "cancelled"
         generation.progress_stage = "cancelled"
         generation.error_code = "CANCELLED"
         generation.error_message = "Generated source was not accepted."
+        if generation.quota_state == "reserved":
+            generation.quota_state = "released"
+        release_reference(
+            db,
+            user_id=generation.user_id,
+            reference_id=f"source:{generation.id}",
+        )
         generation.updated_at = _now()
         db.add(generation)
         _sync_source_creation(db, creation, generation)
@@ -548,6 +616,11 @@ def process_source_generation(
         generation.error_message = "Video generation was cancelled."
         if generation.quota_state == "reserved":
             generation.quota_state = "released"
+        release_reference(
+            db,
+            user_id=generation.user_id,
+            reference_id=f"source:{generation.id}",
+        )
         generation.updated_at = _now()
         db.add(generation)
         _sync_source_creation(db, creation, generation)
@@ -570,6 +643,10 @@ def process_source_generation(
                 "creation_id": generation.creation_id,
                 "generation_id": generation.id,
                 "prompt": generation.original_prompt,
+                "duration_seconds": settings.creator_video_duration_seconds,
+                **({"first_frame_source": (generation.input_json or {})["first_frame_source"],
+                    "first_frame_at_ms": (generation.input_json or {})["first_frame_at_ms"]}
+                   if generation.generation_kind in {"B", "C"} else {}),
             },
         )
     _apply_source_job(db, settings, creation, generation, _parse_job(response))
@@ -622,6 +699,7 @@ def _fail_source(
     if fresh.quota_state == "reserved":
         fresh.quota_state = "released"
     fresh.updated_at = _now()
+    release_reference(db, user_id=fresh.user_id, reference_id=f"source:{fresh.id}")
     creation = db.get(CreatorCreation, fresh.creation_id)
     if creation is not None:
         _sync_source_creation(db, creation, fresh)
@@ -811,7 +889,9 @@ def _submit_job(
         if version.retry_count == 0
         else f"{version.request_id}:retry:{version.retry_count}"
     )
-    if version.number == 1:
+    has_analysis = db.query(CreatorVersion.id).filter(CreatorVersion.creation_id == creation.id,
+                                                     CreatorVersion.ivadmin_run_id != "").first() is not None
+    if not has_analysis:
         upload = db.get(CreatorUpload, creation.upload_id)
         if upload is None or upload.user_id != creation.user_id:
             raise CreationError("UPLOAD_MISSING", "The source video is no longer available.")

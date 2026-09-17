@@ -13,7 +13,9 @@ from app.cdn_cache import (
     CdnTaskResult,
     active_public_urls,
     enqueue_prefetch,
+    enqueue_private_media_prefetch,
     enqueue_refresh,
+    private_media_delivery_url,
     process_once,
     wait_for_cache_jobs,
     wait_for_cache_jobs_submitted,
@@ -22,11 +24,13 @@ from app.cdn_publication import CdnPublicationError, stage_publication_gate
 from app.config import get_settings
 from app.models import (
     CdnCacheJob,
+    CdnPublicationGate,
     CreatorCreation,
     CreatorVersion,
     MediaObject,
     PublishedMediaAsset,
     PublishedVideo,
+    PublishedVideoSeo,
     User,
 )
 from app.private_cdn import sign_private_media_url
@@ -121,6 +125,95 @@ def test_private_media_url_uses_short_lived_cdn_type_a_signature(monkeypatch) ->
     )
 
 
+def test_private_media_url_uses_public_cdn_for_oss_signed_fallback(monkeypatch) -> None:
+    settings = _settings(monkeypatch)
+    key = "ivapp-media/v1/private/creator-sources/aa/source.mp4"
+    monkeypatch.setattr(
+        "app.private_cdn.sign_get_url",
+        lambda *_args, **_kwargs: (
+            "https://bucket.oss-us-east-1.aliyuncs.com/"
+            f"{key}?OSSAccessKeyId=test&Expires=1700000000&Signature=signed"
+        ),
+    )
+
+    assert sign_private_media_url(settings, key=key, expires_seconds=120) == (
+        f"{CDN}/{key}?OSSAccessKeyId=test&Expires=1700000000&Signature=signed"
+    )
+
+
+def test_private_creator_prefetch_has_stable_identity_and_fresh_submission_signature(
+    monkeypatch,
+    db,
+) -> None:
+    settings = _settings(monkeypatch)
+    key = "ivapp-media/v1/private/creator-sources/aa/source.mp4"
+    signed = f"{CDN}/{key}?Expires=1700000000&Signature=fresh"
+    signing_calls = []
+
+    def fake_sign(*_args, **kwargs):
+        signing_calls.append(kwargs)
+        return signed
+
+    monkeypatch.setattr("app.cdn_cache.sign_private_media_url", fake_sign)
+    jobs = enqueue_private_media_prefetch(db, settings, [key, key])
+    db.commit()
+
+    assert len(jobs) == 1
+    assert jobs[0].url == signed
+    assert jobs[0].url_hash == hashlib.sha256(f"{CDN}/{key}".encode()).hexdigest()
+    assert signing_calls == [{"key": key, "expires_seconds": 900}]
+
+    warmed = []
+    monkeypatch.setattr(
+        "app.cdn_cache._warm_private_media_url",
+        lambda url, _settings: warmed.append(url),
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def submit(self, operation, urls):
+            self.calls.append((operation, urls))
+            return CdnSubmission(task_id="private-task", request_id="private-request")
+
+        def status(self, _task_id):
+            return CdnTaskResult(state="succeeded")
+
+    provider = Provider()
+    assert process_once(db, settings, provider=provider) == 1
+    db.refresh(jobs[0])
+    assert jobs[0].state == "succeeded"
+    assert warmed == [signed]
+    assert provider.calls == []
+
+    renewed = f"{CDN}/{key}?Expires=1700000900&Signature=renewed"
+    monkeypatch.setattr(
+        "app.cdn_cache.sign_private_media_url",
+        lambda *_args, **_kwargs: renewed,
+    )
+    forced = enqueue_private_media_prefetch(db, settings, [key], force=True)
+    assert forced[0].url == renewed
+
+
+def test_private_delivery_reuses_the_exact_fresh_warmed_url(monkeypatch, db) -> None:
+    settings = _settings(monkeypatch)
+    key = "ivapp-media/v1/private/creator-sources/aa/source.mp4"
+    signed = f"{CDN}/{key}?Expires=1700000900&Signature=fresh"
+    monkeypatch.setattr("app.cdn_cache.time.time", lambda: 1_700_000_000)
+    monkeypatch.setattr(
+        "app.cdn_cache.sign_private_media_url",
+        lambda *_args, **_kwargs: signed,
+    )
+    job = enqueue_private_media_prefetch(db, settings, [key])[0]
+    job.state = "succeeded"
+    db.commit()
+
+    assert private_media_delivery_url(db, settings, key=key) == signed
+    db.refresh(job)
+    assert job.state == "succeeded"
+
+
 def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, db) -> None:
     settings = _settings(monkeypatch)
     url = f"{CDN}{PUBLIC_PREFIX}runtime/work/pub/single.mp4"
@@ -164,6 +257,74 @@ def test_cache_outbox_deduplicates_and_worker_marks_provider_task(monkeypatch, d
             settings,
             [f"{OLD_OSS}{PUBLIC_PREFIX}runtime/work/pub/single.mp4"],
         )
+
+
+def test_prefetch_quota_uses_on_demand_cdn_fallback(monkeypatch, db) -> None:
+    settings = _settings(monkeypatch)
+    url = f"{CDN}{PUBLIC_PREFIX}runtime/work/pub/quota.mp4"
+    job = enqueue_prefetch(db, settings, [url])[0]
+    db.commit()
+
+    class Provider:
+        @staticmethod
+        def submit(_operation, _urls):
+            raise RuntimeError("QuotaExceeded.Preload: daily limit reached")
+
+        @staticmethod
+        def status(_task_id):
+            raise AssertionError("a rejected prefetch has no provider task")
+
+    assert process_once(db, settings, provider=Provider()) == 1
+    db.refresh(job)
+    assert job.state == "succeeded"
+    assert job.provider_task_id == ""
+    assert job.request_id == "fallback:on-demand"
+    assert job.error_message == ""
+    assert wait_for_cache_jobs_submitted(db, [job.id], timeout_seconds=1) == {
+        job.id: "fallback:on-demand"
+    }
+
+
+def test_daily_budget_reserves_provider_capacity_for_android_apks(
+    monkeypatch,
+    db,
+) -> None:
+    _settings(monkeypatch)
+    monkeypatch.setenv("CDN_PREFETCH_DAILY_BUDGET", "1")
+    monkeypatch.setenv("CDN_PREFETCH_PRIORITY_RESERVE", "1")
+    get_settings.cache_clear()
+    settings = get_settings()
+    routine_urls = [
+        f"{CDN}{PUBLIC_PREFIX}runtime/work/pub/{name}.mp4"
+        for name in ("one", "two")
+    ]
+    apk_url = f"{CDN}{PUBLIC_PREFIX}app-releases/android/pixo.apk"
+    jobs = enqueue_prefetch(db, settings, [*routine_urls, apk_url])
+    db.commit()
+
+    class Provider:
+        def __init__(self) -> None:
+            self.urls = []
+
+        def submit(self, operation, urls):
+            assert operation == "prefetch"
+            self.urls = list(urls)
+            return CdnSubmission(task_id="budget-task", request_id="budget-request")
+
+        @staticmethod
+        def status(_task_id):
+            return CdnTaskResult(state="succeeded")
+
+    provider = Provider()
+    assert process_once(db, settings, provider=provider) == 3
+    assert apk_url in provider.urls
+    assert len(provider.urls) == 2
+    db.expire_all()
+    refreshed = [db.get(CdnCacheJob, job.id) for job in jobs]
+    fallback = [job for job in refreshed if job.request_id == "fallback:on-demand"]
+    submitted = [job for job in refreshed if job.provider_task_id == "budget-task"]
+    assert len(fallback) == 1
+    assert len(submitted) == 2
 
 
 def test_failed_prefetch_can_be_requeued_and_waited_for(monkeypatch, db) -> None:
@@ -534,6 +695,7 @@ def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db
         upload_id="upload",
         status="ready",
         runtime_spec=old_spec,
+        story_plan={"legacy_video": f"{OLD_OSS}/legacy/videos/work.mp4"},
         created_at=now,
         updated_at=now,
     )
@@ -556,6 +718,34 @@ def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db
             user,
             creation,
             version,
+            PublishedVideoSeo(
+                video_id=video.id,
+                slug="work",
+                thumbnail_url=f"{OLD_CDN}{PUBLIC_PREFIX}covers/work.jpg",
+                status="ready",
+                created_at=now,
+                updated_at=now,
+            ),
+            CdnCacheJob(
+                id="cdn_prefetch_legacy",
+                operation="prefetch",
+                url_hash=hashlib.sha256(old_url.encode()).hexdigest(),
+                url=f"{CDN}/{runtime_key}",
+                state="succeeded",
+                attempts=1,
+                next_attempt_at=now,
+                created_at=now,
+                updated_at=now,
+            ),
+            CdnPublicationGate(
+                publication_id="pub",
+                video_id=video.id,
+                urls=[old_url],
+                staged_payload={"video_url": old_url},
+                state="active",
+                created_at=now,
+                updated_at=now,
+            ),
             PublishedMediaAsset(
                 video_id=video.id,
                 publication_id="pub",
@@ -570,7 +760,7 @@ def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db
     db.commit()
 
     manifest = active_public_urls(db, settings)
-    assert manifest == [f"{CDN}/{avatar_key}", f"{CDN}/{runtime_key}"]
+    assert manifest == [f"{CDN}/{runtime_key}"]
 
     dry_run = migrate_public_origins(db, settings, apply=False)
     assert dry_run.changed_count >= 4
@@ -582,11 +772,73 @@ def test_active_manifest_and_atomic_migration_use_media_bindings(monkeypatch, db
     db.refresh(video)
     db.refresh(user)
     db.refresh(creation)
+    seo = db.get(PublishedVideoSeo, video.id)
+    gate = db.get(CdnPublicationGate, "pub")
+    expected_job_hash = hashlib.sha256(f"{CDN}/{runtime_key}".encode()).hexdigest()
+    job = db.get(CdnCacheJob, f"cdn_prefetch_{expected_job_hash[:40]}")
     assert video.video_url == f"{CDN}/{runtime_key}"
     assert video.runtime_spec["video"][0]["video"] == f"{CDN}/{runtime_key}"
     assert user.avatar_url == f"{CDN}/{avatar_key}"
     assert creation.runtime_spec["video"][0]["video"].startswith(CDN)
+    assert creation.story_plan["legacy_video"] == f"{CDN}/legacy/videos/work.mp4"
+    assert seo is not None and seo.thumbnail_url.startswith(CDN)
+    assert gate is not None and gate.urls == [f"{CDN}/{runtime_key}"]
+    assert job is not None and job.url_hash == expected_job_hash
+    assert job.state == "pending"
+    assert job.attempts == 0
+    assert job.provider_task_id == ""
 
     verified = migrate_public_origins(db, settings, apply=False, verify=True)
     assert verified.changed_count == 0
     assert not verified.failures
+
+
+def test_public_origin_migration_merges_an_exact_canonical_job_duplicate(
+    monkeypatch,
+    db,
+) -> None:
+    settings = _settings(monkeypatch)
+    now = datetime.now(timezone.utc)
+    old_url = f"{OLD_OSS}{PUBLIC_PREFIX}covers/work.jpg"
+    canonical_url = f"{CDN}{PUBLIC_PREFIX}covers/work.jpg"
+    old_hash = hashlib.sha256(old_url.encode()).hexdigest()
+    canonical_hash = hashlib.sha256(canonical_url.encode()).hexdigest()
+    old_job = CdnCacheJob(
+        id=f"cdn_prefetch_{old_hash[:40]}",
+        operation="prefetch",
+        url_hash=old_hash,
+        url=canonical_url,
+        state="succeeded",
+        attempts=1,
+        next_attempt_at=now,
+        provider_task_id="old-task",
+        request_id="old-request",
+        error_message="",
+        created_at=now,
+        updated_at=now,
+    )
+    canonical_job = CdnCacheJob(
+        id=f"cdn_prefetch_{canonical_hash[:40]}",
+        operation="prefetch",
+        url_hash=canonical_hash,
+        url=canonical_url,
+        state="succeeded",
+        attempts=1,
+        next_attempt_at=now,
+        provider_task_id="canonical-task",
+        request_id="canonical-request",
+        error_message="",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add_all([old_job, canonical_job])
+    db.commit()
+
+    report = migrate_public_origins(db, settings, apply=True)
+
+    assert not report.failures
+    assert db.get(CdnCacheJob, old_job.id) is None
+    preserved = db.get(CdnCacheJob, canonical_job.id)
+    assert preserved is not None
+    assert preserved.state == "succeeded"
+    assert preserved.provider_task_id == "canonical-task"

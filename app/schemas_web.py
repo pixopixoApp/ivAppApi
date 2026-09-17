@@ -10,9 +10,11 @@ class WebCreatorConfigOut(BaseModel):
     max_bytes: int
     max_duration_seconds: int
     supported_transports: list[str]
+    preparation_profile: str | None = None
+    max_source_bytes: int | None = None
     text_to_video_enabled: bool = False
     daily_generation_quota: int = 3
-    generated_duration_seconds: int = 10
+    generated_duration_seconds: int = 3
     generated_ratio: str = "9:16"
     generated_resolution: str = "720p"
 
@@ -46,10 +48,12 @@ class WebEmailRequest(BaseModel):
 
 class WebEmailCodeRequest(WebEmailRequest):
     code: str = Field(min_length=6, max_length=6)
+    invite_code: str = Field(default="", max_length=32)
 
 
 class WebGoogleRequest(BaseModel):
     credential: str = Field(min_length=1, max_length=8192)
+    invite_code: str = Field(default="", max_length=32)
 
 
 class WebCodeSentOut(BaseModel):

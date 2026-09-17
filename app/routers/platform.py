@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import re
 import secrets
 from datetime import datetime, time, timedelta, timezone
@@ -10,14 +11,14 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.account_deletion import AccountDeletionUnavailable, delete_account_data
 from app.auth_user import AppUser, require_bearer_user
-from app.cdn_cache import enqueue_prefetch
+from app.cdn_cache import enqueue_prefetch, private_media_delivery_url
 from app.cdn_publication import (
     CdnPublicationError,
     activate_ready_publications,
@@ -26,6 +27,21 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
+from app.creator_drafts import draft_page, require_other_creations_idle
+from app.creator_interaction_presets import (
+    creator_interaction_presets,
+    preset_id_for_interaction,
+)
+from app.creator_manual_edits import SUSTAINED, compile_edits, manual_edit_options
+from app.credits import (
+    REFERRAL_CREDITS,
+    InsufficientCredits,
+    ensure_referral_invite,
+    grant_welcome_credit,
+)
+from app.credits import balance as credit_balance
+from app.credits import release_reference as release_credit_reference
+from app.credits import reserve as reserve_credits
 from app.db import get_db
 from app.deps import require_publish_key
 from app.mail import send_creator_invite
@@ -41,18 +57,20 @@ from app.models import (
     CreatorSourceGeneration,
     CreatorUpload,
     CreatorVersion,
+    CreditLedgerEntry,
     MediaObject,
     PublishedVideo,
     PublishedVideoSeo,
+    ReferralBinding,
     User,
 )
 from app.oss_storage import OssStorageError
-from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     BASE_RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
     compile_runtime_spec,
     runtime_spec_version_from_compiled,
+    supported_gestures,
 )
 from app.public_origin import canonicalize_public_payload, canonicalize_public_url
 from app.public_text import (
@@ -77,33 +95,42 @@ from app.schemas_platform import (
     CreatorApplicationInviteResult,
     CreatorApplicationOut,
     CreatorApplicationRequest,
+    CreatorCapabilitiesOut,
     CreatorCreationOut,
     CreatorCreationRequest,
+    CreatorDraftPageOut,
     CreatorGenerationQuotaOut,
     CreatorInviteOut,
     CreatorInvitePage,
+    CreatorManualEditRequest,
+    CreatorPreviewConfirmationRequest,
     CreatorPublishedMutationOut,
     CreatorPublishRequest,
     CreatorPublishResponse,
     CreatorSourceAcceptRequest,
     CreatorSourceGenerationOut,
     CreatorSourceRegenerateRequest,
+    CreatorStoryGenerationRequest,
+    CreatorStoryPlanRequest,
     CreatorUploadOut,
     CreatorVersionOut,
     CreatorVersionRequest,
+    CreditBalanceOut,
+    CreditLedgerEntryOut,
     InviteCreateRequest,
     InviteCreateResponse,
     InviteRedeemRequest,
     InviteRevokeRequest,
     InviteRevokeResponse,
     Platform,
+    ReferralInviteOut,
 )
 from app.seo import ensure_seo_row
 from app.share_urls import published_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
 from app.video_probe import VideoProbeError, probe_video
-from app.web_session import require_creator_user
+from app.web_session import require_app_or_web_user, require_creator_user
 
 public_router = APIRouter(prefix="/api/v1", tags=["platform"])
 creator_router = APIRouter(prefix="/api/v1/creator", tags=["creator"])
@@ -150,7 +177,9 @@ def _generation_quota_out(
     counts = {str(state): int(count) for state, count in rows}
     reserved = counts.get("reserved", 0)
     used = counts.get("charged", 0)
-    limit = max(0, active_settings.creator_video_daily_quota)
+    # Credits, not a hidden daily cap, govern entitlement. Keep legacy fields
+    # present so older clients remain parseable; new clients use unlimited.
+    limit = 2_147_483_647
     enabled = bool(active_settings.creator_text_to_video_enabled)
     return CreatorGenerationQuotaOut(
         enabled=enabled,
@@ -170,18 +199,38 @@ def _reserve_generation_quota(
 ) -> tuple[str, datetime]:
     if not settings.creator_text_to_video_enabled:
         raise HTTPException(status_code=503, detail="text-to-video creation is not available")
-    quota = _generation_quota_out(db, user_id, settings)
-    if quota.remaining <= 0:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "message": "Daily video generation limit reached",
-                "resets_at": quota.resets_at,
-                "limit": quota.limit,
-            },
-        )
     quota_date, _resets_at = _quota_window()
     return quota_date, _now() + timedelta(days=max(1, settings.creator_video_draft_ttl_days))
+
+
+def _reserve_source_credits(
+    db: Session,
+    settings: Settings,
+    *,
+    user_id: str,
+    generation_id: str,
+) -> None:
+    # The Alembic migration backfills historic users. This idempotent fallback
+    # also protects a deployment where a creator request races the backfill.
+    grant_welcome_credit(db, user_id)
+    db.flush()
+    cost = max(1, settings.creator_video_duration_seconds)
+    try:
+        reserve_credits(
+            db,
+            user_id=user_id,
+            reference_id=f"source:{generation_id}",
+            purpose=f"AI source video · {cost} seconds",
+            amount=cost,
+        )
+    except InsufficientCredits as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "INSUFFICIENT_CREDITS",
+                "message": f"You need {cost} Credits to generate a source video.",
+            },
+        ) from exc
 
 
 def _normalize_invite(raw: str) -> str:
@@ -231,6 +280,61 @@ def _lock_creator(db: Session, user_id: str) -> CreatorAccessGrant:
     return grant
 
 
+@public_router.get("/credits", response_model=CreditBalanceOut)
+def get_credits(
+    user: Annotated[AppUser, Depends(require_app_or_web_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> CreditBalanceOut:
+    entries = (
+        db.query(CreditLedgerEntry)
+        .filter(CreditLedgerEntry.user_id == user.user_id)
+        .order_by(CreditLedgerEntry.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return CreditBalanceOut(
+        balance=credit_balance(db, user.user_id),
+        entries=[
+            CreditLedgerEntryOut(
+                id=row.id,
+                kind=row.kind,
+                amount=row.amount,
+                note=row.note,
+                created_at=_iso(row.created_at),
+            )
+            for row in entries
+        ],
+    )
+
+
+@public_router.get("/referrals/me", response_model=ReferralInviteOut)
+def get_my_referral_invite(
+    user: Annotated[AppUser, Depends(require_app_or_web_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> ReferralInviteOut:
+    invite = ensure_referral_invite(db, user.user_id)
+    binding = db.get(ReferralBinding, user.user_id)
+    db.commit()
+    return ReferralInviteOut(
+        code=invite.code,
+        url=f"https://www.pixopixo.com/invite/{invite.code}",
+        status=(binding.status if binding is not None else "none"),
+    )
+
+
+@public_router.post("/works/{work_id}/remix", include_in_schema=False)
+def remix_disabled(
+    work_id: str,
+    _user: Annotated[AppUser, Depends(require_bearer_user)],
+) -> None:
+    # Retained as a stable rejection for old Android builds. Existing remixed
+    # media stays readable through the normal feed and player paths.
+    raise HTTPException(
+        status_code=403,
+        detail={"code": "remix_disabled", "message": "Remix is disabled."},
+    )
+
+
 @public_router.delete("/account", response_model=AccountDeletionResponse)
 def delete_account(
     payload: AccountDeletionRequest,
@@ -269,13 +373,16 @@ def _version_out(
     *,
     upload_id: str | None,
     settings: Settings | None = None,
+    editable: bool = False,
 ) -> CreatorVersionOut:
     active_settings = settings or get_settings()
     ready = row.status in ("ready", "published")
     return CreatorVersionOut(
+        previewed_paths=list(row.previewed_paths or []),
+        experience_mode="story" if (row.source_timeline or {}).get("clips") else "auto",
         version_id=row.id,
         number=row.number,
-        request=row.brief,
+        request="Manual interaction changes" if row.brief.startswith("Manual edits:") else row.brief,
         status=row.status,
         progress_stage=row.progress_stage,
         progress_percent=row.progress_percent,
@@ -291,6 +398,7 @@ def _version_out(
             else None
         ),
         runtime_spec_version=row.runtime_spec_version if ready else None,
+        manual_edit_options=(manual_edit_options(row.source_timeline, row.runtime_spec) if ready and editable else {}),
         error_code=row.error_code or None,
         error_message=row.error_message or None,
         created_at=_iso(row.created_at),
@@ -324,13 +432,14 @@ def _source_generation_out(
         prompt_summary=row.prompt_summary,
         generation_prompt=row.generation_prompt,
         interaction_brief=row.interaction_brief,
-        preset=dict(row.preset_json or {}),
+        preset={key: value for key, value in (row.preset_json or {}).items()
+                if key in {"model", "ratio", "resolution", "duration_seconds"}},
         status=row.status,
         progress_stage=row.progress_stage,
         progress_percent=row.progress_percent,
         provider_task_accepted=row.provider_task_accepted,
         preview_url=(
-            f"/api/v1/creator/uploads/{upload.id}/media" if preview_ready else None
+            f"/api/v1/creator/previews/{upload.id}" if preview_ready else None
         ),
         error_code=row.error_code or None,
         error_message=row.error_message or None,
@@ -354,13 +463,21 @@ def _creation_out(
     )
     ready = row.status in ("ready", "published", "pending_review")
     source_out = _source_generation_out(db, generation) if generation is not None else None
+    source_upload = db.get(CreatorUpload, row.upload_id) if row.upload_id else None
+    from app.creator_story import story_out
     return CreatorCreationOut(
+        experience_mode=row.experience_mode,
+        source_duration_ms=source_upload.duration_ms if source_upload else 0,
+        story=story_out(db, row),
         creation_id=row.id,
         upload_id=row.upload_id,
         source_mode=("prompt" if row.source_mode == "prompt" else "upload"),
         source_prompt=row.source_prompt,
         source_generation_id=row.source_generation_id,
-        source_preview_url=source_out.preview_url if source_out is not None else None,
+        source_preview_url=(
+            source_out.preview_url if source_out is not None and source_out.preview_url else
+            f"/api/v1/creator/previews/{source_upload.id}" if source_upload else None
+        ),
         source_generation=source_out,
         generation_quota=_generation_quota_out(db, row.user_id, active_settings),
         status=row.status,
@@ -383,7 +500,8 @@ def _creation_out(
         published_video_id=row.published_video_id,
         active_version_id=row.active_version_id,
         versions=[
-            _version_out(item, upload_id=row.upload_id, settings=active_settings)
+            _version_out(item, upload_id=row.upload_id, settings=active_settings,
+                         editable=item is versions[-1] and row.status == "ready")
             for item in versions
         ],
         created_at=_iso(row.created_at),
@@ -493,6 +611,60 @@ def get_app_version(
         release_notes=row.release_notes,
         enabled=row.enabled,
         updated_at=_iso(row.updated_at),
+    )
+
+
+_TOUCH_INTERACTIONS = frozenset({
+    "tap", "double_tap", "rapid_tap", "hold", "hold_charge",
+    "swipe_left", "swipe_right", "swipe_up", "swipe_down",
+    "drag_left", "drag_right", "drag_up", "drag_down",
+    "scrub_left", "scrub_right", "scrub_up", "scrub_down",
+    "continuous_swipe", "continuous_tap", "pinch", "draw_circle", "erase",
+})
+_DEVICE_MOTION_INTERACTIONS = frozenset({
+    "hold_still", "tilt_left", "tilt_right", "shake", "rotate",
+})
+_VISION_INTERACTIONS = frozenset({"camera_motion", "camera_continuous"})
+
+
+def _interaction_capability(gesture: str) -> str:
+    if gesture in _TOUCH_INTERACTIONS:
+        return "touch"
+    if gesture in _DEVICE_MOTION_INTERACTIONS:
+        return "device_motion"
+    if gesture in _VISION_INTERACTIONS:
+        return "vision"
+    return "microphone"
+
+
+@creator_router.get("/capabilities", response_model=CreatorCapabilitiesOut)
+def get_creator_capabilities(
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreatorCapabilitiesOut:
+    _require_creator(db, user)
+    source_enabled = bool(settings.creator_text_to_video_enabled)
+    return CreatorCapabilitiesOut(
+        creator_contract_version="2",
+        ai_source_enabled=source_enabled,
+        branch_story_enabled=bool(settings.creator_branch_story_enabled and source_enabled),
+        ai_source_duration_seconds=settings.creator_video_duration_seconds,
+        ai_ending_duration_seconds=settings.creator_video_duration_seconds,
+        credit_per_generated_second=1,
+        referral_reward_credits=REFERRAL_CREDITS,
+        supported_interactions=[
+            {
+                "type": gesture,
+                "lifecycle": "sustained" if gesture in SUSTAINED else "discrete",
+                "capability": _interaction_capability(gesture),
+                "story_enabled": gesture not in SUSTAINED,
+            }
+            for gesture in sorted(supported_gestures())
+        ],
+        interaction_presets=[
+            preset.as_public_dict() for preset in creator_interaction_presets()
+        ],
     )
 
 
@@ -818,6 +990,11 @@ def revoke_creator_access(
                 generation.progress_stage = "cancelled"
                 if generation.quota_state == "reserved":
                     generation.quota_state = "released"
+                release_credit_reference(
+                    db,
+                    user_id=generation.user_id,
+                    reference_id=f"source:{generation.id}",
+                )
             else:
                 generation.cancel_requested = True
     db.commit()
@@ -1064,12 +1241,7 @@ def public_creator_preview(
             raise HTTPException(status_code=404, detail="preview not found")
         try:
             return RedirectResponse(
-                sign_private_media_url(
-                    settings,
-                    key=media.object_key,
-                    expires_seconds=settings.private_media_cdn_ttl_seconds,
-                    filename=row.original_filename,
-                ),
+                private_media_delivery_url(db, settings, key=media.object_key),
                 status_code=307,
                 headers={"Cache-Control": "no-store"},
             )
@@ -1107,12 +1279,7 @@ def preview_creator_upload(
             raise HTTPException(status_code=404, detail="upload media missing")
         try:
             return RedirectResponse(
-                sign_private_media_url(
-                    settings,
-                    key=media.object_key,
-                    expires_seconds=settings.private_media_cdn_ttl_seconds,
-                    filename=row.original_filename,
-                ),
+                private_media_delivery_url(db, settings, key=media.object_key),
                 status_code=307,
                 headers={"Cache-Control": "no-store"},
             )
@@ -1138,6 +1305,11 @@ def create_interactive_video(
     _lock_creator(db, user.user_id)
     request_id = payload.request_id.strip() if payload.request_id else ""
     if request_id:
+        deferred = db.query(CreatorCreation).filter_by(request_id=request_id).first()
+        if deferred is not None:
+            if deferred.user_id != user.user_id or deferred.upload_id != payload.upload_id:
+                raise HTTPException(status_code=409, detail="request id is already in use")
+            return _creation_out(db, deferred, settings)
         existing_generation = (
             db.query(CreatorSourceGeneration)
             .filter(CreatorSourceGeneration.request_id == request_id)
@@ -1164,19 +1336,8 @@ def create_interactive_video(
                 raise HTTPException(status_code=409, detail="request id is already in use")
             existing = _owned_creation(db, existing_version.creation_id, user.user_id)
             return _creation_out(db, existing, settings)
-    active = (
-        db.query(CreatorCreation)
-        .filter(
-            CreatorCreation.user_id == user.user_id,
-            CreatorCreation.status.in_(_ACTIVE_CREATION_STATUSES),
-        )
-        .first()
-    )
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "one creation is already in progress", "creation_id": active.id},
-        )
+    if not payload.defer_analysis or payload.source_mode == "prompt":
+        require_other_creations_idle(db, user.user_id)
     now = _now()
     creation_id = f"cr_{secrets.token_urlsafe(18)}"
     if payload.source_mode == "prompt":
@@ -1219,6 +1380,12 @@ def create_interactive_video(
             created_at=now,
             updated_at=now,
         )
+        _reserve_source_credits(
+            db,
+            settings,
+            user_id=user.user_id,
+            generation_id=generation_id,
+        )
         db.add_all([row, generation])
         record_creator_creation_text(db, row)
         record_creator_generation_text(db, generation)
@@ -1229,6 +1396,16 @@ def create_interactive_video(
     upload = db.get(CreatorUpload, payload.upload_id)
     if upload is None or upload.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="upload not found")
+    if payload.defer_analysis:
+        if upload.normalization_status != "ready":
+            raise HTTPException(status_code=409, detail="source video is still being prepared")
+        row = CreatorCreation(id=creation_id, request_id=request_id or creation_id,
+            user_id=user.user_id, upload_id=upload.id, source_mode="upload", experience_mode="none",
+            status="source_ready", progress_stage="choose_mode", progress_percent=100,
+            brief=payload.brief.strip(), created_at=now, updated_at=now)
+        db.add(row)
+        db.commit()
+        return _creation_out(db, row, settings)
     version_id = f"cv_{secrets.token_urlsafe(18)}"
     row = CreatorCreation(
         id=creation_id,
@@ -1322,7 +1499,7 @@ def regenerate_creation_source(
             raise HTTPException(status_code=409, detail="request id is already in use")
         return _creation_out(db, creation, settings)
 
-    if creation.status in {"published", "pending_review", "deleted"}:
+    if creation.status in {"published", "pending_review", "rejected", "deleted", "abandoned"}:
         raise HTTPException(status_code=409, detail="this creation can no longer be regenerated")
     if _creation_versions(db, creation.id):
         raise HTTPException(
@@ -1337,6 +1514,7 @@ def regenerate_creation_source(
     if current is not None and current.status in {"queued", "running"}:
         raise HTTPException(status_code=409, detail="source generation is still in progress")
 
+    require_other_creations_idle(db, user.user_id, creation.id)
     quota_date, expires_at = _reserve_generation_quota(
         db,
         user_id=user.user_id,
@@ -1366,7 +1544,15 @@ def regenerate_creation_source(
         created_at=now,
         updated_at=now,
     )
-    creation.upload_id = None
+    _reserve_source_credits(
+        db,
+        settings,
+        user_id=user.user_id,
+        generation_id=generation.id,
+    )
+    # Keep the last successful source playable while its explicit paid
+    # replacement is being generated. It is swapped only after the new source
+    # is durable and accepted.
     creation.source_prompt = generation.original_prompt
     creation.source_generation_id = generation.id
     creation.brief = ""
@@ -1400,11 +1586,13 @@ def accept_creation_source(
     _lock_creator(db, user.user_id)
     creation = _owned_creation(db, creation_id, user.user_id)
     generation = _owned_source_generation(db, payload.generation_id, user.user_id)
+    if creation.status in {"published", "pending_review", "rejected", "deleted", "abandoned"}:
+        raise HTTPException(status_code=409, detail="this creation can no longer be accepted")
     if generation.creation_id != creation.id or creation.source_generation_id != generation.id:
         raise HTTPException(status_code=409, detail="this is no longer the current source")
 
     versions = _creation_versions(db, creation.id)
-    if generation.accepted_at is not None and versions:
+    if generation.accepted_at is not None and (versions or payload.defer_analysis):
         return _creation_out(db, creation, settings)
     if generation.status != "ready" or not generation.upload_id:
         raise HTTPException(status_code=409, detail="source video is not ready for review")
@@ -1417,11 +1605,21 @@ def accept_creation_source(
         raise HTTPException(status_code=409, detail="source preview is still being prepared")
     if versions:
         raise HTTPException(status_code=409, detail="this creation already has an analysis version")
+    if payload.defer_analysis:
+        generation.accepted_at = generation.updated_at = _now()
+        creation.upload_id = upload.id
+        creation.experience_mode = "none"
+        creation.status = "source_ready"
+        creation.progress_stage = "choose_mode"
+        creation.updated_at = _now()
+        db.commit()
+        return _creation_out(db, creation, settings)
 
     request_id = payload.request_id.strip()
     reused = db.query(CreatorVersion).filter(CreatorVersion.request_id == request_id).first()
     if reused is not None:
         raise HTTPException(status_code=409, detail="request id is already in use")
+    require_other_creations_idle(db, user.user_id, creation.id)
     now = _now()
     version_id = f"cv_{secrets.token_urlsafe(18)}"
     brief = generation.interaction_brief.strip() or generation.original_prompt
@@ -1456,6 +1654,16 @@ def accept_creation_source(
     db.commit()
     db.refresh(creation)
     return _creation_out(db, creation, settings)
+
+
+@creator_router.get("/drafts", response_model=CreatorDraftPageOut)
+def get_creator_drafts(
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> CreatorDraftPageOut:
+    return CreatorDraftPageOut(**draft_page(db, user.user_id, limit, cursor))
 
 
 @creator_router.get("/creations/active", response_model=CreatorCreationOut | None)
@@ -1499,7 +1707,7 @@ def create_version(
 ) -> CreatorCreationOut:
     _lock_creator(db, user.user_id)
     creation = _owned_creation(db, creation_id, user.user_id)
-    if creation.status == "published":
+    if creation.status in {"published", "pending_review", "rejected", "deleted", "abandoned"}:
         raise HTTPException(status_code=409, detail="published creations cannot be changed")
     if not creation.upload_id:
         raise HTTPException(status_code=409, detail="accept the generated source video first")
@@ -1521,6 +1729,7 @@ def create_version(
             if existing.creation_id != creation.id or existing.user_id != user.user_id:
                 raise HTTPException(status_code=409, detail="request id is already in use")
             return _creation_out(db, creation)
+    require_other_creations_idle(db, user.user_id, creation.id)
     next_number = int(
         db.query(func.max(CreatorVersion.number))
         .filter(CreatorVersion.creation_id == creation.id)
@@ -1543,6 +1752,7 @@ def create_version(
         updated_at=now,
     )
     db.add(version)
+    creation.experience_mode = "auto"
     creation.active_version_id = version_id
     creation.status = "queued"
     creation.progress_stage = "queued"
@@ -1558,6 +1768,130 @@ def create_version(
     return _creation_out(db, creation)
 
 
+@creator_router.put("/creations/{creation_id}/story-plan", response_model=CreatorCreationOut)
+def save_story_plan(
+    creation_id: str, payload: CreatorStoryPlanRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)], db: Annotated[Session, Depends(get_db)],
+) -> CreatorCreationOut:
+    from app.creator_story import save_plan
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    save_plan(db, creation, payload.model_dump())
+    db.commit()
+    return _creation_out(db, creation)
+
+
+@creator_router.post("/creations/{creation_id}/story-generations", response_model=CreatorCreationOut, status_code=202)
+def generate_story_endings(
+    creation_id: str, payload: CreatorStoryGenerationRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)], db: Annotated[Session, Depends(get_db)],
+) -> CreatorCreationOut:
+    from app.creator_story import start_generation
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    start_generation(db, creation, payload.model_dump())
+    db.commit()
+    return _creation_out(db, creation)
+
+
+@creator_router.post("/creations/{creation_id}/preview-confirmations", response_model=CreatorCreationOut)
+def confirm_story_preview(
+    creation_id: str, payload: CreatorPreviewConfirmationRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)], db: Annotated[Session, Depends(get_db)],
+) -> CreatorCreationOut:
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    version = db.get(CreatorVersion, payload.version_id)
+    if (version is None or version.creation_id != creation_id or version.id != creation.active_version_id
+            or creation.status != "ready" or version.status != "ready" or not (version.source_timeline or {}).get("clips")):
+        raise HTTPException(409, "The current Story version is not ready")
+    version.previewed_paths = sorted(set(version.previewed_paths or []) | {payload.path})
+    db.commit()
+    return _creation_out(db, creation)
+
+
+@creator_router.post("/creations/{creation_id}/manual-edits", response_model=CreatorCreationOut)
+def save_manual_edits(
+    creation_id: str,
+    payload: CreatorManualEditRequest,
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> CreatorCreationOut:
+    _lock_creator(db, user.user_id)
+    creation = _owned_creation(db, creation_id, user.user_id)
+    fingerprint = "Manual edits:" + hashlib.sha256(
+        json.dumps(payload.model_dump(exclude={"request_id"}), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    existing = db.query(CreatorVersion).filter_by(request_id=payload.request_id).first()
+    if existing is not None:
+        if (existing.creation_id != creation_id or existing.user_id != user.user_id
+                or existing.brief != fingerprint):
+            raise HTTPException(status_code=409, detail="request id is already in use")
+        return _creation_out(db, creation)
+    if creation.status in {"published", "pending_review", "abandoned"}:
+        raise HTTPException(status_code=409, detail="this creation can no longer be edited")
+    versions = _creation_versions(db, creation_id)
+    if any(item.status in _ACTIVE_VERSION_STATUSES for item in versions):
+        raise HTTPException(status_code=409, detail="wait for the current analysis to finish")
+    base = next((item for item in versions if item.id == payload.base_version_id), None)
+    latest_ready = next((item for item in reversed(versions) if item.status == "ready"), None)
+    if base is None or base is not latest_ready or not base.runtime_spec or not base.source_timeline:
+        raise HTTPException(status_code=409, detail="the base version is no longer the latest ready version")
+    clips = base.runtime_spec.get("video", [])
+    is_story = bool(base.source_timeline.get("clips"))
+    if is_story and (creation.status != "ready" or set(payload.previewed_paths) != {"B", "C"}):
+        raise HTTPException(status_code=409, detail="Experience both Story paths before saving these changes")
+    try:
+        timeline, runtime = compile_edits(
+            base.source_timeline, [item.model_dump() for item in payload.edits],
+            item_id=str(base.runtime_spec.get("item_id") or creation.id),
+            video_url=clips[0]["video"],
+            video_urls={clip["video_id"]: clip["video"] for clip in clips} if is_story else None,
+        )
+    except RuntimeSpecError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if [item for clip in runtime["video"] for item in clip["interactions"]] != payload.preview_interactions:
+        raise HTTPException(status_code=409, detail="preview does not match the saved interactions; reload this version")
+    now = _now()
+    version = CreatorVersion(
+        id=f"cv_{secrets.token_urlsafe(18)}", creation_id=creation_id, user_id=user.user_id,
+        number=max(item.number for item in versions) + 1, request_id=payload.request_id,
+        brief=fingerprint, status="ready", progress_stage="ready", progress_percent=100,
+        source_timeline=timeline, runtime_spec=runtime,
+        previewed_paths=sorted(set(payload.previewed_paths)) if is_story else [],
+        runtime_spec_version=runtime_spec_version_from_compiled(runtime),
+        created_at=now, updated_at=now,
+    )
+    db.add(version)
+    creation.active_version_id = version.id
+    creation.status = creation.progress_stage = "ready"
+    creation.progress_percent = 100
+    creation.source_timeline = timeline
+    creation.runtime_spec = runtime
+    creation.runtime_spec_version = version.runtime_spec_version
+    creation.error_code = creation.error_message = ""
+    if is_story and creation.story_plan:
+        story_interaction = timeline["clips"]["A"]["timeline"]["interactions"][0]
+        preset_id = preset_id_for_interaction(story_interaction)
+        updated_plan = {
+            **creation.story_plan,
+            "interaction_type": story_interaction["gesture"],
+            "interaction_preset_id": preset_id,
+        }
+        for field in ("pinch_direction", "rotation_direction", "vision_target"):
+            updated_plan.pop(field, None)
+        if story_interaction["gesture"] == "pinch":
+            updated_plan["pinch_direction"] = story_interaction.get("pinch_direction") or "inward"
+        elif story_interaction["gesture"] == "rotate":
+            updated_plan["rotation_direction"] = story_interaction.get("rotation_direction") or "counterclockwise"
+        elif story_interaction["gesture"] in {"camera_motion", "camera_continuous"}:
+            updated_plan["vision_target"] = story_interaction.get("vision", {}).get("target")
+        creation.story_plan = updated_plan
+    creation.updated_at = now
+    db.commit()
+    return _creation_out(db, creation)
+
+
 def _cancel_version_row(db: Session, version: CreatorVersion) -> None:
     if version.status == "queued" and not version.ivadmin_job_id:
         version.status = "cancelled"
@@ -1570,6 +1904,36 @@ def _cancel_version_row(db: Session, version: CreatorVersion) -> None:
         raise HTTPException(status_code=409, detail="version can no longer be cancelled")
     version.updated_at = _now()
     db.add(version)
+
+
+def _cancel_pending_story_generations(db: Session, creation: CreatorCreation) -> bool:
+    """Cancel only unfinished paid endings; completed endings stay durable and charged."""
+    identifiers = (creation.story_plan or {}).get("generation_ids") or {}
+    changed = False
+    for identifier in identifiers.values():
+        generation = db.get(CreatorSourceGeneration, identifier)
+        if generation is None or generation.user_id != creation.user_id:
+            continue
+        if generation.status == "queued" and not generation.ivadmin_job_id:
+            generation.status = "cancelled"
+            generation.progress_stage = "cancelled"
+            generation.error_code = "CANCELLED"
+            generation.error_message = "Video generation was cancelled."
+            if generation.quota_state == "reserved":
+                generation.quota_state = "released"
+            release_credit_reference(
+                db,
+                user_id=generation.user_id,
+                reference_id=f"source:{generation.id}",
+            )
+        elif generation.status in {"queued", "running"}:
+            generation.cancel_requested = True
+        else:
+            continue
+        generation.updated_at = _now()
+        db.add(generation)
+        changed = True
+    return changed
 
 
 @creator_router.post("/versions/{version_id}/cancel", response_model=CreatorCreationOut)
@@ -1596,7 +1960,7 @@ def cancel_creation(
     user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
-    _require_creator(db, user)
+    _lock_creator(db, user.user_id)
     row = _owned_creation(db, creation_id, user.user_id)
     if row.source_mode == "prompt" and row.source_generation_id:
         generation = _owned_source_generation(
@@ -1616,6 +1980,11 @@ def cancel_creation(
                 generation.error_message = "Video generation was cancelled."
                 if generation.quota_state == "reserved":
                     generation.quota_state = "released"
+                release_credit_reference(
+                    db,
+                    user_id=generation.user_id,
+                    reference_id=f"source:{generation.id}",
+                )
             elif generation.status == "ready":
                 generation.status = "cancelled"
                 generation.progress_stage = "cancelled"
@@ -1631,6 +2000,22 @@ def cancel_creation(
             db.commit()
             db.refresh(row)
             return _creation_out(db, row)
+    if _cancel_pending_story_generations(db, row):
+        from app.creator_story import sync_story
+        sync_story(db, row)
+        remote_pending = any(
+            db.get(CreatorSourceGeneration, identifier).cancel_requested
+            for identifier in ((row.story_plan or {}).get("generation_ids") or {}).values()
+            if db.get(CreatorSourceGeneration, identifier) is not None
+        )
+        if remote_pending:
+            row.status = "running"
+            row.progress_stage = "cancelling_endings"
+        row.updated_at = _now()
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _creation_out(db, row)
     versions = _creation_versions(db, row.id)
     active = next((item for item in versions if item.status in _ACTIVE_VERSION_STATUSES), None)
     if active is None:
@@ -1650,9 +2035,9 @@ def abandon_creation(
     user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorCreationOut:
-    _require_creator(db, user)
+    _lock_creator(db, user.user_id)
     row = _owned_creation(db, creation_id, user.user_id)
-    if row.status == "published":
+    if row.status in {"published", "pending_review", "rejected", "deleted"}:
         raise HTTPException(status_code=409, detail="published creations cannot be abandoned")
     if row.source_mode == "prompt" and row.source_generation_id:
         generation = db.get(CreatorSourceGeneration, row.source_generation_id)
@@ -1662,10 +2047,16 @@ def abandon_creation(
                 generation.progress_stage = "cancelled"
                 if generation.quota_state == "reserved":
                     generation.quota_state = "released"
-            elif generation.status == "running":
+                release_credit_reference(
+                    db,
+                    user_id=generation.user_id,
+                    reference_id=f"source:{generation.id}",
+                )
+            elif generation.status in {"queued", "running"}:
                 generation.cancel_requested = True
             generation.updated_at = _now()
             db.add(generation)
+    _cancel_pending_story_generations(db, row)
     for version in _creation_versions(db, row.id):
         if version.status in _ACTIVE_VERSION_STATUSES:
             if version.status == "queued" and not version.ivadmin_job_id:
@@ -1712,6 +2103,9 @@ def retry_version(
     _lock_creator(db, user.user_id)
     version = _owned_version(db, version_id, user.user_id)
     creation = _owned_creation(db, version.creation_id, user.user_id)
+    if creation.status in {"published", "pending_review", "rejected", "deleted", "abandoned"}:
+        raise HTTPException(status_code=409, detail="this creation can no longer be retried")
+    require_other_creations_idle(db, user.user_id, creation.id)
     _retry_version_row(db, version)
     creation.active_version_id = version.id
     creation.status = "queued"
@@ -1734,9 +2128,12 @@ def retry_creation(
     _lock_creator(db, user.user_id)
     row = _owned_creation(db, creation_id, user.user_id)
     versions = _creation_versions(db, row.id)
+    if row.status in {"published", "pending_review", "rejected", "deleted", "abandoned"}:
+        raise HTTPException(status_code=409, detail="this creation can no longer be retried")
     target = next((item for item in reversed(versions) if item.status in ("failed", "cancelled")), None)
     if target is None:
         raise HTTPException(status_code=409, detail="creation has no retryable version")
+    require_other_creations_idle(db, user.user_id, row.id)
     _retry_version_row(db, target)
     row.active_version_id = target.id
     row.status = "queued"
@@ -1763,7 +2160,7 @@ def publish_creation(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorPublishResponse:
-    _require_creator(db, user)
+    _lock_creator(db, user.user_id)
     if not payload.confirm:
         raise HTTPException(status_code=400, detail="preview confirmation is required")
     row = _owned_creation(db, creation_id, user.user_id)
@@ -1800,6 +2197,10 @@ def publish_creation(
         raise HTTPException(status_code=409, detail="selected version is not ready")
     if not isinstance(source_timeline, dict):
         raise HTTPException(status_code=409, detail="creation is not ready to publish")
+    is_story = bool(source_timeline.get("clips"))
+    if is_story and (version is None or version.id != row.active_version_id or row.status != "ready"
+                     or set(version.previewed_paths or []) != {"B", "C"}):
+        raise HTTPException(status_code=409, detail="Experience both paths of the current Story before publishing")
     upload = db.get(CreatorUpload, row.upload_id)
     if upload is None or upload.user_id != user.user_id:
         raise HTTPException(status_code=409, detail="source upload is missing")
@@ -1807,6 +2208,16 @@ def publish_creation(
         raise HTTPException(status_code=409, detail="published video id already exists")
     if upload.normalization_status != "ready" or not upload.playable_sha256:
         raise HTTPException(status_code=409, detail="source video is still being normalized")
+    story_uploads: dict[str, CreatorUpload] = {}
+    if is_story:
+        asset_ids = source_timeline.get("creator", {}).get("assets", {})
+        if set(asset_ids) != {"A", "B", "C"}:
+            raise HTTPException(409, "Story assets are incomplete")
+        for role, identifier in asset_ids.items():
+            asset = db.get(CreatorUpload, identifier)
+            if asset is None or asset.user_id != user.user_id or asset.normalization_status != "ready" or not asset.playable_sha256:
+                raise HTTPException(409, f"Story clip {role} is not ready")
+            story_uploads[role] = asset
 
     if media_mode_is_oss(settings):
         try:
@@ -1815,6 +2226,7 @@ def publish_creation(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     final_url = f"/media/{row.id}.mp4"
+    story_urls = {role: f"/media/{row.id}-{role}.mp4" for role in story_uploads}
     publication_id = None
     prefetch_urls: list[str] = []
     if media_mode_is_oss(settings):
@@ -1826,6 +2238,14 @@ def publish_creation(
         source_media = db.get(MediaObject, upload.playable_media_object_id)
         if source_media is None:
             raise HTTPException(status_code=409, detail="playable media object is missing")
+        assets = [RuntimeSourceAsset(role="single", media=source_media)]
+        if is_story:
+            assets = []
+            for role, asset in story_uploads.items():
+                media = db.get(MediaObject, asset.playable_media_object_id) if asset.playable_media_object_id else None
+                if media is None or media.state != "ready":
+                    raise HTTPException(409, f"Story clip {role} backup is still in progress")
+                assets.append(RuntimeSourceAsset(role="clip", clip_id=role, media=media))
         try:
             published_assets = publish_runtime_assets(
                 db,
@@ -1837,20 +2257,25 @@ def publish_creation(
                     else f"creator-{version.number if version else 1}"
                 ),
                 source_payload=source_timeline,
-                assets=[RuntimeSourceAsset(role="single", media=source_media)],
+                assets=assets,
             )
-            final_url = published_assets.urls["single"]
+            final_url = published_assets.urls["A" if is_story else "single"]
+            if is_story:
+                story_urls = dict(published_assets.urls)
             publication_id = published_assets.publication_id
-            prefetch_urls = list(published_assets.urls.values())
+            # Only the entry clip is first-view critical. Branch clips keep
+            # their CDN URLs and fill on demand after an interaction.
+            prefetch_urls = [final_url]
         except (MediaServiceError, OssStorageError) as exc:
             db.rollback()
             raise HTTPException(status_code=409, detail=f"preview cannot be published: {exc}") from exc
     try:
         runtime_spec = compile_runtime_spec(
             item_id=row.id,
-            content_mode="single",
+            content_mode="story" if is_story else "single",
             source=source_timeline,
             video_url=final_url,
+            video_urls=story_urls if is_story else None,
         )
     except RuntimeSpecError as exc:
         db.rollback()
@@ -1859,10 +2284,19 @@ def publish_creation(
 
     storage = LocalMediaStorage(settings) if not media_mode_is_oss(settings) else None
     destination = None
+    story_destinations: list[Path] = []
     now = _now()
     try:
         copied_url = final_url
-        if storage is not None:
+        if storage is not None and is_story:
+            for role, asset in story_uploads.items():
+                playable_path = local_path_for_sha256(settings, asset.playable_sha256, expected_size=asset.playable_size_bytes)
+                if playable_path is None:
+                    raise StorageError(f"Normalized Story clip {role} is missing")
+                target, _ = storage.publish_file(source=playable_path, item_id=f"{row.id}-{role}")
+                story_destinations.append(target)
+            copied_url = story_urls["A"]
+        elif storage is not None:
             playable_path = local_path_for_sha256(
                 settings,
                 upload.playable_sha256,
@@ -1886,7 +2320,7 @@ def publish_creation(
             title=payload.title.strip(),
             description=payload.description.strip(),
             user_id=user.user_id,
-            content_mode="single",
+            content_mode="story" if is_story else "single",
             feed_weight=0,
             cdn_ready=not media_mode_is_oss(settings),
             content_source="ugc",
@@ -1938,6 +2372,8 @@ def publish_creation(
         db.rollback()
         if destination is not None:
             destination.unlink(missing_ok=True)
+        for target in story_destinations:
+            target.unlink(missing_ok=True)
         raise
     return CreatorPublishResponse(
         video_id=row.id,
@@ -2036,7 +2472,7 @@ def creator_share_page(
         if seo is not None and seo.status == "ready" and seo.slug:
             return RedirectResponse(
                 url=(
-                    f"{settings.seo_public_base_url.rstrip('/')}/experiences/"
+                    f"{settings.seo_public_base_url.rstrip('/')}/videos/"
                     f"{quote(seo.slug, safe='-')}"
                 ),
                 status_code=308,

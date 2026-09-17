@@ -1,95 +1,92 @@
-# Web 文本生成互动内容：运行与上线手册
+# Android Creator：AI 来源与 Branch Story 上线手册
 
-## 当前状态：软回滚
+## 已实现范围
 
-截至 2026-08-29，Web Creator 对用户只开放以下链路：
+Android Creator 的来源与玩法已经解耦：
 
-1. 登录并通过邀请码获得 Creator 权限。
-2. 上传 MP4，完成归一化后进入互动分析、预览和发布。
-3. 未登录用户仍可浏览和体验公开内容。
+1. 用户上传视频，或使用 5 Credits 生成 5 秒 AI 来源。
+2. 来源准备完成后只进入确认/玩法选择，不会自动启动互动分析。
+3. `AI Auto Interactions` 沿用原有分析能力和完整互动类型。
+4. `Branch Story` 使用 A 开场、B 成功、C 未达成三段视频。B/C 均为 5 秒；
+   每个 AI 结局 5 Credits，最多一侧可免费复用原视频片尾。
+5. 用户手动切换互动类型时，Android 使用服务端下发的确定性选项立即预览；
+   保存也由确定性编译器完成，不调用 AI、不扣 Credits。
+6. Story 必须完整体验 B、C 两条路径后才能保存修改或发布。
 
-文本生成视频的 API、数据表、任务状态和历史记录全部保留，但 Website 不再暴露文本创建
-或重新生成入口，ivapp 的新建入口也由 `CREATOR_TEXT_TO_VIDEO_ENABLED=false` 拒绝。
-不要执行数据库降级或删除历史任务。
+新任务的视频提供方固定为官方 `MiniMax-Hailuo-2.3` 公共 API。供应商生成 6 秒
+768P 素材，ivadmin 入库前确定性裁切、转码为产品要求的 5 秒 9:16 来源。历史 Ark
+任务仍可查询或排空，新任务不会回退到 Ark，也不会把模型凭证发给 Android、浏览器
+或 ivapp。
 
-回滚前已经进入队列的文本任务允许继续排空。`CREATOR_VIDEO_GENERATION_ENABLED=false`
-负责阻止 ivadmin 接受新任务；负责排空已有任务的 Worker 应保持运行，待活动任务归零后再由
-运维停止。已经生成到 `review_source` 的历史草稿仍可在 Website 接受并继续互动分析；失败的
-历史文本任务不能从 Website 重新生成，用户需取消后改用 MP4 新建。
+## 计费和任务语义
 
-## 保留的文本链路设计
+- 新用户一次性获得 5 Credits。
+- 受邀用户首次在 Android 登录后，邀请人一次性获得 10 Credits。
+- AI 来源：5 秒，预留 5 Credits，视频准备成功后结算；失败或取消后释放。
+- Story 结局：每个 5 秒，分别预留和结算 5 Credits。一侧失败不会影响另一侧，
+  只重试失败的一侧。
+- Credits 余额是唯一用量限制；没有隐藏的每日 3 次配额。
+- 请求 ID、任务和生成结果均持久化。离开页面不会取消任务；重新打开后会继续查询。
+- 已成功的 Story 结局立即视为持久结果，不会因另一侧失败而被草稿清理器删除。
 
-以下设计仅供将来重新启用时参考。文本链路会先由 ivadmin 规划完整视频提示词和互动说明，
-再由 Ark Seedance 生成源视频；用户确认源视频后，才进入与 MP4 相同的互动分析流程。
+## Story 播放规则
+
+- 不复用片尾时，A 为完整来源视频。
+- 复用片尾时，切点两侧各至少保留 1 秒；A 为切点前部分，B 或 C 为片尾。
+- A 到达分支点后暂停，输入能力准备完成后给用户完整 4 秒操作时间。
+- 成功立即播放 B；未达成或超时播放 C。
+- B、C 播放结束后结束体验，不回到上一个互动点。
 
 ## 服务职责
 
-- Website：当前提供登录、邀请码、MP4 输入、互动预览和发布；仅为历史文本任务保留源视频
-  确认与进度展示。
-- ivapp：用户权限、每日额度、创作会话、生成任务编排、源视频确认、30 天草稿清理。
-- ivadmin：提示词规划、Ark 私有凭证、Seedance 异步任务、生成视频下载验收、互动分析。
-- Media cache / OSS：生成视频保持私有；沿用已有内容寻址缓存和私有 OSS 抽象。
-
-ivapp 不保存 Ark 或文本模型凭证。浏览器也不会接触任何模型凭证或 Ark 输出地址。
-
-## 状态闭环
-
-文本创建的主要状态如下：
-
-```text
-queued -> planning_prompt -> submitting_video -> generating_video
-       -> ingesting_video -> preparing_preview -> review_source
-       -> validate_video -> normalize_video -> sample_frames
-       -> find_playable_moments -> compile_preview -> ready
-       -> pending_review -> published
-```
-
-用户在 `review_source` 必须选择接受或重新生成。未接受的 ready / failed / cancelled
-草稿在 30 天后由 Worker 清理；已接受源不会被该清理任务删除。
+- Android：页面、即时互动替换、本地预览、草稿恢复与服务端任务重连。
+- ivapp：用户权限、Credits、创作会话、Story 计划、分支状态、预览确认和发布。
+- ivadmin：MiniMax 私有凭证、任务提交/查询、视频下载验收、5 秒归一化、切片和首帧。
+- Media cache / OSS：保存规范化来源、A/B/C 片段和发布素材。
 
 ## 配置
 
-ivadmin：
+ivadmin 必需配置：
 
-- `CREATOR_VIDEO_GENERATION_ENABLED=false`
-- `CREATOR_VIDEO_ARK_API_KEY`
-- `CREATOR_VIDEO_ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
-- `CREATOR_VIDEO_MODEL=doubao-seedance-2-0-260128`
-- `CREATOR_VIDEO_RATIO=9:16`
-- `CREATOR_VIDEO_DURATION_SECONDS=10`
-- `CREATOR_VIDEO_RESOLUTION=720p`
-- `CREATOR_VIDEO_GENERATE_AUDIO=true`
-- `CREATOR_VIDEO_WATERMARK=false`
+- `CREATOR_INTERNAL_KEY`：与 ivapp 完全一致的随机内部密钥。
+- `CREATOR_VIDEO_GENERATION_ENABLED=true`
+- `CREATOR_BRANCH_STORY_ENABLED=true`
+- `CREATOR_VIDEO_GENERATION_WORKER_ENABLED=true`
+- `CREATOR_VIDEO_MINIMAX_API_KEY`：从部署密钥存储注入。
+- `CREATOR_VIDEO_MINIMAX_BASE_URL=https://api.minimaxi.com`
+- `CREATOR_VIDEO_MODEL=MiniMax-Hailuo-2.3`
+- `CREATOR_VIDEO_DURATION_SECONDS=5`
+- `CREATOR_VIDEO_RESOLUTION=768P`
+- `MEDIA_STORAGE_MODE=oss`：Story 首帧必须通过私有对象存储生成短时下载地址。
 
-ivapp：
+`CREATOR_VIDEO_ARK_API_KEY` 只用于排空历史任务，可以留空。启动检查会拒绝模型、
+时长、分辨率或 MiniMax Key 缺失的半启用部署，避免用户进入一个必然失败的入口。
 
-- `CREATOR_TEXT_TO_VIDEO_ENABLED=false`
-- `CREATOR_VIDEO_DAILY_QUOTA=3`
+ivapp 必需配置：
+
+- `IVADMIN_BASE_URL`：ivadmin 内网地址。
+- `CREATOR_INTERNAL_KEY`：与 ivadmin 相同。
+- `CREATOR_TEXT_TO_VIDEO_ENABLED=true`
+- `CREATOR_BRANCH_STORY_ENABLED=true`
 - `CREATOR_VIDEO_DRAFT_TTL_DAYS=30`
 
-两个功能开关默认关闭。不要把 Ark Key 写入仓库、前端配置或部署日志。
+`CREATOR_VIDEO_DAILY_QUOTA` 已废弃，保留字段仅用于旧客户端响应兼容。
 
-## 将来重新启用的顺序
+## 上线顺序
 
-1. 申请并激活一个可调用 Seedance 2.0 的 Ark Key。
-2. 使用 `ivadmin-api/backend/scripts/smoke_ark_video.py` 做 5 秒、480p 冒烟测试。
-3. 在 ivapp 数据库执行 Alembic 升级。
-4. 将成功验证的单个 Ark Key 注入 ivadmin secret；不要配置运行期双 Key 回退。
-5. 先发布 ivadmin 并开启 `CREATOR_VIDEO_GENERATION_ENABLED`，验证私有接口和 Worker。
-6. 再发布 ivapp 与 Website，最后开启 `CREATOR_TEXT_TO_VIDEO_ENABLED`。
-7. 观察任务成功率、Ark 429/5xx、等待时长、额度扣减和 30 天清理任务。
+1. 备份数据库，并分别升级 ivadmin、ivapp 的数据库结构。
+2. 将 PixoMini 已验证的 MiniMax 服务端 Key 注入 ivadmin；不要复制进仓库或客户端。
+3. 先发布 ivadmin，确认 Worker、共享媒体缓存、私有 OSS 和内部接口正常。
+4. 在隔离测试账号上做一次真实 5 秒来源和一次带首帧的 5 秒 Story 生成。
+5. 验证失败退款、重复请求、B/C 两路播放、三段素材发布和审核状态。
+6. 发布 ivapp 和 Android，先开启文本来源，再开启 Branch Story。
+7. 观察生成耗时、失败率、429/5xx、Credits 对账、媒体备份和 CDN 发布状态。
 
-再次软回滚时先关闭 ivapp 的文本入口，再关闭 ivadmin 新任务生成开关。MP4 上传链路与已
-进入互动分析的任务不受影响；排空历史任务后再停 Worker；数据库字段和表保留，不执行降级
-删除。
+本次代码验收只使用模拟响应和本地媒体，没有调用真实 MiniMax API。真实生成冒烟测试由
+持有生产 Key 的发布人员执行。
 
-## 当前凭证验证结论
+## 回滚
 
-2026-08-29 的真实鉴权检查中，新项目现存 Key、旧项目 `ARK_API_KEY`，以及
-`admin.pixopixo.cn` 线上 AI 视频模块当前保存的 Key 均被 Ark 返回
-`401 AuthenticationError: API key status is not active`。线上模块在 2026-08-28 曾有成功的
-Seedance 任务，但用同一 Key 查询该成功任务时也已返回 401；当前配置与部署备份中的 Key
-相同，没有发现第二份运行时 Key。检查没有提交新视频任务，因此未产生生成费用。
-
-上线前必须由运维在火山方舟控制台重新激活该 Key，或注入一个新的已激活 Key，并重新完成
-冒烟测试；在此之前两个功能开关必须保持关闭。不要把已确认失效的 Key 复制到新环境。
+先关闭 ivapp 的 `CREATOR_BRANCH_STORY_ENABLED` 和文本来源入口，阻止新任务；再让 ivadmin
+排空已经进入队列的任务。已成功来源、结局、版本和发布内容继续可用。不要通过数据库降级
+删除用户任务或媒体。

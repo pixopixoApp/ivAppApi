@@ -12,7 +12,10 @@ from app.protocol_video import (
     compile_runtime_spec,
     read_runtime_spec,
 )
-from app.runtime_backfill import compile_all_runtime_specs
+from app.runtime_backfill import (
+    backfill_known_rotation_directions,
+    compile_all_runtime_specs,
+)
 
 
 def test_compile_preserves_response_window_and_pause_semantics() -> None:
@@ -51,6 +54,42 @@ def test_unknown_gesture_fails_closed() -> None:
             content_mode="single",
             source={"interactions": [{"gesture": "magic", "gate_at_ms": 1}]},
             video_url="/media/demo.mp4",
+        )
+
+
+def test_rotate_compiles_selected_direction_and_rejects_invalid_value() -> None:
+    source = {
+        "interactions": [
+            {
+                "gesture": "rotate",
+                "gate_at_ms": 1000,
+                "rotation_direction": "clockwise",
+            }
+        ]
+    }
+    spec = compile_runtime_spec(
+        item_id="rotate-demo",
+        content_mode="single",
+        source=source,
+        video_url="/media/rotate-demo.mp4",
+    )
+    assert spec["video"][0]["interactions"][0]["detection"]["rotation_direction"] == (
+        "clockwise"
+    )
+    with pytest.raises(RuntimeSpecError, match="rotation_direction"):
+        compile_runtime_spec(
+            item_id="invalid-rotate",
+            content_mode="single",
+            source={
+                "interactions": [
+                    {
+                        "gesture": "rotate",
+                        "gate_at_ms": 1000,
+                        "rotation_direction": "sideways",
+                    }
+                ]
+            },
+            video_url="/media/invalid-rotate.mp4",
         )
 
 
@@ -126,7 +165,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     interaction = spec["video"][0]["interactions"][0]
 
     assert spec["version"] == "1.2"
-    assert RUNTIME_SPEC_VERSION == "1.6"
+    assert RUNTIME_SPEC_VERSION == "1.7"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -392,7 +431,7 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
     assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
-        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}
+        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7"}
     )
     spec = compile_runtime_spec(
         item_id="legacy",
@@ -627,6 +666,33 @@ def test_backfill_updates_good_rows_and_preserves_bad_rows(db) -> None:
     assert good.runtime_spec_version != "legacy"
     assert bad.runtime_spec == legacy_spec
     assert bad.runtime_spec_version == "legacy"
+
+
+def test_rotation_direction_backfill_updates_source_and_runtime_spec(db, monkeypatch) -> None:
+    row = PublishedVideo(
+        id="audited-rotate",
+        video_url="/media/audited-rotate.mp4",
+        timeline={"interactions": [{"gesture": "rotate", "gate_at_ms": 3620}]},
+        runtime_spec={"schema": "legacy"},
+        runtime_spec_version="legacy",
+        version="1",
+        content_mode="single",
+    )
+    db.add(row)
+    db.commit()
+    monkeypatch.setattr(
+        "app.runtime_backfill.KNOWN_ROTATION_DIRECTIONS",
+        {"audited-rotate": {3620: "counterclockwise"}},
+    )
+
+    report = backfill_known_rotation_directions(db, apply=True)
+
+    assert report.failures == []
+    assert report.updated == 1
+    db.refresh(row)
+    assert row.timeline["interactions"][0]["rotation_direction"] == "counterclockwise"
+    detection = row.runtime_spec["video"][0]["interactions"][0]["detection"]
+    assert detection["rotation_direction"] == "counterclockwise"
 
 
 def test_backfill_recompiles_creator_versions_and_active_snapshot(db) -> None:

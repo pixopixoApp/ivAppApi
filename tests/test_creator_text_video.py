@@ -6,6 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
+from app.credits import settle_reference
 from app.main import app
 from app.models import (
     CreatorAccessGrant,
@@ -13,6 +14,8 @@ from app.models import (
     CreatorSourceGeneration,
     CreatorUpload,
     CreatorVersion,
+    CreditLedgerEntry,
+    MediaObject,
     User,
     UserToken,
 )
@@ -94,6 +97,7 @@ def test_prompt_creation_waits_for_source_confirmation(db, monkeypatch) -> None:
             f"/api/v1/creator/creations/{created.json()['creation_id']}/cancel",
             headers=headers,
         )
+        credits = client.get("/api/v1/credits", headers=headers)
 
     assert created.status_code == 202
     assert created.json()["source_mode"] == "prompt"
@@ -103,6 +107,8 @@ def test_prompt_creation_waits_for_source_confirmation(db, monkeypatch) -> None:
     assert repeated.json()["creation_id"] == created.json()["creation_id"]
     assert cancelled.json()["status"] == "cancelled"
     assert cancelled.json()["generation_quota"]["reserved"] == 0
+    assert credits.status_code == 200
+    assert credits.json()["balance"] == 5
     generation = db.get(
         CreatorSourceGeneration,
         created.json()["source_generation_id"],
@@ -112,7 +118,7 @@ def test_prompt_creation_waits_for_source_confirmation(db, monkeypatch) -> None:
     assert generation.quota_state == "released"
 
 
-def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis(
+def test_source_worker_charges_only_after_ready_preview_and_accept_starts_analysis(
     db,
     monkeypatch,
 ) -> None:
@@ -169,7 +175,7 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
             "preset": {
                 "model": "doubao-seedance-2-0-260128",
                 "ratio": "9:16",
-                "duration_seconds": 10,
+                "duration_seconds": 3,
                 "resolution": "720p",
                 "generate_audio": True,
                 "watermark": False,
@@ -191,7 +197,7 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
             "source_storage_key": "local-cache://sha256/" + "a" * 64,
             "source_sha256": "a" * 64,
             "source_size_bytes": 2048,
-            "source_duration_ms": 10_000,
+            "source_duration_ms": 3_000,
         },
     ]
 
@@ -207,7 +213,7 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
     settings = get_settings()
     process_source_generation(db, settings, generation)
     db.refresh(generation)
-    assert generation.quota_state == "charged"
+    assert generation.quota_state == "reserved"
     assert generation.provider_task_accepted is True
 
     process_source_generation(db, settings, generation)
@@ -220,13 +226,36 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
     upload.normalization_status = "ready"
     upload.playable_sha256 = "b" * 64
     upload.playable_size_bytes = 1024
-    db.add(upload)
+    playable = MediaObject(
+        id="mo_source_worker_playable",
+        purpose="creator_normalized",
+        origin="ai_generated",
+        visibility="private",
+        state="ready",
+        staging_key="",
+        object_key=(
+            "ivapp-media/v1/private/creator-sources/worker/playable.mp4"
+        ),
+        original_filename="playable.mp4",
+        content_type="video/mp4",
+        size_bytes=1024,
+        sha256="b" * 64,
+        etag="test-etag",
+    )
+    upload.playable_media_object_id = playable.id
+    warmed_keys: list[str] = []
+    monkeypatch.setattr(
+        "app.worker.enqueue_private_media_prefetch",
+        lambda _db, _settings, keys: warmed_keys.extend(keys) or [],
+    )
+    db.add_all([upload, playable])
     db.commit()
     process_source_generation(db, settings, generation)
     db.refresh(generation)
     db.refresh(creation)
     assert generation.status == "ready"
     assert creation.status == "source_ready"
+    assert warmed_keys == [playable.object_key]
 
     with TestClient(app) as client:
         reviewed = client.get(
@@ -250,7 +279,9 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
             },
         )
 
-    assert reviewed.json()["source_preview_url"].endswith(f"/{upload.id}/media")
+    assert reviewed.json()["source_preview_url"].endswith(
+        f"/creator/previews/{upload.id}"
+    )
     assert reviewed.json()["source_generation"]["prompt_summary"].startswith("Glowing")
     assert accepted.status_code == 202
     assert accepted.json()["status"] == "queued"
@@ -262,12 +293,25 @@ def test_source_worker_charges_on_provider_acceptance_and_accept_starts_analysis
         "creation_id": creation.id,
         "generation_id": generation.id,
         "prompt": "A glowing ribbon follows a hand wave",
+        "duration_seconds": 3,
     }
 
 
-def test_daily_generation_quota_blocks_fourth_provider_attempt(db, monkeypatch) -> None:
+def test_credits_allow_fourth_provider_attempt_without_hidden_daily_cap(db, monkeypatch) -> None:
     _enable(monkeypatch)
-    _user_id, headers = _creator(db, "quota-user")
+    user_id, headers = _creator(db, "quota-user")
+    # A funded account is no longer subject to the old daily-three limit.
+    db.add(
+        CreditLedgerEntry(
+            id="test-quota-credit-grant",
+            user_id=user_id,
+            kind="test_grant",
+            amount=20,
+            reference_id="test",
+            note="test-only credit grant",
+        )
+    )
+    db.commit()
 
     with TestClient(app) as client:
         first = client.post(
@@ -306,8 +350,62 @@ def test_daily_generation_quota_blocks_fourth_provider_attempt(db, monkeypatch) 
             json={"prompt": "Idea four", "request_id": "quota-4"},
         )
 
-    assert blocked.status_code == 429
-    assert blocked.json()["detail"]["limit"] == 3
+    assert blocked.status_code == 202
+    assert blocked.json()["generation_quota"]["unlimited"] is True
+
+
+def test_paid_source_regeneration_keeps_previous_ready_preview(db, monkeypatch) -> None:
+    _enable(monkeypatch)
+    user_id, headers = _creator(db, "regenerate-preview-user")
+    now = datetime.now(timezone.utc)
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/creator/creations",
+            headers=headers,
+            json={"source_mode": "prompt", "prompt": "First source", "request_id": "source-first"},
+        )
+        assert created.status_code == 202
+        creation = db.get(CreatorCreation, created.json()["creation_id"])
+        generation = db.get(CreatorSourceGeneration, creation.source_generation_id)
+        old_upload = CreatorUpload(
+            id="up_previous_ready_source", user_id=user_id,
+            storage_key="local-cache://sha256/" + "a" * 64,
+            source_local_uri="local-cache://sha256/" + "a" * 64,
+            source_sha256="a" * 64, upload_transport="ai-generated",
+            origin="ai_generated", source_generation_id=generation.id,
+            normalization_status="ready", normalization_profile="mobile-v1",
+            playable_local_uri="local-cache://sha256/" + "a" * 64,
+            playable_sha256="a" * 64, playable_size_bytes=2048,
+            original_filename="old.mp4", size_bytes=2048, duration_ms=5000,
+            created_at=now,
+        )
+        db.add(old_upload)
+        generation.upload_id = old_upload.id
+        generation.status = "ready"
+        generation.quota_state = "charged"
+        generation.accepted_at = now
+        creation.upload_id = old_upload.id
+        creation.status = "source_ready"
+        db.add(CreditLedgerEntry(
+            id="regenerate-preview-credit", user_id=user_id, kind="test_grant",
+            amount=5, reference_id="test", note="test-only credit grant", created_at=now,
+        ))
+        settle_reference(db, user_id=user_id, reference_id=f"source:{generation.id}")
+        db.commit()
+
+        regenerated = client.post(
+            f"/api/v1/creator/creations/{creation.id}/source/regenerate",
+            headers=headers,
+            json={"prompt": "Replacement source", "request_id": "source-replacement"},
+        )
+
+    assert regenerated.status_code == 202, regenerated.text
+    assert regenerated.json()["upload_id"] == old_upload.id
+    assert regenerated.json()["source_preview_url"].endswith(
+        f"/creator/previews/{old_upload.id}"
+    )
+    db.expire_all()
+    assert db.get(CreatorCreation, creation.id).upload_id == old_upload.id
 
 
 def test_unaccepted_source_expires_and_releases_reserved_quota(db, monkeypatch) -> None:

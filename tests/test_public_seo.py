@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.main import app
-from app.models import PublishedVideo, User
-from app.seo import source_hash
+from app.models import (
+    PublishedVideo,
+    PublishedVideoSeo,
+    PublishedVideoSeoSlugAlias,
+    User,
+)
+from app.seo import seo_slug_stem, slugify, source_hash, unique_slug
 
 
 def _published(db, *, video_id: str = "work-seo-1") -> PublishedVideo:
@@ -51,6 +57,39 @@ def _published(db, *, video_id: str = "work-seo-1") -> PublishedVideo:
     db.add(row)
     db.commit()
     return row
+
+
+def test_seo_slug_removes_noise_and_uses_five_digit_suffix() -> None:
+    title = (
+        "A an the in on at for to with and or of by is are 2025 2026 top 10 "
+        "5 best ultimate amazing awesome easy simple \"Cat's Dance?!\" % 💸"
+    )
+
+    assert seo_slug_stem(title) == "cats-dance"
+    assert slugify(title, suffix=10_042) == "cats-dance-10042"
+
+
+def test_seo_slug_limits_keywords_and_has_a_safe_fallback() -> None:
+    assert seo_slug_stem("Moon Dance Forest Camera Gesture Sparkle") == (
+        "moon-dance-forest-camera-gesture"
+    )
+    assert seo_slug_stem("Optimize Next.js Performance") == "optimize-nextjs-performance"
+    assert seo_slug_stem("The Best 2025!!! 💸") == "interactive-video"
+
+
+def test_unique_slug_retries_a_five_digit_collision(db, monkeypatch) -> None:
+    db.add(PublishedVideoSeo(video_id="existing", slug="cat-dance-10000"))
+    db.add(
+        PublishedVideoSeoSlugAlias(
+            slug="cat-dance-10001",
+            video_id="existing",
+        )
+    )
+    db.commit()
+    suffixes = iter((0, 1, 2))
+    monkeypatch.setattr("app.seo.secrets.randbelow", lambda _limit: next(suffixes))
+
+    assert unique_slug(db, "The Cat Dance", video_id="new") == "cat-dance-10002"
 
 
 def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
@@ -102,7 +141,7 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
 
     assert listing.status_code == 200
     assert listing.json()["total"] == 1
-    assert slug.startswith("tap-to-wake-the-city-")
+    assert re.fullmatch(r"tap-wake-city-\d{5}", slug)
     assert listing.json()["items"][0]["title"] == "Tap to Wake the City"
     assert listing.json()["items"][0]["embed_url"] == (
         listing.json()["items"][0]["canonical_url"]
@@ -112,8 +151,42 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
     assert item["created_at"] == item["created_at"][:10]
     assert item["updated_at"] == item["updated_at"][:10]
     assert detail.status_code == 200
-    assert detail.json()["canonical_url"].endswith(f"/experiences/{slug}")
+    assert detail.json()["canonical_url"].endswith(f"/videos/{slug}")
     assert resolved.json()["canonical_url"] == detail.json()["canonical_url"]
+
+
+def test_legacy_slug_alias_resolves_to_the_current_permalink(db, monkeypatch) -> None:
+    monkeypatch.setenv("SEO_PUBLIC_BASE_URL", "https://pixopixo.com")
+    get_settings.cache_clear()
+    row = _published(db, video_id="work-seo-legacy")
+    new_slug = "make-baby-laugh-48317"
+    old_slug = "make-baby-laugh-4f92c12edae64ed4"
+    db.add(
+        PublishedVideoSeo(
+            video_id=row.id,
+            slug=new_slug,
+            page_title="Make Baby Laugh",
+            page_description="Make a baby laugh with a playful interactive video.",
+            meta_title="Make Baby Laugh | Pixopixo",
+            meta_description="Play a lighthearted interactive baby video on Pixopixo.",
+            interaction_summary="Follow the cue to make the baby laugh.",
+            thumbnail_url="https://pixopixo.com/posters/work-seo-legacy.jpg",
+            status="ready",
+            source_hash=source_hash(row),
+        )
+    )
+    db.add(PublishedVideoSeoSlugAlias(slug=old_slug, video_id=row.id))
+    db.commit()
+
+    with TestClient(app) as client:
+        legacy = client.get(f"/api/v1/public/seo/experiences/{old_slug}")
+        current = client.get(f"/api/v1/public/seo/experiences/{new_slug}")
+
+    assert legacy.status_code == 200
+    assert current.status_code == 200
+    assert legacy.json()["slug"] == new_slug
+    assert legacy.json()["canonical_url"].endswith(f"/videos/{new_slug}")
+    assert legacy.json() == current.json()
 
 
 def test_pending_or_unpublished_metadata_is_not_indexable(db) -> None:

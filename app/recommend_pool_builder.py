@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.db import SessionLocal
@@ -99,10 +100,8 @@ def _row_playable(row: dict) -> bool:
                 vid, row.get("runtime_spec_version"), exc,
             )
             return False
-    if ctype == CONTENT_TYPE_HTML:
-        # 建池时 bridge_version 已是 1 且 html_url 非空（见 _visible_filter）
-        return True
-    return False
+    # HTML 建池时 bridge_version 已是 1 且 html_url 非空（见 _visible_filter）。
+    return ctype == CONTENT_TYPE_HTML
 
 
 def build_all_pools(*, settings: Settings | None = None) -> dict[int, tuple[int, int]]:
@@ -164,5 +163,5 @@ def rebuild_once() -> None:
         log.info("recommend pool rebuild done counts=%s", counts)
     except ImpressionUnavailableError as exc:
         log.warning("recommend pool rebuild skipped (redis unavailable): %s", exc)
-    except Exception:  # noqa: BLE001 - 建池失败不应拖垮主服务
+    except Exception:
         log.exception("recommend pool rebuild failed")

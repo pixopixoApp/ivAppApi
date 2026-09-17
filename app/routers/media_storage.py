@@ -7,10 +7,16 @@ from datetime import timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser
 from app.config import Settings, get_settings
+from app.creator_video_prepare import (
+    FIRST_30_SECONDS_PROFILE,
+    VideoPreparationError,
+    prepared_creator_video,
+)
 from app.db import get_db
 from app.deps import require_publish_key
 from app.html_import_service import (
@@ -68,6 +74,22 @@ from app.video_probe import VideoProbeError, probe_video
 from app.web_session import require_creator_user
 
 router = APIRouter(tags=["media-storage"])
+
+
+@router.get("/api/v1/creator/uploads/{upload_id}/prepared-source", response_class=FileResponse)
+def get_prepared_creator_source(
+    upload_id: str,
+    user: Annotated[AppUser, Depends(require_creator_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Response:
+    row = db.get(CreatorUpload, upload_id)
+    if row is None or row.user_id != user.user_id or row.upload_transport != "local-resumable-v1":
+        raise HTTPException(status_code=404, detail="upload not found")
+    path = local_path_for_sha256(settings, row.source_sha256, expected_size=row.size_bytes)
+    if path is None:
+        raise HTTPException(status_code=404, detail="source media is unavailable")
+    return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "private, no-store"})
 
 
 @router.post("/internal/v1/html-imports/inspect", dependencies=[Depends(require_publish_key)])
@@ -152,7 +174,8 @@ def _iso(value) -> str:
     return value.isoformat() if value is not None else ""
 
 
-def _creator_upload_out(row: CreatorUpload) -> CreatorUploadOut:
+def _creator_upload_out(row: CreatorUpload, context: dict | None = None) -> CreatorUploadOut:
+    context = context or {}
     progress = {
         "pending": 0,
         "submitted": 5,
@@ -162,6 +185,9 @@ def _creator_upload_out(row: CreatorUpload) -> CreatorUploadOut:
         "failed": 100,
     }.get(row.normalization_status or "pending", 0)
     return CreatorUploadOut(
+        original_duration_ms=context.get("original_duration_ms"),
+        was_trimmed=bool(context.get("was_trimmed")),
+        prepared_source_url=f"/api/v1/creator/uploads/{row.id}/prepared-source" if context.get("preparation_profile") else None,
         upload_id=row.id,
         original_filename=row.original_filename,
         size_bytes=row.size_bytes,
@@ -387,11 +413,12 @@ def get_internal_media_download_url(
     object_id: str,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
+    expires_seconds: int | None = None,
 ) -> MediaObjectDownloadOut:
     row = db.get(MediaObject, object_id)
     if row is None or row.state != "ready":
         raise HTTPException(status_code=404, detail="ready media object not found")
-    ttl = max(30, min(3600, settings.oss_private_get_ttl_seconds))
+    ttl = max(30, min(3600, expires_seconds if expires_seconds is not None else settings.oss_private_get_ttl_seconds))
     try:
         url = (
             public_url(settings, row.object_key)
@@ -461,10 +488,14 @@ def init_creator_upload(
 ) -> UploadSessionOut:
     if db.get(CreatorAccessGrant, user.user_id) is None:
         raise HTTPException(status_code=403, detail="creator access required")
-    if payload.size_bytes > settings.creator_video_max_bytes:
+    prepares_video = payload.preparation_profile == FIRST_30_SECONDS_PROFILE
+    if prepares_video and (user.channel != "web" or not settings.creator_local_upload_enabled or "local-resumable-v1" not in payload.supported_transports):
+        raise HTTPException(status_code=400, detail="video preparation requires a Web resumable upload")
+    max_source_bytes = max(settings.creator_video_max_bytes, settings.creator_web_source_max_bytes) if prepares_video else settings.creator_video_max_bytes
+    if payload.size_bytes > max_source_bytes:
         raise HTTPException(
             status_code=400,
-            detail=f"video exceeds {settings.creator_video_max_bytes} bytes",
+            detail=f"video exceeds {max_source_bytes} bytes",
         )
     content_type = payload.content_type.split(";", 1)[0].strip().lower()
     if not payload.filename.lower().endswith(".mp4") and content_type not in {
@@ -504,6 +535,7 @@ def init_creator_upload(
                 "size_bytes": int(payload.size_bytes),
                 "sha256": payload.sha256.lower() if payload.sha256 else "",
                 "offset": 0,
+                "preparation_profile": payload.preparation_profile,
             },
             expires_at=expires_at,
         )
@@ -677,7 +709,7 @@ def finalize_creator_upload(
     upload_id = str((session.context or {}).get("upload_id") or "")
     existing = db.get(CreatorUpload, upload_id) if upload_id else None
     if existing is not None:
-        return _creator_upload_out(existing)
+        return _creator_upload_out(existing, session.context)
     if (session.context or {}).get("transport") == "local-resumable-v1":
         session = _creator_local_session(db, session_id, user)
         context = dict(session.context or {})
@@ -707,11 +739,19 @@ def finalize_creator_upload(
                     raise LocalMediaCacheError("uploaded video checksum does not match")
                 digest = calculated_digest
             metadata = probe_video(source)
-            if metadata.duration_ms > settings.creator_video_max_duration_seconds * 1000:
+            original_duration_ms = metadata.duration_ms
+            needs_preparation = metadata.duration_ms > settings.creator_video_max_duration_seconds * 1000 or expected_size > settings.creator_video_max_bytes
+            prepared_size = expected_size
+            if needs_preparation and context.get("preparation_profile") == FIRST_30_SECONDS_PROFILE:
+                with prepared_creator_video(source, settings) as (prepared, metadata):
+                    digest = sha256_file(prepared)
+                    prepared_size = prepared.stat().st_size
+                    commit_staged_upload(settings, prepared, sha256=digest, size_bytes=prepared_size)
+            elif needs_preparation:
                 raise LocalMediaCacheError(
                     f"video must be {settings.creator_video_max_duration_seconds} seconds or shorter"
                 )
-            if source == staging:
+            if source == staging and not needs_preparation:
                 assert digest is not None
                 commit_staged_upload(
                     settings,
@@ -719,7 +759,7 @@ def finalize_creator_upload(
                     sha256=digest,
                     size_bytes=expected_size,
                 )
-        except (LocalMediaCacheError, VideoProbeError) as exc:
+        except (LocalMediaCacheError, VideoProbeError, VideoPreparationError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         row = CreatorUpload(
             id=upload_id,
@@ -732,15 +772,18 @@ def finalize_creator_upload(
             normalization_status="pending",
             normalization_profile="mobile-v1",
             original_filename=str(context.get("filename") or "video.mp4"),
-            size_bytes=expected_size,
+            size_bytes=prepared_size,
             duration_ms=metadata.duration_ms,
         )
         session.state = "ready"
+        session.context = {**context, "original_duration_ms": original_duration_ms,
+                           "was_trimmed": original_duration_ms > settings.creator_video_max_duration_seconds * 1000}
         session.finalized_at = now_utc()
         db.add_all([row, session])
         db.commit()
+        staging.unlink(missing_ok=True)
         db.refresh(row)
-        return _creator_upload_out(row)
+        return _creator_upload_out(row, session.context)
     try:
         result = finalize_upload_session(
             db,

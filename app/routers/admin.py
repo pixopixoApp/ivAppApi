@@ -19,7 +19,7 @@ from app.avatar_storage import (
     store_cover_image,
     store_user_avatar,
 )
-from app.cdn_cache import enqueue_prefetch, html_package_public_urls
+from app.cdn_cache import enqueue_prefetch
 from app.cdn_publication import (
     CdnPublicationError,
     activate_ready_publications,
@@ -576,7 +576,6 @@ async def upload_user_avatar(
         row.avatar_url = avatar_url
         row.avatar_media_object_id = media_object_id
         db.add(row)
-        enqueue_prefetch(db, settings, [avatar_url])
         db.commit()
         db.refresh(row)
     except AvatarStorageError as exc:
@@ -1051,13 +1050,16 @@ def publish_assets(
             setattr(row, field, value)
         row.updated_at = now
         db.add(row)
-    enqueue_prefetch(db, settings, published_assets.urls.values())
+    # Warm only the entry clip. Story branches remain immutable CDN URLs and
+    # fill on demand when a viewer actually chooses that path.
+    critical_urls = [video_url]
+    enqueue_prefetch(db, settings, critical_urls)
     try:
         gate = stage_publication_gate(
             db,
             video_id=item_id,
             publication_id=published_assets.publication_id,
-            urls=published_assets.urls.values(),
+            urls=critical_urls,
             staged_payload=target_payload,
         )
         db.flush()
@@ -1293,11 +1295,9 @@ def publish_html(
         updated = True
 
     if package is not None:
-        enqueue_prefetch(
-            db,
-            settings,
-            html_package_public_urls(db, settings, package_id=package.id),
-        )
+        # The entry document controls time-to-first-render. Immutable JS, CSS
+        # and media subresources are cached by the CDN when the page loads.
+        enqueue_prefetch(db, settings, [html_url])
     record_published_video_text(db, row)
     mark_seo_stale(db, row)
     db.commit()
