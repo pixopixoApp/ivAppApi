@@ -1,6 +1,7 @@
 """Redis 推荐内容池全量重建（30 分钟定时，影子 + 原子 RENAME）。
 
-数据来源：published_videos（feed_weight 1~5 直接映射 level）。
+数据来源：published_videos（feed_weight 1~5 直接映射 level；>5 按最高档 5；
+weight<=0 视为未标注/不参与推荐，跳过不入池）。
 每档拆「全量 + new（created_at 在窗口内）」两个 Set，经 shadow 原子切换，零空窗。
 部署前提：Redis 内容池全部建好（SCARD 校验通过）后才对外切流量。
 """
@@ -126,7 +127,11 @@ def build_all_pools(*, settings: Settings | None = None) -> dict[int, tuple[int,
         vid = row["id"]
         weight = int(row.get("feed_weight") or 0)
         created_at = row.get("created_at")
-        lv = weight if weight in LEVELS else (5 if weight > 5 else 1)
+        # 档位映射：1~5 直接映射；>5（历史越界值）按最高档 5；
+        # weight<=0 表示未标注/不参与推荐池，跳过不入池（避免把 0 档混进档 1）。
+        if weight <= 0:
+            continue
+        lv = weight if weight in LEVELS else 5
         buckets[lv].append(vid)
         if _is_new(created_at, now, new_window):
             new_buckets[lv].append(vid)
