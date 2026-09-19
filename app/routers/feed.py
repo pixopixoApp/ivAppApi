@@ -635,20 +635,42 @@ def _locked_recommend_cursor(db: Session, *, state_key: str) -> RecommendCursor:
     )
 
 
-def _record_recommend_stats(db: Session, *, video_ids: list[str]) -> None:
+def _record_recommend_stats(
+    db: Session,
+    *,
+    video_ids: list[str],
+    counter_key: str | None = None,
+    counter_ttl_seconds: int | None = None,
+) -> None:
     """累计每个视频被推荐下发的次数（同步、幂等 UPSERT）。
 
     仅由正常的 Redis 推荐下发流程调用；回放（rewind）批次不计数，以便该
     统计反映“算法正常产出”的能力而非池子耗尽后的兜底重复。写入失败只告警、
     不影响本次 feed 返回。
+
+    防污染（策略 A+B）：
+    - A. counter_key 为 None（无可信会话身份）时直接跳过，匿名随机 ssid 调用不计入；
+    - B. counter_key 非空时仅统计该会话此前未计数过的视频，每个会话对每个视频
+         最多贡献 1 次，压测/重复下拉无法刷高计数。
     """
+    if counter_key is None:
+        return
     unique_ids = list(dict.fromkeys(video_ids))
     if not unique_ids:
+        return
+    # 策略 B：先剔除该会话已计数过的视频，只对新增部分 +1。
+    try:
+        store = get_recommend_store()
+        fresh_ids = store.filter_counted(counter_key=counter_key, video_ids=unique_ids)
+    except (RedisError, ImpressionUnavailableError):
+        log.warning("recommend stats dedupe unavailable counter=%s", counter_key)
+        return
+    if not fresh_ids:
         return
     now = datetime.now(timezone.utc)
     dialect = db.get_bind().dialect.name
     try:
-        for vid in unique_ids:
+        for vid in fresh_ids:
             values = {
                 "video_id": vid,
                 "count": 1,
@@ -680,9 +702,19 @@ def _record_recommend_stats(db: Session, *, video_ids: list[str]) -> None:
                 continue
             db.execute(statement)
         db.commit()
-    except Exception:  # noqa: BLE001 - 统计失败不能影响推荐主流程
+    except Exception:  # 统计失败不能影响推荐主流程
         db.rollback()
-        log.warning("recommend stats write failed count=%d", len(unique_ids), exc_info=True)
+        log.warning("recommend stats write failed count=%d", len(fresh_ids), exc_info=True)
+        return
+    # 入库成功后再标记已计数，避免写库失败却把会话标记为已计（丢数据）。
+    try:
+        store.mark_counted(
+            counter_key=counter_key,
+            video_ids=fresh_ids,
+            ttl_seconds=counter_ttl_seconds,
+        )
+    except (RedisError, ImpressionUnavailableError):
+        log.warning("recommend stats mark_counted failed counter=%s", counter_key)
 
 
 def _seen_ttl_seconds(settings: Settings, *, is_guest: bool) -> int:
@@ -1325,14 +1357,19 @@ def post_video(
         payload.body.supported_experience_spec_versions,
         payload.body.supported_camera_continuous_targets,
     )
+    # 稳定身份判定：登录用户（user_id）或客户端显式传入的 ssid 至少有一个。
+    # 二者都没有时（匿名调用、服务端随机 ssid）去重无效、也会污染推荐统计，
+    # 因此不进入 Redis 推荐路径，改走 MySQL 直查（不写 recommend_stats）。
+    client_ssid = payload.head.ssid.strip() if (payload.head and payload.head.ssid) else ""
+    has_stable_identity = bool(user) or bool(client_ssid)
     ssid = resolve_ssid(payload.head)
     payload.head.ssid = ssid
 
-    # ---- Redis 推荐方案（开关开启时优先，Redis 不可用自动降级 MySQL）----
+    # ---- Redis 推荐方案（开关开启且身份稳定时优先，否则降级 MySQL）----
     redis_video_ids: list[str] | None = None
     redis_is_rewind = False
     redis_seen_key: str | None = None
-    if settings.feature_recommend_redis:
+    if settings.feature_recommend_redis and has_stable_identity:
         try:
             redis_video_ids, redis_is_rewind, redis_seen_key = _build_redis_recommend_ids(
                 user_id=user.user_id if user else None,
@@ -1348,10 +1385,13 @@ def post_video(
     if redis_video_ids is None:
         # ---- 降级：现有 MySQL 直查逻辑 ----
         capability_key = ",".join(sorted(supported_runtime_spec_versions)) or "none"
+        # 无稳定身份的匿名请求统一归入 anonymous 游标，避免每次随机 ssid
+        # 在 recommend_cursors 里插入一行造成表膨胀。
+        stable_ssid = client_ssid or "anonymous"
         state_key = (
             f"feed:user:{user.user_id}:spec:{capability_key}"
             if user
-            else f"feed:ssid:{ssid}:spec:{capability_key}"
+            else f"feed:ssid:{stable_ssid}:spec:{capability_key}"
         )
         try:
             video_ids, next_cursor = _next_video_ids(
@@ -1470,8 +1510,19 @@ def post_video(
             log.warning("video redis mark_seen failed token=%s", token)
 
     # 推荐次数统计：正常下发即累计（排除 rewind 回放），用于评估算法产出。
+    # 策略 A+B：以会话（登录 user_id / 游客 ssid）为单位去重，且无可信身份时不计入。
+    is_guest = user is None
+    counter_key = (
+        f"rec:counted:{redis_seen_key}" if redis_seen_key else None
+    )
+    counter_ttl = _seen_ttl_seconds(settings, is_guest=is_guest)
     if not redis_is_rewind:
-        _record_recommend_stats(db, video_ids=[item.item_id for item in items])
+        _record_recommend_stats(
+            db,
+            video_ids=[item.item_id for item in items],
+            counter_key=counter_key,
+            counter_ttl_seconds=counter_ttl,
+        )
 
     body = VideoBodyOut(
         items=items,

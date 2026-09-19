@@ -187,6 +187,40 @@ class RedisRecommendStore:
             log.warning("recommend mark_seen failed key=%s err=%s", seen_key, exc)
             raise ImpressionUnavailableError(str(exc)) from exc
 
+    # ---- 推荐统计去重（ZSet，每会话每视频仅计一次）----
+    def filter_counted(self, *, counter_key: str, video_ids: list[str]) -> list[str]:
+        """返回 video_ids 中【尚未被该会话计数过】的子集（保持原顺序，去重）。"""
+        uniq = list(dict.fromkeys(video_ids))
+        if not uniq:
+            return []
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            for vid in uniq:
+                pipe.zscore(counter_key, vid)
+            res = pipe.execute()
+            return [vid for vid, score in zip(uniq, res) if score is None]
+        except RedisError as exc:
+            log.warning("recommend filter_counted failed key=%s err=%s", counter_key, exc)
+            raise ImpressionUnavailableError(str(exc)) from exc
+
+    def mark_counted(
+        self, *, counter_key: str, video_ids: list[str], ttl_seconds: int | None = None
+    ) -> None:
+        """把已计数的视频写入 ZSet（score=当前时间戳）；可选 TTL 自动过期防膨胀。"""
+        uniq = list(dict.fromkeys(video_ids))
+        if not uniq:
+            return
+        try:
+            now = int(__import__("time").time())
+            pipe = self._client.pipeline(transaction=True)
+            pipe.zadd(counter_key, {vid: now for vid in uniq})
+            if ttl_seconds is not None:
+                pipe.expire(counter_key, ttl_seconds)
+            pipe.execute()
+        except RedisError as exc:
+            log.warning("recommend mark_counted failed key=%s err=%s", counter_key, exc)
+            raise ImpressionUnavailableError(str(exc)) from exc
+
     # ---- 内容池采样 ----
     def srandmember(self, *, key: str, count: int) -> list[str]:
         try:
