@@ -165,7 +165,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     interaction = spec["video"][0]["interactions"][0]
 
     assert spec["version"] == "1.2"
-    assert RUNTIME_SPEC_VERSION == "1.7"
+    assert RUNTIME_SPEC_VERSION == "1.8"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -189,6 +189,112 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
             downgraded,
             item_id="continuous-tap-demo",
             version="1.1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_end", "expected_end"),
+    [(3000, 3000), (8000, 5000)],
+)
+def test_explicit_sustained_end_is_compiled_and_clipped(
+    configured_end: int,
+    expected_end: int,
+) -> None:
+    spec = compile_runtime_spec(
+        item_id="bounded-continuous",
+        content_mode="single",
+        source={
+            "media": {"duration_ms": 10_000},
+            "interactions": [
+                {
+                    "gesture": "continuous_tap",
+                    "gate_at_ms": 0,
+                    "gate_end_ms": configured_end,
+                },
+                {"gesture": "tap", "gate_at_ms": 5000},
+            ],
+        },
+        video_url="/media/bounded-continuous.mp4",
+    )
+
+    assert spec["version"] == "1.8"
+    interaction = spec["video"][0]["interactions"][0]
+    assert interaction["active_until_ms"] == expected_end
+    assert interaction["detection"]["response_window_ms"] == 0
+    assert read_runtime_spec(
+        spec,
+        item_id="bounded-continuous",
+        version="1.8",
+    )[0].interactions[0].active_until_ms == expected_end
+
+
+def test_sustained_end_must_be_later_than_start() -> None:
+    with pytest.raises(RuntimeSpecError, match="greater than gate_at_ms"):
+        compile_runtime_spec(
+            item_id="invalid-bounded-continuous",
+            content_mode="single",
+            source={
+                "media": {"duration_ms": 10_000},
+                "interactions": [
+                    {
+                        "gesture": "continuous_swipe",
+                        "gate_at_ms": 1000,
+                        "gate_end_ms": 1000,
+                    }
+                ],
+            },
+            video_url="/media/invalid-bounded-continuous.mp4",
+        )
+
+
+def test_continuous_hold_and_multi_tap_compile_as_v18() -> None:
+    spec = compile_runtime_spec(
+        item_id="new-touch-controls",
+        content_mode="single",
+        source={
+            "media": {"duration_ms": 10_000},
+            "interactions": [
+                {
+                    "gesture": "continuous_hold",
+                    "gate_at_ms": 0,
+                    "gate_end_ms": 3000,
+                },
+                {
+                    "gesture": "multi_tap",
+                    "gate_at_ms": 5000,
+                    "tap_count": 99,
+                },
+            ],
+        },
+        video_url="/media/new-touch-controls.mp4",
+    )
+
+    assert spec["version"] == "1.8"
+    hold, multi_tap = spec["video"][0]["interactions"]
+    assert hold["type"] == "continuous_hold"
+    assert hold["active_until_ms"] == 3000
+    assert hold["description"] == "Press and hold to play"
+    assert multi_tap["type"] == "multi_tap"
+    assert multi_tap["description"] == "Tap 99 times"
+    assert multi_tap["detection"]["required_tap_count"] == 99
+
+
+@pytest.mark.parametrize("tap_count", [0, 100, 1.5, True, None])
+def test_multi_tap_rejects_invalid_counts(tap_count: object) -> None:
+    with pytest.raises(RuntimeSpecError, match="tap_count"):
+        compile_runtime_spec(
+            item_id="invalid-multi-tap",
+            content_mode="single",
+            source={
+                "interactions": [
+                    {
+                        "gesture": "multi_tap",
+                        "gate_at_ms": 1000,
+                        "tap_count": tap_count,
+                    }
+                ]
+            },
+            video_url="/media/invalid-multi-tap.mp4",
         )
 
 
@@ -325,17 +431,6 @@ def test_continuous_voice_compiles_as_v16_with_fixed_audio_lease() -> None:
         (
             {
                 "media": {"duration_ms": 10_000},
-                "interactions": [{
-                    "gesture": "continuous_swipe",
-                    "gate_at_ms": 1000,
-                    "gate_end_ms": 2000,
-                }],
-            },
-            "does not allow gate_end_ms",
-        ),
-        (
-            {
-                "media": {"duration_ms": 10_000},
                 "interactions": [
                     {"gesture": "continuous_swipe", "gate_at_ms": 1000},
                     {"gesture": "tap", "gate_at_ms": 1000},
@@ -431,7 +526,7 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
     assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
-        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7"}
+        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}
     )
     spec = compile_runtime_spec(
         item_id="legacy",

@@ -69,8 +69,8 @@ from app.protocol_video import (
     BASE_RUNTIME_SPEC_VERSION,
     RuntimeSpecError,
     compile_runtime_spec,
+    creator_supported_gestures,
     runtime_spec_version_from_compiled,
-    supported_gestures,
 )
 from app.public_origin import canonicalize_public_payload, canonicalize_public_url
 from app.public_text import (
@@ -615,11 +615,11 @@ def get_app_version(
 
 
 _TOUCH_INTERACTIONS = frozenset({
-    "tap", "double_tap", "rapid_tap", "hold", "hold_charge",
+    "tap", "double_tap", "rapid_tap", "multi_tap", "hold", "hold_charge",
     "swipe_left", "swipe_right", "swipe_up", "swipe_down",
     "drag_left", "drag_right", "drag_up", "drag_down",
     "scrub_left", "scrub_right", "scrub_up", "scrub_down",
-    "continuous_swipe", "continuous_tap", "pinch", "draw_circle", "erase",
+    "continuous_swipe", "continuous_tap", "continuous_hold", "pinch", "draw_circle", "erase",
 })
 _DEVICE_MOTION_INTERACTIONS = frozenset({
     "hold_still", "tilt_left", "tilt_right", "shake", "rotate",
@@ -660,7 +660,7 @@ def get_creator_capabilities(
                 "capability": _interaction_capability(gesture),
                 "story_enabled": gesture not in SUSTAINED,
             }
-            for gesture in sorted(supported_gestures())
+            for gesture in sorted(creator_supported_gestures())
         ],
         interaction_presets=[
             preset.as_public_dict() for preset in creator_interaction_presets()

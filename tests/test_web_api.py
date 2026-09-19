@@ -15,7 +15,7 @@ from app.models import (
     User,
     UserToken,
 )
-from app.protocol_video import supported_gestures
+from app.protocol_video import creator_supported_gestures
 from app.web_session import WEB_CSRF_COOKIE, WEB_SESSION_COOKIE
 
 
@@ -204,7 +204,9 @@ def test_web_session_can_read_shared_credits_referral_and_creator_capabilities(d
     assert body["credit_per_generated_second"] == 1
     assert body["referral_reward_credits"] == 10
     assert len(body["supported_interactions"]) == 35
-    assert {item["type"] for item in body["supported_interactions"]} == set(supported_gestures())
+    assert {item["type"] for item in body["supported_interactions"]} == set(
+        creator_supported_gestures()
+    )
     assert len(body["interaction_presets"]) == 53
     assert len({item["id"] for item in body["interaction_presets"]}) == 53
     assert sum(item["story_enabled"] for item in body["interaction_presets"]) == 47

@@ -72,8 +72,10 @@ class TimelineInteraction(BaseModel):
     gesture: str | None = None
     gate_at_ms: int | None = None
     gate_end_ms: int | None = Field(
-        default=None, description="交互生效结束（绝对毫秒）；协议侧可换算为 response_window_ms"
+        default=None,
+        description="交互生效结束（绝对毫秒）；持续交互编译为 active_until_ms",
     )
+    tap_count: int | None = Field(default=None, ge=1, le=99)
     reaction_start_ms: int | None = None
     reaction_end_ms: int | None = None
     hint: str | None = None
@@ -362,6 +364,7 @@ class DetectionOut(BaseModel):
     min_shake_score: int | None = None
     rotation_direction: Literal["clockwise", "counterclockwise"] | None = None
     pinch_direction: Literal["inward", "outward"] | None = None
+    required_tap_count: int | None = Field(default=None, ge=1, le=99)
 
     @model_serializer(mode="wrap")
     def _omit_nulls(self, handler: Any) -> dict[str, Any]:
@@ -420,6 +423,10 @@ class InteractionOut(BaseModel):
     type: str
     description: str
     offset_time_ms: int
+    active_until_ms: int | None = Field(
+        default=None,
+        description="持续交互在媒体时间轴上的排他结束点（毫秒）",
+    )
     pause_video: bool
     detection: DetectionOut
     feedback: FeedbackOut
@@ -466,7 +473,7 @@ class FeedItemOut(BaseModel):
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
     following: bool = Field(default=False, description="is_following 的兼容字段")
     experience_spec_version: Literal[
-        "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"
+        "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"
     ] | None = Field(
         default=None,
         description="Runtime ExperienceSpec 版本；HTML 内容不携带",
@@ -484,7 +491,7 @@ class FeedItemOut(BaseModel):
             if not self.video:
                 raise ValueError("runtime feed item requires video")
             if self.experience_spec_version not in {
-                "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"
+                "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"
             }:
                 raise ValueError("runtime feed item requires a supported experience_spec_version")
             if self.html_url is not None or self.bridge_version is not None:

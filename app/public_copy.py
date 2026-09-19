@@ -7,12 +7,13 @@ published App/Web experiences.
 
 from __future__ import annotations
 
-PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.5.0-en"
+PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.6.0-en"
 
 INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "tap": "Tap",
     "double_tap": "Double tap",
     "rapid_tap": "Tap fast",
+    "multi_tap": "Tap the required number of times",
     "hold": "Hold",
     "hold_still": "Hold still",
     "hold_charge": "Hold to charge",
@@ -30,6 +31,7 @@ INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "scrub_down": "Scrub down",
     "continuous_swipe": "Swipe back and forth to play",
     "continuous_tap": "Keep tapping to play",
+    "continuous_hold": "Press and hold to play",
     "pinch": "Pinch",
     "draw_circle": "Draw a circle",
     "erase": "Rub to erase",

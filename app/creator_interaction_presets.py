@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.camera_continuous_targets import CAMERA_CONTINUOUS_TARGETS
-from app.protocol_video import supported_gestures
+from app.protocol_video import creator_supported_gestures
 from app.public_copy import interaction_instruction
 from app.vision_targets import VISION_TARGETS, creator_vision_config
 
@@ -334,7 +334,10 @@ def resolve_interaction_preset(value: dict[str, Any]) -> CreatorInteractionPrese
             if supplied is not None and supplied != expected:
                 raise ValueError(f"{field} does not match interaction preset")
         return preset
-    if not isinstance(interaction_type, str) or interaction_type not in supported_gestures():
+    if (
+        not isinstance(interaction_type, str)
+        or interaction_type not in creator_supported_gestures()
+    ):
         raise ValueError("unsupported interaction type")
     if interaction_type == "pinch":
         if value.get("rotation_direction") is not None or value.get("vision_target") is not None:
@@ -403,4 +406,4 @@ def apply_preset_fields(item: dict[str, Any], preset: CreatorInteractionPreset) 
 
 assert len(CREATOR_INTERACTION_PRESETS) == 53
 assert len(CREATOR_INTERACTION_PRESETS_BY_ID) == len(CREATOR_INTERACTION_PRESETS)
-assert {preset.type for preset in CREATOR_INTERACTION_PRESETS} == supported_gestures()
+assert {preset.type for preset in CREATOR_INTERACTION_PRESETS} == creator_supported_gestures()

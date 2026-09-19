@@ -1,3 +1,5 @@
+import pytest
+
 from app.camera_continuous_targets import supported_camera_continuous_targets
 from app.creator_interaction_presets import (
     apply_preset_fields,
@@ -5,7 +7,7 @@ from app.creator_interaction_presets import (
     preset_id_for_interaction,
     resolve_interaction_preset,
 )
-from app.protocol_video import supported_gestures
+from app.protocol_video import creator_supported_gestures
 from app.vision_targets import supported_vision_targets
 
 
@@ -13,7 +15,9 @@ def test_catalog_is_complete_unique_and_story_safe():
     presets = creator_interaction_presets()
     assert len(presets) == 53
     assert len({preset.id for preset in presets}) == 53
-    assert {preset.type for preset in presets} == supported_gestures()
+    assert {preset.type for preset in presets} == creator_supported_gestures()
+    assert "continuous_hold" not in creator_supported_gestures()
+    assert "multi_tap" not in creator_supported_gestures()
     assert sum(preset.story_enabled for preset in presets) == 47
     assert {preset.id for preset in presets if preset.lifecycle == "sustained"} == {
         "continuous_tap",
@@ -53,6 +57,12 @@ def test_catalog_is_complete_unique_and_story_safe():
         for interaction_type, items in by_type.items()
         if interaction_type not in {"pinch", "rotate", "camera_motion", "camera_continuous"}
     )
+
+
+@pytest.mark.parametrize("interaction_type", ["continuous_hold", "multi_tap"])
+def test_operator_only_types_are_rejected_by_creator_presets(interaction_type: str):
+    with pytest.raises(ValueError, match="unsupported interaction type"):
+        resolve_interaction_preset({"type": interaction_type})
 
 
 def test_legacy_and_preset_inputs_resolve_to_the_same_semantics():

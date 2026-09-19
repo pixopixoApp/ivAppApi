@@ -31,7 +31,8 @@ _CONF = 0.85
 # v1.1 adds ``video[].on_end`` and continuous_swipe. v1.2 adds
 # continuous_tap. v1.3 adds finger-snap camera_continuous; v1.4 adds the
 # finger-gun recoil target; v1.5 adds sustained microphone blowing; v1.6 adds
-# sustained microphone voice/level playback.
+# sustained microphone voice/level playback; v1.7 adds outward pinch; v1.8
+# adds explicit sustained ranges, continuous_hold, and parameterized multi_tap.
 # Compilation deliberately keeps content on the oldest compatible version.
 BASE_RUNTIME_SPEC_VERSION = "1.1"
 CONTINUOUS_TAP_RUNTIME_SPEC_VERSION = "1.2"
@@ -39,7 +40,8 @@ CAMERA_CONTINUOUS_RUNTIME_SPEC_VERSION = "1.3"
 FINGER_GUN_RUNTIME_SPEC_VERSION = "1.4"
 CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION = "1.5"
 CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION = "1.6"
-RUNTIME_SPEC_VERSION = "1.7"
+OUTWARD_PINCH_RUNTIME_SPEC_VERSION = "1.7"
+RUNTIME_SPEC_VERSION = "1.8"
 SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
     {
         "1.0",
@@ -49,11 +51,23 @@ SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
         FINGER_GUN_RUNTIME_SPEC_VERSION,
         CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
         CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
+        OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
         RUNTIME_SPEC_VERSION,
     }
 )
 LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS = frozenset({"1.0", "1.1"})
 RUNTIME_SPEC_SCHEMA = "pixo.runtime.v1"
+SUSTAINED_PLAYBACK_GESTURES = frozenset(
+    {
+        "continuous_swipe",
+        "continuous_tap",
+        "continuous_hold",
+        "camera_continuous",
+        "mic_blow_continuous",
+        "mic_level_continuous",
+    }
+)
+OPERATOR_ONLY_GESTURES = frozenset({"continuous_hold", "multi_tap"})
 
 # Per-gesture detection defaults (App interaction-type catalog).
 _TOUCH_MID = {"confidence_threshold": _CONF, "place": "middle_middle"}
@@ -67,6 +81,7 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
     "tap": {**_TOUCH_MID, "response_window_ms": 0},
     "double_tap": {**_TOUCH_MID, "response_window_ms": 0},
     "rapid_tap": {**_TOUCH_MID, "response_window_ms": 0},
+    "multi_tap": {**_TOUCH_MID, "response_window_ms": 0},
     "hold": {**_TOUCH_MID, "response_window_ms": 0, "min_duration_ms": 1000},
     "hold_still": {
         **_MOTION_BOT,
@@ -98,6 +113,7 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
         "response_window_ms": 0,
         "idle_timeout_ms": 500,
     },
+    "continuous_hold": {**_TOUCH_MID, "response_window_ms": 0},
     "pinch": {**_TOUCH_MID, "response_window_ms": 0, "min_scale_delta": 0.06,
               "pinch_direction": DEFAULT_PINCH_DIRECTION},
     "draw_circle": {
@@ -215,6 +231,15 @@ def supported_gestures() -> frozenset[str]:
     return frozenset(_DETECTION_BY_GESTURE)
 
 
+def creator_supported_gestures() -> frozenset[str]:
+    """Return interactions exposed to end-user creator surfaces.
+
+    Operator-only interactions remain valid in compiled specs without being
+    advertised to, or accepted by, the public creator preset API.
+    """
+    return supported_gestures() - OPERATOR_ONLY_GESTURES
+
+
 def normalize_pinch_direction(value: Any) -> str:
     if value is None:
         return DEFAULT_PINCH_DIRECTION
@@ -258,6 +283,15 @@ def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
     if base is None:
         raise RuntimeSpecError(f"unsupported gesture: {gesture}")
     detection = dict(base)
+    if gesture == "multi_tap":
+        tap_count = item.get("tap_count")
+        if (
+            isinstance(tap_count, bool)
+            or not isinstance(tap_count, int)
+            or not 1 <= tap_count <= 99
+        ):
+            raise RuntimeSpecError("multi_tap tap_count must be an integer in [1, 99]")
+        detection["required_tap_count"] = tap_count
     if gesture == "rotate":
         detection["rotation_direction"] = normalize_rotation_direction(
             item.get("rotation_direction")
@@ -269,7 +303,13 @@ def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
         detection["place"] = region_to_place(region)
     gate = item.get("gate_at_ms")
     gate_end = item.get("gate_end_ms")
-    if isinstance(gate, int) and not isinstance(gate, bool) and isinstance(gate_end, int) and not isinstance(gate_end, bool):
+    if (
+        gesture not in SUSTAINED_PLAYBACK_GESTURES
+        and isinstance(gate, int)
+        and not isinstance(gate, bool)
+        and isinstance(gate_end, int)
+        and not isinstance(gate_end, bool)
+    ):
         if gate_end < gate:
             raise RuntimeSpecError("gate_end_ms must be >= gate_at_ms")
         detection["response_window_ms"] = gate_end - gate
@@ -292,15 +332,8 @@ def _validate_sustained_source(
     timeline: dict[str, Any],
     interactions: list[Any],
 ) -> None:
-    sustained_types = {
-        "continuous_swipe",
-        "continuous_tap",
-        "camera_continuous",
-        "mic_blow_continuous",
-        "mic_level_continuous",
-    }
     if not any(
-        isinstance(item, dict) and item.get("gesture") in sustained_types
+        isinstance(item, dict) and item.get("gesture") in SUSTAINED_PLAYBACK_GESTURES
         for item in interactions
     ):
         return
@@ -311,7 +344,10 @@ def _validate_sustained_source(
             "timeline.media.duration_ms is required for sustained interactions"
         )
     for index, item in enumerate(interactions):
-        if not isinstance(item, dict) or item.get("gesture") not in sustained_types:
+        if (
+            not isinstance(item, dict)
+            or item.get("gesture") not in SUSTAINED_PLAYBACK_GESTURES
+        ):
             continue
         label = f"interaction[{index}]"
         gesture = str(item.get("gesture"))
@@ -325,7 +361,15 @@ def _validate_sustained_source(
         if item.get("pause_video", True) is not True:
             raise RuntimeSpecError(f"{label} {gesture} requires pause_video=true")
         if "gate_end_ms" in item:
-            raise RuntimeSpecError(f"{label} {gesture} does not allow gate_end_ms")
+            gate_end = item.get("gate_end_ms")
+            if (
+                isinstance(gate_end, bool)
+                or not isinstance(gate_end, int)
+                or gate_end <= gate
+            ):
+                raise RuntimeSpecError(
+                    f"{label} {gesture} gate_end_ms must be an integer greater than gate_at_ms"
+                )
         if "outcomes" in item:
             raise RuntimeSpecError(f"{label} {gesture} does not allow outcomes")
         if "region" in item:
@@ -341,6 +385,28 @@ def _validate_sustained_source(
                 raise RuntimeSpecError(
                     f"{label} {gesture} must end at a later interaction"
                 )
+
+
+def _configured_sustained_end(
+    *,
+    item: dict[str, Any],
+    index: int,
+    interactions: list[Any],
+    media_duration_ms: int,
+) -> int | None:
+    """Return the compiled exclusive boundary while preserving source intent."""
+    if item.get("gesture") not in SUSTAINED_PLAYBACK_GESTURES:
+        return None
+    configured = item.get("gate_end_ms")
+    if not isinstance(configured, int) or isinstance(configured, bool):
+        return None
+    candidates = [configured, media_duration_ms]
+    if index + 1 < len(interactions):
+        following = interactions[index + 1]
+        next_gate = following.get("gate_at_ms") if isinstance(following, dict) else None
+        if isinstance(next_gate, int) and not isinstance(next_gate, bool):
+            candidates.append(next_gate)
+    return min(candidates)
 
 
 def _outcome_to_action(outcome: Any) -> dict[str, Any]:
@@ -381,7 +447,12 @@ def _actions_from_item(item: dict) -> tuple[dict[str, Any], dict[str, Any]]:
     )
 
 
-def _one_interaction(item: dict, *, index: int) -> dict:
+def _one_interaction(
+    item: dict,
+    *,
+    index: int,
+    active_until_ms: int | None = None,
+) -> dict:
     gesture = item.get("gesture")
     gate = item.get("gate_at_ms")
     if not isinstance(gesture, str) or not gesture.strip():
@@ -392,13 +463,7 @@ def _one_interaction(item: dict, *, index: int) -> dict:
     if gate < 0:
         raise RuntimeSpecError(f"interaction[{index}] gate_at_ms must be non-negative")
     detection = _detection_for_item(item, gesture=gesture)
-    sustained = gesture in {
-        "continuous_swipe",
-        "continuous_tap",
-        "camera_continuous",
-        "mic_blow_continuous",
-        "mic_level_continuous",
-    }
+    sustained = gesture in SUSTAINED_PLAYBACK_GESTURES
     if sustained:
         on_success, on_miss = dict(_ACTION_CONTINUE), dict(_ACTION_CONTINUE)
     else:
@@ -407,6 +472,8 @@ def _one_interaction(item: dict, *, index: int) -> dict:
     if not isinstance(pause_video, bool):
         raise RuntimeSpecError(f"interaction[{index}] pause_video must be boolean")
     description = interaction_instruction(gesture)
+    if gesture == "multi_tap":
+        description = f"Tap {detection['required_tap_count']} times"
     if gesture == "pinch":
         description = "Spread two fingers outward" if detection["pinch_direction"] == "outward" else "Pinch inward"
     if gesture == "camera_motion":
@@ -425,7 +492,7 @@ def _one_interaction(item: dict, *, index: int) -> dict:
                 description = canonical_camera_continuous_instruction(target)
             except CameraContinuousTargetError as exc:
                 raise RuntimeSpecError(str(exc)) from exc
-    return {
+    interaction = {
         "id": f"action_{index + 1:03d}",
         "type": gesture,
         "description": description,
@@ -436,6 +503,9 @@ def _one_interaction(item: dict, *, index: int) -> dict:
         "on_success": on_success,
         "on_miss": on_miss,
     }
+    if active_until_ms is not None:
+        interaction["active_until_ms"] = active_until_ms
+    return interaction
 
 
 def timeline_to_clip(
@@ -451,10 +521,28 @@ def timeline_to_clip(
         if not isinstance(interactions, list):
             raise RuntimeSpecError("timeline.interactions must be an array")
         _validate_sustained_source(timeline, interactions)
+        media = timeline.get("media")
+        duration = media.get("duration_ms") if isinstance(media, dict) else 0
+        media_duration_ms = (
+            duration
+            if isinstance(duration, int) and not isinstance(duration, bool)
+            else 0
+        )
         for index, item in enumerate(interactions):
             if not isinstance(item, dict):
                 raise RuntimeSpecError(f"interaction[{index}] must be an object")
-            interactions_out.append(_one_interaction(item, index=index))
+            interactions_out.append(
+                _one_interaction(
+                    item,
+                    index=index,
+                    active_until_ms=_configured_sustained_end(
+                        item=item,
+                        index=index,
+                        interactions=interactions,
+                        media_duration_ms=media_duration_ms,
+                    ),
+                )
+            )
     return {
         "video_id": clip_id,
         "video": video_url,
@@ -659,10 +747,18 @@ def compile_runtime_spec(
         for interaction in clip["interactions"]
         if interaction["type"] == "camera_continuous"
     }
-    if any(interaction["type"] == "pinch"
+    uses_v18 = any(
+        interaction["type"] in {"continuous_hold", "multi_tap"}
+        or interaction.get("active_until_ms") is not None
+        for clip in clips
+        for interaction in clip["interactions"]
+    )
+    if uses_v18:
+        compiled_version = RUNTIME_SPEC_VERSION
+    elif any(interaction["type"] == "pinch"
            and interaction.get("detection", {}).get("pinch_direction") == "outward"
            for clip in clips for interaction in clip["interactions"]):
-        compiled_version = RUNTIME_SPEC_VERSION
+        compiled_version = OUTWARD_PINCH_RUNTIME_SPEC_VERSION
     elif "mic_level_continuous" in interaction_types:
         compiled_version = CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION
     elif "mic_blow_continuous" in interaction_types:
@@ -730,9 +826,44 @@ def read_runtime_spec(
         for index, interaction in enumerate(clip.interactions):
             if interaction.type not in _DETECTION_BY_GESTURE:
                 raise RuntimeSpecError(f"unsupported gesture: {interaction.type}")
+            if (
+                interaction.type in {"continuous_hold", "multi_tap"}
+                and version != RUNTIME_SPEC_VERSION
+            ):
+                raise RuntimeSpecError(
+                    f"{interaction.type} requires runtime spec version 1.8"
+                )
+            if interaction.active_until_ms is not None:
+                if version != RUNTIME_SPEC_VERSION:
+                    raise RuntimeSpecError(
+                        "active_until_ms requires runtime spec version 1.8"
+                    )
+                if interaction.type not in SUSTAINED_PLAYBACK_GESTURES:
+                    raise RuntimeSpecError(
+                        "active_until_ms is only valid for sustained interactions"
+                    )
+                if interaction.active_until_ms <= interaction.offset_time_ms:
+                    raise RuntimeSpecError(
+                        "active_until_ms must be greater than offset_time_ms"
+                    )
+                next_offset = (
+                    clip.interactions[index + 1].offset_time_ms
+                    if index + 1 < len(clip.interactions)
+                    else None
+                )
+                if (
+                    next_offset is not None
+                    and interaction.active_until_ms > next_offset
+                ):
+                    raise RuntimeSpecError(
+                        "active_until_ms cannot exceed the next interaction"
+                    )
             if interaction.type == "pinch":
                 direction = normalize_pinch_direction(interaction.detection.pinch_direction)
-                if direction == "outward" and version != RUNTIME_SPEC_VERSION:
+                if direction == "outward" and version not in {
+                    OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }:
                     raise RuntimeSpecError("outward pinch requires runtime spec version 1.7")
             if version == "1.0" and interaction.type == "continuous_swipe":
                 raise RuntimeSpecError("continuous_swipe requires runtime spec version 1.1")
@@ -744,6 +875,7 @@ def read_runtime_spec(
                     FINGER_GUN_RUNTIME_SPEC_VERSION,
                     CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
+                    OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }
                 and interaction.type == "camera_continuous"
@@ -800,6 +932,24 @@ def read_runtime_spec(
                     raise RuntimeSpecError(
                         "continuous_tap must end at a later interaction"
                     )
+            if interaction.type == "continuous_hold":
+                detection = interaction.detection
+                if (
+                    interaction.pause_video is not True
+                    or detection.response_window_ms != 0
+                    or detection.place != "middle_middle"
+                    or interaction.on_success.action != "continue"
+                    or interaction.on_miss.action != "continue"
+                ):
+                    raise RuntimeSpecError(
+                        "continuous_hold persisted contract is invalid"
+                    )
+            if interaction.type == "multi_tap":
+                required = interaction.detection.required_tap_count
+                if required is None or not 1 <= required <= 99:
+                    raise RuntimeSpecError(
+                        "multi_tap requires required_tap_count in [1, 99]"
+                    )
             if interaction.type == "camera_motion":
                 try:
                     normalize_vision_config((interaction.detection.model_extra or {}).get("vision"))
@@ -847,6 +997,7 @@ def read_runtime_spec(
                 if version not in {
                     CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
+                    OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(
@@ -877,7 +1028,11 @@ def read_runtime_spec(
                     )
             if interaction.type == "mic_level_continuous":
                 detection = interaction.detection
-                if version not in {CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION, RUNTIME_SPEC_VERSION}:
+                if version not in {
+                    CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
+                    OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }:
                     raise RuntimeSpecError(
                         "mic_level_continuous requires runtime spec version 1.6"
                     )
