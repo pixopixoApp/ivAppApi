@@ -57,39 +57,42 @@ def test_unknown_gesture_fails_closed() -> None:
         )
 
 
-def test_rotate_compiles_selected_direction_and_rejects_invalid_value() -> None:
+@pytest.mark.parametrize("gesture", ["rotate", "draw_circle"])
+def test_rotation_interactions_compile_selected_direction_and_reject_invalid_value(
+    gesture: str,
+) -> None:
     source = {
         "interactions": [
             {
-                "gesture": "rotate",
+                "gesture": gesture,
                 "gate_at_ms": 1000,
                 "rotation_direction": "clockwise",
             }
         ]
     }
     spec = compile_runtime_spec(
-        item_id="rotate-demo",
+        item_id=f"{gesture}-demo",
         content_mode="single",
         source=source,
-        video_url="/media/rotate-demo.mp4",
+        video_url=f"/media/{gesture}-demo.mp4",
     )
     assert spec["video"][0]["interactions"][0]["detection"]["rotation_direction"] == (
         "clockwise"
     )
     with pytest.raises(RuntimeSpecError, match="rotation_direction"):
         compile_runtime_spec(
-            item_id="invalid-rotate",
+            item_id=f"invalid-{gesture}",
             content_mode="single",
             source={
                 "interactions": [
                     {
-                        "gesture": "rotate",
+                        "gesture": gesture,
                         "gate_at_ms": 1000,
                         "rotation_direction": "sideways",
                     }
                 ]
             },
-            video_url="/media/invalid-rotate.mp4",
+            video_url=f"/media/invalid-{gesture}.mp4",
         )
 
 

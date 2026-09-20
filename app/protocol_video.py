@@ -297,7 +297,7 @@ def _detection_for_item(item: dict, *, gesture: str) -> dict[str, Any]:
         ):
             raise RuntimeSpecError("multi_tap tap_count must be an integer in [1, 99]")
         detection["required_tap_count"] = tap_count
-    if gesture == "rotate":
+    if gesture in {"rotate", "draw_circle"}:
         detection["rotation_direction"] = normalize_rotation_direction(
             item.get("rotation_direction")
         )
