@@ -32,7 +32,8 @@ _CONF = 0.85
 # continuous_tap. v1.3 adds finger-snap camera_continuous; v1.4 adds the
 # finger-gun recoil target; v1.5 adds sustained microphone blowing; v1.6 adds
 # sustained microphone voice/level playback; v1.7 adds outward pinch; v1.8
-# adds explicit sustained ranges, continuous_hold, and parameterized multi_tap.
+# adds explicit sustained ranges, continuous_hold, and parameterized multi_tap;
+# v1.9 adds forward/backward pitch interactions.
 # Compilation deliberately keeps content on the oldest compatible version.
 BASE_RUNTIME_SPEC_VERSION = "1.1"
 CONTINUOUS_TAP_RUNTIME_SPEC_VERSION = "1.2"
@@ -41,7 +42,8 @@ FINGER_GUN_RUNTIME_SPEC_VERSION = "1.4"
 CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION = "1.5"
 CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION = "1.6"
 OUTWARD_PINCH_RUNTIME_SPEC_VERSION = "1.7"
-RUNTIME_SPEC_VERSION = "1.8"
+SUSTAINED_RANGE_RUNTIME_SPEC_VERSION = "1.8"
+RUNTIME_SPEC_VERSION = "1.9"
 SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
     {
         "1.0",
@@ -52,6 +54,7 @@ SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
         CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
         CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
         OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+        SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
         RUNTIME_SPEC_VERSION,
     }
 )
@@ -135,6 +138,8 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
     },
     "tilt_left": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
     "tilt_right": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
+    "tilt_forward": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
+    "tilt_backward": {**_MOTION_BOT, "response_window_ms": 0, "min_angle_deg": 15},
     "shake": {**_MOTION_BOT, "response_window_ms": 0, "min_shake_score": 60},
     "rotate": {
         **_MOTION_BOT,
@@ -753,8 +758,10 @@ def compile_runtime_spec(
         for clip in clips
         for interaction in clip["interactions"]
     )
-    if uses_v18:
+    if {"tilt_forward", "tilt_backward"}.intersection(interaction_types):
         compiled_version = RUNTIME_SPEC_VERSION
+    elif uses_v18:
+        compiled_version = SUSTAINED_RANGE_RUNTIME_SPEC_VERSION
     elif any(interaction["type"] == "pinch"
            and interaction.get("detection", {}).get("pinch_direction") == "outward"
            for clip in clips for interaction in clip["interactions"]):
@@ -828,13 +835,19 @@ def read_runtime_spec(
                 raise RuntimeSpecError(f"unsupported gesture: {interaction.type}")
             if (
                 interaction.type in {"continuous_hold", "multi_tap"}
-                and version != RUNTIME_SPEC_VERSION
+                and version not in {
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }
             ):
                 raise RuntimeSpecError(
                     f"{interaction.type} requires runtime spec version 1.8"
                 )
             if interaction.active_until_ms is not None:
-                if version != RUNTIME_SPEC_VERSION:
+                if version not in {
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }:
                     raise RuntimeSpecError(
                         "active_until_ms requires runtime spec version 1.8"
                     )
@@ -862,6 +875,7 @@ def read_runtime_spec(
                 direction = normalize_pinch_direction(interaction.detection.pinch_direction)
                 if direction == "outward" and version not in {
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError("outward pinch requires runtime spec version 1.7")
@@ -876,12 +890,20 @@ def read_runtime_spec(
                     CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }
                 and interaction.type == "camera_continuous"
             ):
                 raise RuntimeSpecError(
                     "camera_continuous requires runtime spec version 1.3 or later"
+                )
+            if (
+                interaction.type in {"tilt_forward", "tilt_backward"}
+                and version != RUNTIME_SPEC_VERSION
+            ):
+                raise RuntimeSpecError(
+                    f"{interaction.type} requires runtime spec version 1.9"
                 )
             if interaction.detection.response_window_ms < 0:
                 raise RuntimeSpecError("interaction response_window_ms must be non-negative")
@@ -998,6 +1020,7 @@ def read_runtime_spec(
                     CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION,
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(
@@ -1031,6 +1054,7 @@ def read_runtime_spec(
                 if version not in {
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
+                    SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(

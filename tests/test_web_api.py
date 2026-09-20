@@ -203,18 +203,19 @@ def test_web_session_can_read_shared_credits_referral_and_creator_capabilities(d
     assert body["creator_contract_version"] == "2"
     assert body["credit_per_generated_second"] == 1
     assert body["referral_reward_credits"] == 10
-    assert len(body["supported_interactions"]) == 35
+    assert len(body["supported_interactions"]) == 37
     assert {item["type"] for item in body["supported_interactions"]} == set(
         creator_supported_gestures()
     )
-    assert len(body["interaction_presets"]) == 53
-    assert len({item["id"] for item in body["interaction_presets"]}) == 53
-    assert sum(item["story_enabled"] for item in body["interaction_presets"]) == 47
+    assert len(body["interaction_presets"]) == 55
+    assert len({item["id"] for item in body["interaction_presets"]}) == 55
+    assert sum(item["story_enabled"] for item in body["interaction_presets"]) == 49
     assert {
         "pinch_in", "pinch_out", "rotate_clockwise", "rotate_counterclockwise",
         "camera_motion.face_smile", "camera_motion.hand_open_palm",
         "camera_continuous.hand_finger_snap",
         "camera_continuous.hand_finger_gun_recoil",
+        "tilt_forward", "tilt_backward",
     } <= {item["id"] for item in body["interaction_presets"]}
     assert next(item for item in body["supported_interactions"] if item["type"] == "camera_continuous") == {
         "type": "camera_continuous",

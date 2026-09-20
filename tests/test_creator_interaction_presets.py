@@ -13,12 +13,12 @@ from app.vision_targets import supported_vision_targets
 
 def test_catalog_is_complete_unique_and_story_safe():
     presets = creator_interaction_presets()
-    assert len(presets) == 53
-    assert len({preset.id for preset in presets}) == 53
+    assert len(presets) == 55
+    assert len({preset.id for preset in presets}) == 55
     assert {preset.type for preset in presets} == creator_supported_gestures()
     assert "continuous_hold" not in creator_supported_gestures()
     assert "multi_tap" not in creator_supported_gestures()
-    assert sum(preset.story_enabled for preset in presets) == 47
+    assert sum(preset.story_enabled for preset in presets) == 49
     assert {preset.id for preset in presets if preset.lifecycle == "sustained"} == {
         "continuous_tap",
         "continuous_swipe",
@@ -41,7 +41,7 @@ def test_catalog_is_complete_unique_and_story_safe():
     by_type = {}
     for preset in presets:
         by_type.setdefault(preset.type, []).append(preset)
-    assert len(by_type) == 35
+    assert len(by_type) == 37
     assert len(by_type["camera_motion"]) == 16
     assert sum(preset.variant_group == "hand" for preset in by_type["camera_motion"]) == 7
     assert sum(preset.variant_group == "face" for preset in by_type["camera_motion"]) == 9

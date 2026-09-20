@@ -1,13 +1,13 @@
 """Canonical English copy embedded in public runtime specifications.
 
-The values mirror Pixo Runtime interaction catalog 3.5.0.  Source timelines and
+The values mirror Pixo Runtime interaction catalog 3.7.0.  Source timelines and
 model output are editable evidence; this catalog owns the text presented by
 published App/Web experiences.
 """
 
 from __future__ import annotations
 
-PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.6.0-en"
+PUBLIC_COPY_CATALOG_VERSION = "pixo-runtime.interactions.3.7.0-en"
 
 INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "tap": "Tap",
@@ -39,6 +39,8 @@ INTERACTION_INSTRUCTIONS: dict[str, str] = {
     "camera_continuous": "Keep performing the camera gesture to play",
     "tilt_left": "Tilt left",
     "tilt_right": "Tilt right",
+    "tilt_forward": "Tilt forward",
+    "tilt_backward": "Tilt backward",
     "shake": "Shake your phone",
     "rotate": "Rotate your phone",
     "mic_level": "Make some noise",

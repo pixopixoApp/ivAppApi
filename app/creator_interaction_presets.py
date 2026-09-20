@@ -101,6 +101,8 @@ _DEVICE_FAMILIES = {
     "hold_still": "stability",
     "tilt_left": "tilt",
     "tilt_right": "tilt",
+    "tilt_forward": "tilt",
+    "tilt_backward": "tilt",
     "shake": "shake",
 }
 
@@ -138,6 +140,8 @@ _LABELS = {
     "hold_still": "Keep phone still",
     "tilt_left": "Tilt phone left",
     "tilt_right": "Tilt phone right",
+    "tilt_forward": "Tilt phone forward",
+    "tilt_backward": "Tilt phone backward",
     "shake": "Shake phone",
     "mic_level": "Make a sound",
     "mic_level_continuous": "Keep vocalizing to play",
@@ -158,6 +162,8 @@ _RECOMMENDED = frozenset({
 
 
 def _minimum_runtime_version(interaction_type: str, preset_id: str) -> str:
+    if interaction_type in {"tilt_forward", "tilt_backward"}:
+        return "1.9"
     if preset_id == "pinch_out":
         return "1.7"
     if interaction_type == "mic_level_continuous":
@@ -256,7 +262,9 @@ def _build_presets() -> tuple[CreatorInteractionPreset, ...]:
             vision_target=target,
         ))
 
-    for interaction_type in ("hold_still", "tilt_left", "tilt_right", "shake"):
+    for interaction_type in (
+        "hold_still", "tilt_left", "tilt_right", "tilt_forward", "tilt_backward", "shake",
+    ):
         presets.append(_simple_preset(
             interaction_type, "device_motion", _DEVICE_FAMILIES[interaction_type],
         ))
@@ -404,6 +412,6 @@ def apply_preset_fields(item: dict[str, Any], preset: CreatorInteractionPreset) 
         )
 
 
-assert len(CREATOR_INTERACTION_PRESETS) == 53
+assert len(CREATOR_INTERACTION_PRESETS) == 55
 assert len(CREATOR_INTERACTION_PRESETS_BY_ID) == len(CREATOR_INTERACTION_PRESETS)
 assert {preset.type for preset in CREATOR_INTERACTION_PRESETS} == creator_supported_gestures()

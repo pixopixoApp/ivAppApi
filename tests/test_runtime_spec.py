@@ -165,7 +165,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     interaction = spec["video"][0]["interactions"][0]
 
     assert spec["version"] == "1.2"
-    assert RUNTIME_SPEC_VERSION == "1.8"
+    assert RUNTIME_SPEC_VERSION == "1.9"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -277,6 +277,36 @@ def test_continuous_hold_and_multi_tap_compile_as_v18() -> None:
     assert multi_tap["type"] == "multi_tap"
     assert multi_tap["description"] == "Tap 99 times"
     assert multi_tap["detection"]["required_tap_count"] == 99
+
+
+@pytest.mark.parametrize("gesture", ["tilt_forward", "tilt_backward"])
+def test_depth_tilt_interactions_require_v19(gesture: str) -> None:
+    spec = compile_runtime_spec(
+        item_id=f"{gesture}-demo",
+        content_mode="single",
+        source={
+            "media": {"duration_ms": 5_000},
+            "interactions": [{"gesture": gesture, "gate_at_ms": 1_000}],
+        },
+        video_url=f"/media/{gesture}-demo.mp4",
+    )
+
+    assert spec["version"] == "1.9"
+    assert spec["video"][0]["interactions"][0]["type"] == gesture
+    assert read_runtime_spec(
+        spec,
+        item_id=f"{gesture}-demo",
+        version="1.9",
+    )[0].interactions[0].type == gesture
+
+    downgraded = copy.deepcopy(spec)
+    downgraded["version"] = "1.8"
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.9"):
+        read_runtime_spec(
+            downgraded,
+            item_id=f"{gesture}-demo",
+            version="1.8",
+        )
 
 
 @pytest.mark.parametrize("tap_count", [0, 100, 1.5, True, None])
@@ -526,7 +556,7 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
     assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
-        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}
+        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9"}
     )
     spec = compile_runtime_spec(
         item_id="legacy",

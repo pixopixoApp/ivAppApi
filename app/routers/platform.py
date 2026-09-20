@@ -622,7 +622,8 @@ _TOUCH_INTERACTIONS = frozenset({
     "continuous_swipe", "continuous_tap", "continuous_hold", "pinch", "draw_circle", "erase",
 })
 _DEVICE_MOTION_INTERACTIONS = frozenset({
-    "hold_still", "tilt_left", "tilt_right", "shake", "rotate",
+    "hold_still", "tilt_left", "tilt_right", "tilt_forward", "tilt_backward",
+    "shake", "rotate",
 })
 _VISION_INTERACTIONS = frozenset({"camera_motion", "camera_continuous"})
 
