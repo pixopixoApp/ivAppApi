@@ -10,6 +10,17 @@ from app.main import app
 from app.models import EmailCode, Follow, PublishedVideo, User, UserToken, VideoView
 from app.protocol_video import compile_runtime_spec
 from app.routers import feed as feed_router
+from app.schemas import RuntimeCapabilitiesIn
+
+
+def test_runtime_capabilities_accept_the_complete_supported_version_range() -> None:
+    versions = [f"1.{minor}" for minor in range(10)]
+
+    capabilities = RuntimeCapabilitiesIn(
+        supported_experience_spec_versions=versions
+    )
+
+    assert capabilities.supported_experience_spec_versions == versions
 
 
 def _user(db, user_id: str, *, enabled: bool = True, birthday: str = "") -> str:

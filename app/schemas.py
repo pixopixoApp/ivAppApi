@@ -283,7 +283,7 @@ class RuntimeCapabilitiesIn(BaseModel):
     supported_experience_spec_versions: list[str] | None = Field(
         default=None,
         min_length=1,
-        max_length=8,
+        max_length=16,
         description=(
             "客户端可解析的 ExperienceSpec 版本；不传按旧客户端 1.0/1.1 处理"
         ),
