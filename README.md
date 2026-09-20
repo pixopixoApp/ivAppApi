@@ -192,17 +192,14 @@ python3 -m venv .venv
 
 ## 部署
 
-发布必须显式选择环境：
+开发服务器已经退役，发布只允许显式选择生产环境：
 
 ```bash
-./scripts/deploy.sh --environment development
 ./scripts/deploy.sh --environment production
 ```
 
-- `development` 固定发布到 `123.56.218.5`，只接受 Docker 内的 `mysql`。
 - `production` 固定发布到 `8.221.106.221`，只接受指定的独立 RDS。
-- 本地覆盖配置分别使用 `.deploy.development.env` 和
-  `.deploy.production.env`，不会进入 Git 或发布包。
+- 本地覆盖配置只使用 `.deploy.production.env`，不会进入 Git 或发布包。
 
 首次上线持久化 runtime spec，或首次切换到 ExperienceSpec v1.1 时必须显式执行：
 

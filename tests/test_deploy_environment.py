@@ -69,10 +69,22 @@ def test_production_compose_requires_and_loads_rds_overlay(tmp_path: Path) -> No
     assert "background-workers" in result.stdout
 
 
-def test_deploy_requires_an_explicit_environment() -> None:
+def test_deploy_requires_an_explicit_production_environment() -> None:
     result = subprocess.run(
         [str(DEPLOY)], check=False, capture_output=True, text=True
     )
 
     assert result.returncode == 2
-    assert "--environment must be development or production" in result.stderr
+    assert "--environment must be production" in result.stderr
+
+
+def test_deploy_rejects_the_retired_development_server() -> None:
+    result = subprocess.run(
+        [str(DEPLOY), "--environment", "development"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "development server has been retired" in result.stderr

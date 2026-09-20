@@ -12,11 +12,11 @@ BACKFILL_RUNTIME_SPECS=0
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/deploy.sh --environment development|production [options]
+Usage: scripts/deploy.sh --environment production [options]
 
 Options:
   --environment NAME
-                  Required deployment profile: development or production.
+                  Required deployment profile. Production is the only server.
   --dry-run       Show files that would change; do not write or restart remotely.
   --allow-dirty   Allow deployment from a dirty local Git worktree.
   --skip-checks   Skip scripts/check.sh.
@@ -52,21 +52,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-case "$DEPLOY_ENVIRONMENT" in
-  development)
-    EXPECTED_DEPLOY_HOST=123.56.218.5
-    EXPECTED_DATABASE_MODE=local
-    ;;
-  production)
-    EXPECTED_DEPLOY_HOST=8.221.106.221
-    EXPECTED_DATABASE_MODE=rds
-    ;;
-  *)
-    echo "--environment must be development or production" >&2
-    usage >&2
-    exit 2
-    ;;
-esac
+if [[ "$DEPLOY_ENVIRONMENT" == development ]]; then
+  echo "The development server has been retired; deploy production only." >&2
+  exit 2
+fi
+if [[ "$DEPLOY_ENVIRONMENT" != production ]]; then
+  echo "--environment must be production" >&2
+  usage >&2
+  exit 2
+fi
+EXPECTED_DEPLOY_HOST=8.221.106.221
+EXPECTED_DATABASE_MODE=rds
 
 DEPLOY_PROFILE_FILE="$ROOT_DIR/.deploy.$DEPLOY_ENVIRONMENT.env"
 if [[ -f "$DEPLOY_PROFILE_FILE" ]]; then
@@ -133,8 +129,7 @@ RSYNC_FILTERS=(
   --exclude='.env*.bak*'
   --exclude='*.bak-*'
   --exclude='.deploy.env'
-  --exclude='.deploy.development.env'
-  --exclude='.deploy.production.env'
+  --exclude='.deploy.*.env'
   --exclude='volumes/'
   --exclude='data/'
   --exclude='__pycache__/'
@@ -182,40 +177,17 @@ esac
 test -d "$deploy_path"
 test -f "$deploy_path/.env"
 test -f "$deploy_path/docker-compose.yml"
-case "$environment" in
-  development)
-    grep -qx 'PIXO_ENVIRONMENT=development' "$deploy_path/.env"
-    grep -qx 'MYSQL_DATABASE=ivapp' "$deploy_path/.env"
-    if grep -Fq "$expected_rds_host" "$deploy_path/.env"; then
-      echo 'development .env references the production RDS host' >&2
-      exit 1
-    fi
-    grep -qx 'PUBLIC_GAME_BASE_URL=https://demo.pixopixo.cn/game/' \
-      "$deploy_path/.env"
-    grep -qx 'SEO_PUBLIC_BASE_URL=https://demo.pixopixo.cn' \
-      "$deploy_path/.env"
-    if [[ -e "$deploy_path/.env.target" ]]; then
-      echo 'development must not have .env.target' >&2
-      exit 1
-    fi
-    ;;
-  production)
-    test -f "$deploy_path/.env.target"
-    test -f "$deploy_path/docker-compose.rds.yml"
-    grep -qx 'PIXO_ENVIRONMENT=production' "$deploy_path/.env.target"
-    grep -qx "RDS_HOST=$expected_rds_host" "$deploy_path/.env.target"
-    grep -Eq "^DATABASE_URL=.*@$expected_rds_host:[0-9]+/ivapp" \
-      "$deploy_path/.env.target"
-    grep -qx 'PUBLIC_GAME_BASE_URL=https://pixopixo.com/' \
-      "$deploy_path/.env.target"
-    grep -qx 'SEO_PUBLIC_BASE_URL=https://pixopixo.com' \
-      "$deploy_path/.env.target"
-    ;;
-  *)
-    echo "invalid deployment environment: $environment" >&2
-    exit 2
-    ;;
-esac
+[[ "$environment" == production ]] || exit 2
+test -f "$deploy_path/.env.target"
+test -f "$deploy_path/docker-compose.rds.yml"
+grep -qx 'PIXO_ENVIRONMENT=production' "$deploy_path/.env.target"
+grep -qx "RDS_HOST=$expected_rds_host" "$deploy_path/.env.target"
+grep -Eq "^DATABASE_URL=.*@$expected_rds_host:[0-9]+/ivapp" \
+  "$deploy_path/.env.target"
+grep -qx 'PUBLIC_GAME_BASE_URL=https://pixopixo.com/' \
+  "$deploy_path/.env.target"
+grep -qx 'SEO_PUBLIC_BASE_URL=https://pixopixo.com' \
+  "$deploy_path/.env.target"
 docker compose version >/dev/null
 command -v rsync >/dev/null
 command -v curl >/dev/null
@@ -272,10 +244,8 @@ build_image="$7"
 environment="$8"
 chmod 700 "$release_path"
 ln -sfn "$deploy_path/.env" "$release_path/.env"
-if [[ "$environment" == production ]]; then
-  test -f "$deploy_path/.env.target"
-  ln -sfn "$deploy_path/.env.target" "$release_path/.env.target"
-fi
+test -f "$deploy_path/.env.target"
+ln -sfn "$deploy_path/.env.target" "$release_path/.env.target"
 "$release_path/scripts/compose_target.sh" \
   "$release_path" "$project" "$environment" config --quiet
 if [[ "$build_image" -eq 1 ]]; then
@@ -311,19 +281,13 @@ rsync -a --delete \
   --exclude='*.pyc' \
   --exclude='.pytest_cache/' \
   "$deploy_path/" "$source_backup/"
-if [[ "$environment" == production ]]; then
-  defaults_file="/root/.config/pixo/$project.cnf"
-  test -r "$defaults_file"
-  mysqldump --defaults-extra-file="$defaults_file" \
-    --single-transaction --skip-lock-tables --skip-add-locks \
-    --set-gtid-purged=OFF --no-tablespaces --quick \
-    --routines --events --triggers "$project" \
-    | gzip -9 > "$backup_path/database.sql.gz"
-else
-  docker exec "${project}-${database_service}-1" sh -c \
-    'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --quick --routines --events --triggers "$MYSQL_DATABASE"' \
-    | gzip -9 > "$backup_path/database.sql.gz"
-fi
+defaults_file="/root/.config/pixo/$project.cnf"
+test -r "$defaults_file"
+mysqldump --defaults-extra-file="$defaults_file" \
+  --single-transaction --skip-lock-tables --skip-add-locks \
+  --set-gtid-purged=OFF --no-tablespaces --quick \
+  --routines --events --triggers "$project" \
+  | gzip -9 > "$backup_path/database.sql.gz"
 test -s "$backup_path/database.sql.gz"
 sha256sum "$backup_path/database.sql.gz" > "$backup_path/database.sql.gz.sha256"
 chmod 700 "$backup_path"
