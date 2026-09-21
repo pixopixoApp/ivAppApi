@@ -7,6 +7,7 @@ allowed to invent defaults or reinterpret source timelines at request time.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
@@ -33,7 +34,8 @@ _CONF = 0.85
 # finger-gun recoil target; v1.5 adds sustained microphone blowing; v1.6 adds
 # sustained microphone voice/level playback; v1.7 adds outward pinch; v1.8
 # adds explicit sustained ranges, continuous_hold, and parameterized multi_tap;
-# v1.9 adds forward/backward pitch interactions.
+# v1.9 adds forward/backward pitch interactions using the original Web beta-sign
+# names; v1.10 defines pitch names from the user's point of view.
 # Compilation deliberately keeps content on the oldest compatible version.
 BASE_RUNTIME_SPEC_VERSION = "1.1"
 CONTINUOUS_TAP_RUNTIME_SPEC_VERSION = "1.2"
@@ -43,7 +45,9 @@ CONTINUOUS_BLOW_RUNTIME_SPEC_VERSION = "1.5"
 CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION = "1.6"
 OUTWARD_PINCH_RUNTIME_SPEC_VERSION = "1.7"
 SUSTAINED_RANGE_RUNTIME_SPEC_VERSION = "1.8"
-RUNTIME_SPEC_VERSION = "1.9"
+LEGACY_PITCH_RUNTIME_SPEC_VERSION = "1.9"
+RUNTIME_SPEC_VERSION = "1.10"
+USER_RELATIVE_TILT_SEMANTICS = "user_relative_v2"
 SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
     {
         "1.0",
@@ -55,6 +59,7 @@ SUPPORTED_RUNTIME_SPEC_VERSIONS = frozenset(
         CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
         OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
         SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+        LEGACY_PITCH_RUNTIME_SPEC_VERSION,
         RUNTIME_SPEC_VERSION,
     }
 )
@@ -220,6 +225,66 @@ def region_to_place(region: dict | None) -> str:
 
 class RuntimeSpecError(ValueError):
     """Source cannot be compiled or persisted runtime data is invalid."""
+
+
+def upgrade_tilt_semantics(source: dict[str, Any]) -> dict[str, Any]:
+    """Convert legacy pitch names to user-relative names exactly once.
+
+    ExperienceSpec 1.9 named pitch from the Web beta-axis direction.  v1.10
+    names it from the user's physical intent: forward moves the phone's top
+    edge away; backward moves it toward the user.
+    """
+    upgraded = deepcopy(source)
+
+    def upgrade_timeline(timeline: dict[str, Any]) -> None:
+        if timeline.get("tilt_semantics") == USER_RELATIVE_TILT_SEMANTICS:
+            return
+        interactions = timeline.get("interactions") or []
+        if not any(
+            isinstance(item, dict)
+            and item.get("gesture") in {"tilt_forward", "tilt_backward"}
+            for item in interactions
+        ):
+            return
+        for item in interactions:
+            if not isinstance(item, dict):
+                continue
+            if item.get("gesture") == "tilt_forward":
+                item["gesture"] = "tilt_backward"
+            elif item.get("gesture") == "tilt_backward":
+                item["gesture"] = "tilt_forward"
+        timeline["tilt_semantics"] = USER_RELATIVE_TILT_SEMANTICS
+
+    clips = upgraded.get("clips")
+    if isinstance(clips, dict):
+        for body in clips.values():
+            if isinstance(body, dict) and isinstance(body.get("timeline"), dict):
+                upgrade_timeline(body["timeline"])
+    else:
+        upgrade_timeline(upgraded)
+    return upgraded
+
+
+def mark_user_relative_tilt_semantics(source: dict[str, Any]) -> dict[str, Any]:
+    """Mark a newly-authored source without rewriting its gesture names."""
+    marked = deepcopy(source)
+
+    def mark_timeline(timeline: dict[str, Any]) -> None:
+        if any(
+            isinstance(item, dict)
+            and item.get("gesture") in {"tilt_forward", "tilt_backward"}
+            for item in timeline.get("interactions") or []
+        ):
+            timeline["tilt_semantics"] = USER_RELATIVE_TILT_SEMANTICS
+
+    clips = marked.get("clips")
+    if isinstance(clips, dict):
+        for body in clips.values():
+            if isinstance(body, dict) and isinstance(body.get("timeline"), dict):
+                mark_timeline(body["timeline"])
+    else:
+        mark_timeline(marked)
+    return marked
 
 
 def normalize_rotation_direction(value: Any) -> str:
@@ -699,8 +764,23 @@ def compile_runtime_spec(
                 raise RuntimeSpecError(
                     f"story media URLs missing for clips: {', '.join(missing)}"
                 )
+        pitch_timelines = [
+            body.get("timeline")
+            for body in clips_in.values()
+            if isinstance(body, dict) and isinstance(body.get("timeline"), dict)
+            and any(
+                isinstance(item, dict)
+                and item.get("gesture") in {"tilt_forward", "tilt_backward"}
+                for item in body["timeline"].get("interactions") or []
+            )
+        ]
         clips_raw = story_to_video(source, urls)
     elif mode == "single":
+        pitch_timelines = [source] if any(
+            isinstance(item, dict)
+            and item.get("gesture") in {"tilt_forward", "tilt_backward"}
+            for item in source.get("interactions") or []
+        ) else []
         clips_raw = [timeline_to_video(source, video_url, clip_id=item_id)]
     else:
         raise RuntimeSpecError(f"unsupported content mode: {content_mode}")
@@ -759,7 +839,19 @@ def compile_runtime_spec(
         for interaction in clip["interactions"]
     )
     if {"tilt_forward", "tilt_backward"}.intersection(interaction_types):
-        compiled_version = RUNTIME_SPEC_VERSION
+        user_relative_markers = {
+            timeline.get("tilt_semantics") == USER_RELATIVE_TILT_SEMANTICS
+            for timeline in pitch_timelines
+        }
+        if len(user_relative_markers) > 1:
+            raise RuntimeSpecError(
+                "story mixes legacy and user-relative forward/backward tilt semantics"
+            )
+        compiled_version = (
+            RUNTIME_SPEC_VERSION
+            if user_relative_markers == {True}
+            else LEGACY_PITCH_RUNTIME_SPEC_VERSION
+        )
     elif uses_v18:
         compiled_version = SUSTAINED_RANGE_RUNTIME_SPEC_VERSION
     elif any(interaction["type"] == "pinch"
@@ -837,6 +929,7 @@ def read_runtime_spec(
                 interaction.type in {"continuous_hold", "multi_tap"}
                 and version not in {
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }
             ):
@@ -846,6 +939,7 @@ def read_runtime_spec(
             if interaction.active_until_ms is not None:
                 if version not in {
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(
@@ -876,6 +970,7 @@ def read_runtime_spec(
                 if direction == "outward" and version not in {
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError("outward pinch requires runtime spec version 1.7")
@@ -891,6 +986,7 @@ def read_runtime_spec(
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }
                 and interaction.type == "camera_continuous"
@@ -900,10 +996,13 @@ def read_runtime_spec(
                 )
             if (
                 interaction.type in {"tilt_forward", "tilt_backward"}
-                and version != RUNTIME_SPEC_VERSION
+                and version not in {
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
+                    RUNTIME_SPEC_VERSION,
+                }
             ):
                 raise RuntimeSpecError(
-                    f"{interaction.type} requires runtime spec version 1.9"
+                    f"{interaction.type} requires runtime spec version 1.9 or later"
                 )
             if interaction.detection.response_window_ms < 0:
                 raise RuntimeSpecError("interaction response_window_ms must be non-negative")
@@ -1021,6 +1120,7 @@ def read_runtime_spec(
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(
@@ -1055,6 +1155,7 @@ def read_runtime_spec(
                     CONTINUOUS_VOICE_RUNTIME_SPEC_VERSION,
                     OUTWARD_PINCH_RUNTIME_SPEC_VERSION,
                     SUSTAINED_RANGE_RUNTIME_SPEC_VERSION,
+                    LEGACY_PITCH_RUNTIME_SPEC_VERSION,
                     RUNTIME_SPEC_VERSION,
                 }:
                     raise RuntimeSpecError(

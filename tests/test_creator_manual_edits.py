@@ -106,6 +106,35 @@ def test_options_cover_every_supported_type_and_match_saved_nodes():
     assert source == TIMELINE
 
 
+def test_editing_legacy_pitch_upgrades_all_nodes_before_replacement():
+    legacy = {
+        "media": {"duration_ms": 5000},
+        "interactions": [
+            {"gesture": "tilt_backward", "gate_at_ms": 1000},
+            {"gesture": "tilt_forward", "gate_at_ms": 2000},
+            {"gesture": "tap", "gate_at_ms": 3000},
+        ],
+    }
+    timeline, compiled = compile_edits(
+        legacy,
+        [{"interaction_id": "action_001", "type": "tilt_backward"}],
+        item_id="legacy-pitch",
+        video_url="/preview.mp4",
+    )
+    assert timeline["tilt_semantics"] == "user_relative_v2"
+    assert [item["gesture"] for item in timeline["interactions"]] == [
+        "tilt_backward",
+        "tilt_backward",
+        "tap",
+    ]
+    assert compiled["version"] == "1.10"
+    assert [item["type"] for item in compiled["video"][0]["interactions"]] == [
+        "tilt_backward",
+        "tilt_backward",
+        "tap",
+    ]
+
+
 def test_parameterized_choices_keep_each_direction_and_camera_target_distinct():
     choices = manual_edit_options(deepcopy(TIMELINE), runtime())["action_001"]
     expected = {

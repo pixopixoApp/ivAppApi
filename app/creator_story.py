@@ -29,6 +29,7 @@ from app.models import (
 )
 from app.protocol_video import (
     compile_runtime_spec,
+    mark_user_relative_tilt_semantics,
     runtime_spec_version_from_compiled,
 )
 
@@ -346,6 +347,7 @@ def sync_story(db: Session, creation: CreatorCreation) -> None:
                        **({"on_end": {"action": "end"}} if role != "A" else {})}
                 for role in ("A", "B", "C")},
                 "creator": {"assets": assets, "story_revision": plan["revision"]}}
+            source = mark_user_relative_tilt_semantics(source)
             runtime = compile_runtime_spec(item_id=creation.id, content_mode="story", source=source, video_url="",
                 video_urls={role: f"/api/v1/creator/previews/{identifier}" for role, identifier in assets.items()})
             number = int(db.query(func.max(CreatorVersion.number)).filter_by(creation_id=creation.id).scalar() or 0) + 1

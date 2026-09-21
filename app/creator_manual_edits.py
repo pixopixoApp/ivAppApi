@@ -1,6 +1,5 @@
 """Deterministic creator edits. No model, task queue, or credit operations."""
 
-from copy import deepcopy
 from typing import Any
 
 from app.creator_interaction_presets import (
@@ -13,13 +12,17 @@ from app.creator_interaction_presets import (
 from app.protocol_video import (
     RuntimeSpecError,
     compile_runtime_spec,
+    upgrade_tilt_semantics,
 )
 
 SUSTAINED = SUSTAINED_INTERACTION_TYPES
 
 
 def replace_interactions(source: dict, edits: list[dict[str, str]]) -> dict:
-    timeline = deepcopy(source)
+    # Any edited legacy version becomes a v1.10 authoring source as a whole.
+    # This prevents untouched pitch nodes from keeping opposite wire meanings
+    # beside newly selected user-relative nodes in the same work.
+    timeline = upgrade_tilt_semantics(source)
     if isinstance(timeline.get("clips"), dict):
         groups: dict[str, list] = {}
         for edit in edits:

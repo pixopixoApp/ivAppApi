@@ -10,7 +10,9 @@ from app.protocol_video import (
     SUPPORTED_RUNTIME_SPEC_VERSIONS,
     RuntimeSpecError,
     compile_runtime_spec,
+    mark_user_relative_tilt_semantics,
     read_runtime_spec,
+    upgrade_tilt_semantics,
 )
 from app.runtime_backfill import (
     backfill_known_rotation_directions,
@@ -168,7 +170,7 @@ def test_continuous_tap_alone_upgrades_to_v12_with_fixed_lease() -> None:
     interaction = spec["video"][0]["interactions"][0]
 
     assert spec["version"] == "1.2"
-    assert RUNTIME_SPEC_VERSION == "1.9"
+    assert RUNTIME_SPEC_VERSION == "1.10"
     assert interaction["type"] == "continuous_tap"
     assert interaction["description"] == "Keep tapping to play"
     assert interaction["pause_video"] is True
@@ -283,7 +285,9 @@ def test_continuous_hold_and_multi_tap_compile_as_v18() -> None:
 
 
 @pytest.mark.parametrize("gesture", ["tilt_forward", "tilt_backward"])
-def test_depth_tilt_interactions_require_v19(gesture: str) -> None:
+def test_depth_tilt_interactions_preserve_v19_and_compile_user_relative_v110(
+    gesture: str,
+) -> None:
     spec = compile_runtime_spec(
         item_id=f"{gesture}-demo",
         content_mode="single",
@@ -302,14 +306,80 @@ def test_depth_tilt_interactions_require_v19(gesture: str) -> None:
         version="1.9",
     )[0].interactions[0].type == gesture
 
+    corrected = compile_runtime_spec(
+        item_id=f"{gesture}-corrected-demo",
+        content_mode="single",
+        source={
+            "tilt_semantics": "user_relative_v2",
+            "media": {"duration_ms": 5_000},
+            "interactions": [{"gesture": gesture, "gate_at_ms": 1_000}],
+        },
+        video_url=f"/media/{gesture}-corrected-demo.mp4",
+    )
+    assert corrected["version"] == "1.10"
+    assert read_runtime_spec(
+        corrected,
+        item_id=f"{gesture}-corrected-demo",
+        version="1.10",
+    )[0].interactions[0].type == gesture
+
     downgraded = copy.deepcopy(spec)
     downgraded["version"] = "1.8"
-    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.9"):
+    with pytest.raises(RuntimeSpecError, match="requires runtime spec version 1.9 or later"):
         read_runtime_spec(
             downgraded,
             item_id=f"{gesture}-demo",
             version="1.8",
         )
+
+
+def test_pitch_source_upgrade_swaps_legacy_names_once_for_single_and_story() -> None:
+    legacy = {
+        "interactions": [
+            {"gesture": "tilt_backward", "gate_at_ms": 1_000},
+            {"gesture": "tilt_forward", "gate_at_ms": 2_000},
+        ]
+    }
+    upgraded = upgrade_tilt_semantics(legacy)
+    assert [item["gesture"] for item in upgraded["interactions"]] == [
+        "tilt_forward",
+        "tilt_backward",
+    ]
+    assert upgraded["tilt_semantics"] == "user_relative_v2"
+    assert upgrade_tilt_semantics(upgraded) == upgraded
+    assert legacy["interactions"][0]["gesture"] == "tilt_backward"
+
+    story = upgrade_tilt_semantics({
+        "entry_clip_id": "A",
+        "clips": {"A": {"timeline": legacy}},
+    })
+    assert story["clips"]["A"]["timeline"]["tilt_semantics"] == "user_relative_v2"
+    assert story["clips"]["A"]["timeline"]["interactions"][0]["gesture"] == "tilt_forward"
+
+    newly_authored = mark_user_relative_tilt_semantics(legacy)
+    assert newly_authored["tilt_semantics"] == "user_relative_v2"
+    assert newly_authored["interactions"][0]["gesture"] == "tilt_backward"
+
+
+def test_legacy_pitch_version_keeps_all_v18_features_readable() -> None:
+    spec = compile_runtime_spec(
+        item_id="legacy-pitch-with-range",
+        content_mode="single",
+        source={
+            "media": {"duration_ms": 2_000},
+            "interactions": [
+                {"gesture": "continuous_hold", "gate_at_ms": 0, "gate_end_ms": 500},
+                {"gesture": "tilt_forward", "gate_at_ms": 1_000},
+            ],
+        },
+        video_url="/media/legacy-pitch-with-range.mp4",
+    )
+    assert spec["version"] == "1.9"
+    assert [item.type for item in read_runtime_spec(
+        spec,
+        item_id="legacy-pitch-with-range",
+        version="1.9",
+    )[0].interactions] == ["continuous_hold", "tilt_forward"]
 
 
 @pytest.mark.parametrize("tap_count", [0, 100, 1.5, True, None])
@@ -559,7 +629,7 @@ def test_story_result_end_and_retry_reuse_existing_actions() -> None:
 
 def test_v10_remains_readable_but_cannot_claim_video_on_end() -> None:
     assert SUPPORTED_RUNTIME_SPEC_VERSIONS == frozenset(
-        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9"}
+        {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10"}
     )
     spec = compile_runtime_spec(
         item_id="legacy",

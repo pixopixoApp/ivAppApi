@@ -163,7 +163,7 @@ _RECOMMENDED = frozenset({
 
 def _minimum_runtime_version(interaction_type: str, preset_id: str) -> str:
     if interaction_type in {"tilt_forward", "tilt_backward"}:
-        return "1.9"
+        return "1.10"
     if preset_id == "pinch_out":
         return "1.7"
     if interaction_type == "mic_level_continuous":
