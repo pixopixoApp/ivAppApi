@@ -11,7 +11,11 @@ class CameraContinuousTargetError(ValueError):
 
 CAMERA_CONTINUOUS_TARGETS: dict[str, dict[str, Any]] = {
     "hand_finger_snap": {
-        "instruction": "Keep snapping your thumb and middle finger to play",
+        # The wire target/profile keep their legacy names so published specs remain valid.
+        "instruction": (
+            "Press your middle finger against your thumb, then keep flicking it "
+            "forward to play"
+        ),
         "camera_facing": "front",
         "show_preview": True,
         "idle_timeout_ms": 1100,

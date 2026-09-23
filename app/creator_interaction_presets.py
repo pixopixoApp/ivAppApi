@@ -247,7 +247,7 @@ def _build_presets() -> tuple[CreatorInteractionPreset, ...]:
             id=f"camera_continuous.{target}",
             type="camera_continuous",
             label=(
-                "Keep snapping fingers to play"
+                "Keep flicking your middle finger to play"
                 if target == "hand_finger_snap"
                 else "Keep recoiling a finger gun to play"
             ),
