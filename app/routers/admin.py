@@ -40,6 +40,7 @@ from app.html_content import (
     validate_html_package_url,
 )
 from app.impressions import ImpressionUnavailableError, get_impression_store
+from app.interaction_inventory import interaction_filter_keys
 from app.logging_config import get_logger
 from app.media_api import RuntimeObjectPublishRequest, RuntimePreviewRequest
 from app.media_service import MediaServiceError, media_mode_is_oss
@@ -1480,6 +1481,7 @@ def _content_management_out(
         "reviewed_by": row.reviewed_by or "",
         "reviewed_at": row.reviewed_at.isoformat() if row.reviewed_at else None,
         "review_note": row.review_note or "",
+        "interaction_triggers": interaction_filter_keys(row.timeline),
         "seo": {
             "status": seo.status if seo else "missing",
             "slug": seo.slug if seo else "",
@@ -1507,7 +1509,7 @@ def list_content_management(
     _: Annotated[None, Depends(require_publish_key)],
     source: str = Query(default="all", pattern="^(all|pgc|ugc|manual_upload)$"),
     status: str = Query(default="all", pattern="^(all|draft|pending|approved|rejected)$"),
-    limit: int = Query(default=100, ge=1, le=200),
+    limit: int = Query(default=100, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     q = db.query(PublishedVideo).filter(
@@ -1526,6 +1528,7 @@ def list_content_management(
                 PublishedVideo.content_type,
                 PublishedVideo.title,
                 PublishedVideo.description,
+                PublishedVideo.timeline,
                 PublishedVideo.review_status,
                 PublishedVideo.user_id,
                 PublishedVideo.feed_weight,
