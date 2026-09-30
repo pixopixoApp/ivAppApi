@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,6 +18,11 @@ from app.auth_user import (
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
+from app.html_content import (
+    CONTENT_TYPE_HTML,
+    CONTENT_TYPE_RUNTIME,
+    HTML_BRIDGE_VERSION,
+)
 from app.models import (
     Comment,
     CommentLike,
@@ -567,14 +572,32 @@ def _liked(
 ) -> CreatorWorkPage:
     _enabled(settings, "social_video_likes_enabled")
     offset = _offset(cursor)
-    pairs = db.query(VideoLike, PublishedVideo).join(PublishedVideo, PublishedVideo.id == VideoLike.video_id).filter(
+    query = db.query(VideoLike, PublishedVideo).join(
+        PublishedVideo, PublishedVideo.id == VideoLike.video_id
+    ).filter(
         VideoLike.user_id == user.user_id,
         PublishedVideo.is_deleted == 0,
         PublishedVideo.deleted_at.is_(None),
         PublishedVideo.review_status == "approved",
         PublishedVideo.distribution_enabled.is_(True),
         PublishedVideo.cdn_ready.is_(True),
-    ).order_by(VideoLike.created_at.desc(), VideoLike.id.desc()).offset(offset).limit(limit + 1).all()
+        or_(
+            and_(
+                PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+                PublishedVideo.runtime_spec.is_not(None),
+                PublishedVideo.runtime_spec_version.in_(supported_runtime_spec_versions),
+            ),
+            and_(
+                PublishedVideo.content_type == CONTENT_TYPE_HTML,
+                PublishedVideo.html_url.is_not(None),
+                PublishedVideo.bridge_version == HTML_BRIDGE_VERSION,
+            ),
+        ),
+    )
+    total_count = query.count()
+    pairs = query.order_by(
+        VideoLike.created_at.desc(), VideoLike.id.desc()
+    ).offset(offset).limit(limit + 1).all()
     has_more = len(pairs) > limit
     rows = [pair[1] for pair in pairs[:limit]]
     context = _load_feed_item_context(db, rows, viewer_user_id=user.user_id)
@@ -595,7 +618,12 @@ def _liked(
                 engagement=EngagementSummary(unique_player_count=context.play_counts_by_video_id.get(row.id, 0), like_count=row.like_count, comment_count=row.comment_count, viewer_liked=True),
                 review_status=row.review_status, created_at=_iso(row.created_at),
             ))
-    return CreatorWorkPage(items=items, next_cursor=_cursor(offset + limit) if has_more else None, has_more=has_more)
+    return CreatorWorkPage(
+        items=items,
+        next_cursor=_cursor(offset + limit) if has_more else None,
+        has_more=has_more,
+        total_count=total_count,
+    )
 
 
 def _notifications(db: Session, settings: Settings, user: AppUser, limit: int, cursor: str | None) -> NotificationPage:

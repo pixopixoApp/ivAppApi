@@ -151,8 +151,10 @@ def test_liked_videos_respect_declared_runtime_capabilities(db) -> None:
 
     assert legacy.status_code == 200
     assert legacy.json()["items"] == []
+    assert legacy.json()["total_count"] == 0
     assert supported.status_code == 200
     assert [item["video_id"] for item in supported.json()["items"]] == ["video-modern"]
+    assert supported.json()["total_count"] == 1
 
 
 def test_block_filters_comments_and_prevents_interaction(db) -> None:

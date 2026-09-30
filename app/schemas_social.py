@@ -48,6 +48,7 @@ class CreatorWorkPage(BaseModel):
     items: list[CreatorWork]
     next_cursor: str | None = None
     has_more: bool = False
+    total_count: int | None = None
 
 
 class CommentAuthor(BaseModel):
