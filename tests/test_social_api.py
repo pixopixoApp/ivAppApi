@@ -130,6 +130,31 @@ def test_like_is_idempotent_and_reconcile_repairs_counts(db) -> None:
     assert db.query(SocialNotification).filter_by(type="video_like").count() == 1
 
 
+def test_liked_videos_respect_declared_runtime_capabilities(db) -> None:
+    _user(db, "author")
+    viewer = _user(db, "viewer")
+    _video(db, "video-modern", "author")
+    video = db.get(PublishedVideo, "video-modern")
+    video.runtime_spec_version = "1.2"
+    video.runtime_spec = {**video.runtime_spec, "version": "1.2"}
+    db.commit()
+    version = video.runtime_spec_version
+
+    with TestClient(app) as client:
+        client.put("/api/v1/social/videos/video-modern/like", headers=_auth(viewer))
+        legacy = client.get("/api/v1/social/liked", headers=_auth(viewer))
+        supported = client.get(
+            "/api/v1/social/liked",
+            headers=_auth(viewer),
+            params={"experience_spec_versions": f"1.0,{version}"},
+        )
+
+    assert legacy.status_code == 200
+    assert legacy.json()["items"] == []
+    assert supported.status_code == 200
+    assert [item["video_id"] for item in supported.json()["items"]] == ["video-modern"]
+
+
 def test_block_filters_comments_and_prevents_interaction(db) -> None:
     _user(db, "author")
     viewer = _user(db, "viewer")

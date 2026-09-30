@@ -31,6 +31,7 @@ from app.models import (
     VideoLike,
     VideoView,
 )
+from app.protocol_video import normalize_client_runtime_spec_versions
 from app.public_origin import canonicalize_public_url
 from app.routers.feed import _item_from_published, _load_feed_item_context
 from app.safety import blocked_peer_ids, users_blocked_between
@@ -555,7 +556,15 @@ def _remove_comment(db: Session, user: AppUser, comment_id: str, *, hide: bool) 
     )
 
 
-def _liked(db: Session, settings: Settings, user: AppUser, limit: int, cursor: str | None) -> CreatorWorkPage:
+def _liked(
+    db: Session,
+    settings: Settings,
+    user: AppUser,
+    limit: int,
+    cursor: str | None,
+    *,
+    supported_runtime_spec_versions: frozenset[str],
+) -> CreatorWorkPage:
     _enabled(settings, "social_video_likes_enabled")
     offset = _offset(cursor)
     pairs = db.query(VideoLike, PublishedVideo).join(PublishedVideo, PublishedVideo.id == VideoLike.video_id).filter(
@@ -571,7 +580,14 @@ def _liked(db: Session, settings: Settings, user: AppUser, limit: int, cursor: s
     context = _load_feed_item_context(db, rows, viewer_user_id=user.user_id)
     items = []
     for row in rows:
-        item = _item_from_published(db, row, settings=settings, viewer_user_id=user.user_id, context=context)
+        item = _item_from_published(
+            db,
+            row,
+            settings=settings,
+            viewer_user_id=user.user_id,
+            context=context,
+            supported_runtime_spec_versions=supported_runtime_spec_versions,
+        )
         if item:
             items.append(CreatorWork(
                 video_id=row.id, title=row.title or "", description=row.description or "",
@@ -694,8 +710,27 @@ def _register_routes(router: APIRouter, auth: Callable[..., AppUser]) -> None:
         return {"reported": True}
 
     @router.get("/liked", response_model=CreatorWorkPage)
-    def liked_videos(user: Annotated[AppUser, Depends(auth)], db: Annotated[Session, Depends(get_db)], settings: Annotated[Settings, Depends(get_settings)], limit: int = Query(default=20, ge=1, le=50), cursor: str | None = None) -> CreatorWorkPage:
-        return _liked(db, settings, user, limit, cursor)
+    def liked_videos(
+        user: Annotated[AppUser, Depends(auth)],
+        db: Annotated[Session, Depends(get_db)],
+        settings: Annotated[Settings, Depends(get_settings)],
+        limit: int = Query(default=20, ge=1, le=50),
+        cursor: str | None = None,
+        experience_spec_versions: str | None = None,
+        camera_continuous_targets: str | None = None,
+    ) -> CreatorWorkPage:
+        supported_versions = normalize_client_runtime_spec_versions(
+            experience_spec_versions.split(",") if experience_spec_versions else None,
+            camera_continuous_targets.split(",") if camera_continuous_targets else None,
+        )
+        return _liked(
+            db,
+            settings,
+            user,
+            limit,
+            cursor,
+            supported_runtime_spec_versions=supported_versions,
+        )
 
     @router.get("/notifications", response_model=NotificationPage)
     def notifications(user: Annotated[AppUser, Depends(auth)], db: Annotated[Session, Depends(get_db)], settings: Annotated[Settings, Depends(get_settings)], limit: int = Query(default=20, ge=1, le=50), cursor: str | None = None) -> NotificationPage:
