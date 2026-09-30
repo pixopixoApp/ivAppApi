@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
@@ -104,6 +105,12 @@ class PublishedVideo(Base):
     # 是否已删除（标记删除）：0=未删除，1=已删除。deleted_at 仅记录删除时间。
     is_deleted: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=0, server_default="0", index=True
+    )
+    like_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    comment_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
@@ -282,6 +289,9 @@ class User(Base):
     scheduled_delete_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    creator_activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -416,19 +426,102 @@ class ContentReport(Base):
 
 
 class VideoView(Base):
-    """A distinct authenticated viewer for one published item."""
+    """A distinct, irreversibly keyed viewer for one published item."""
 
     __tablename__ = "video_views"
     __table_args__ = (
-        UniqueConstraint("video_id", "user_id", name="uq_video_views_video_user"),
+        UniqueConstraint("video_id", "viewer_key", name="uq_video_views_video_viewer"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    viewer_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True, default=lambda: secrets.token_hex(32)
+    )
+    first_viewed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
+class VideoLike(Base):
+    __tablename__ = "video_likes"
+    __table_args__ = (
+        UniqueConstraint("video_id", "user_id", name="uq_video_likes_video_user"),
+        Index("ix_video_likes_user_created", "user_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     video_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    first_viewed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class Comment(Base):
+    __tablename__ = "comments"
+    __table_args__ = (
+        Index("ix_comments_video_root_created", "video_id", "root_comment_id", "created_at"),
+        Index("ix_comments_author_created", "author_user_id", "created_at"),
     )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    author_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    root_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    reply_to_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    body: Mapped[str] = mapped_column(String(1120), nullable=False, default="")
+    moderation_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="visible", index=True
+    )
+    like_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CommentLike(Base):
+    __tablename__ = "comment_likes"
+    __table_args__ = (
+        UniqueConstraint("comment_id", "user_id", name="uq_comment_likes_comment_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    comment_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SocialNotification(Base):
+    __tablename__ = "social_notifications"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_social_notifications_dedupe"),
+        Index("ix_social_notifications_recipient_created", "recipient_user_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    recipient_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    actor_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    type: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    video_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(320), nullable=False)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SocialRateEvent(Base):
+    __tablename__ = "social_rate_events"
+    __table_args__ = (
+        Index("ix_social_rate_events_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class AppVersion(Base):

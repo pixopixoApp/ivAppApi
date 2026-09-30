@@ -13,7 +13,17 @@ from app.logging_config import get_logger, setup_logging
 from app.media_cache import initialize_cache
 from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
-from app.routers import admin, feed, media_storage, platform, safety, seo, user, web
+from app.routers import (
+    admin,
+    feed,
+    media_storage,
+    platform,
+    safety,
+    seo,
+    social,
+    user,
+    web,
+)
 
 log = get_logger(__name__)
 
@@ -67,6 +77,10 @@ app.include_router(platform.creator_router)
 app.include_router(platform.operations_router)
 app.include_router(safety.client_router)
 app.include_router(safety.operations_router)
+app.include_router(social.public_router)
+app.include_router(social.app_router)
+app.include_router(social.web_router)
+app.include_router(social.operations_router)
 app.include_router(web.router)
 app.include_router(web.invite_router)
 app.include_router(seo.public_router)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,8 @@ from app.impressions import ImpressionUnavailableError, get_impression_store
 from app.media_service import media_mode_is_oss
 from app.models import (
     AnalyticsLog,
+    Comment,
+    CommentLike,
     ContentReport,
     CreatorAccessGrant,
     CreatorApplication,
@@ -24,9 +27,12 @@ from app.models import (
     Follow,
     PublishedVideo,
     RecommendCursor,
+    SocialNotification,
+    SocialRateEvent,
     User,
     UserBlock,
     UserToken,
+    VideoLike,
     VideoView,
 )
 from app.storage import LocalMediaStorage, StorageError
@@ -116,6 +122,12 @@ def delete_account_data(
             conditions.append(AnalyticsLog.video_id.in_(video_ids))
         db.query(AnalyticsLog).filter(or_(*conditions)).delete(synchronize_session=False)
     if video_ids:
+        db.query(VideoLike).filter(VideoLike.video_id.in_(video_ids)).delete(synchronize_session=False)
+        video_comment_ids = [row.id for row in db.query(Comment.id).filter(Comment.video_id.in_(video_ids)).all()]
+        if video_comment_ids:
+            db.query(CommentLike).filter(CommentLike.comment_id.in_(video_comment_ids)).delete(synchronize_session=False)
+            db.query(Comment).filter(Comment.id.in_(video_comment_ids)).delete(synchronize_session=False)
+        db.query(SocialNotification).filter(SocialNotification.video_id.in_(video_ids)).delete(synchronize_session=False)
         db.query(VideoView).filter(VideoView.video_id.in_(video_ids)).delete(
             synchronize_session=False
         )
@@ -124,6 +136,39 @@ def delete_account_data(
             ContentReport.target_id.in_(video_ids),
         ).delete(synchronize_session=False)
     db.query(VideoView).filter(VideoView.user_id == user_id).delete(synchronize_session=False)
+    own_likes = db.query(VideoLike).filter(VideoLike.user_id == user_id).all()
+    for like in own_likes:
+        video = db.get(PublishedVideo, like.video_id)
+        if video is not None:
+            video.like_count = max(0, video.like_count - 1)
+        db.delete(like)
+    own_comment_likes = db.query(CommentLike).filter(CommentLike.user_id == user_id).all()
+    for like in own_comment_likes:
+        comment = db.get(Comment, like.comment_id)
+        if comment is not None:
+            comment.like_count = max(0, comment.like_count - 1)
+        db.delete(like)
+    for comment in db.query(Comment).filter(Comment.author_user_id == user_id).all():
+        if comment.deleted_at is None and comment.moderation_status == "visible":
+            video = db.get(PublishedVideo, comment.video_id)
+            if video is not None:
+                video.comment_count = max(0, video.comment_count - 1)
+            if comment.root_comment_id:
+                root = db.get(Comment, comment.root_comment_id)
+                if root is not None:
+                    root.reply_count = max(0, root.reply_count - 1)
+        comment.body = ""
+        comment.moderation_status = "removed"
+        comment.deleted_at = comment.deleted_at or datetime.now(timezone.utc)
+    db.query(SocialNotification).filter(
+        or_(
+            SocialNotification.recipient_user_id == user_id,
+            SocialNotification.actor_user_id == user_id,
+        )
+    ).delete(synchronize_session=False)
+    db.query(SocialRateEvent).filter(SocialRateEvent.user_id == user_id).delete(
+        synchronize_session=False
+    )
     db.query(RecommendCursor).filter(RecommendCursor.token == f"feed:user:{user_id}").delete()
     db.query(Follow).filter(
         or_(Follow.follower_user_id == user_id, Follow.followee_user_id == user_id)

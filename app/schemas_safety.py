@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ReportTargetType = Literal["video", "user"]
+ReportTargetType = Literal["video", "user", "comment"]
 ReportStatus = Literal["pending", "actioned", "dismissed"]
 
 
@@ -59,6 +59,6 @@ class SafetyReportPage(BaseModel):
 
 class SafetyReportDecisionRequest(BaseModel):
     status: Literal["actioned", "dismissed"]
-    action: Literal["none", "remove_content", "disable_user"] = "none"
+    action: Literal["none", "remove_content", "remove_comment", "disable_user"] = "none"
     resolution: str = Field(default="", max_length=500)
     reviewed_by: str = Field(default="", max_length=64)

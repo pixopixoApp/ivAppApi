@@ -124,6 +124,14 @@ class Settings(BaseSettings):
     #   True = 关闭曝光即标记，推荐去重改为仅依赖客户端上报（/seen 或 /impression）。
     # 切换前必须确认客户端已在可靠上报，否则去重会失效、重复增加。
     feature_seen_client_report: bool = False
+    # Independently reversible social launch capabilities.
+    social_creator_profiles_enabled: bool = True
+    social_video_likes_enabled: bool = True
+    social_comments_enabled: bool = True
+    social_notifications_enabled: bool = True
+    # Rotatable secret used to avoid persisting raw account/install identifiers
+    # in distinct-player analytics. CURSOR_SECRET is the deployment fallback.
+    viewer_key_secret: str = ""
 
     # 新视频窗口（秒）：feed_weight 分档下，created_at 在此窗口内的视为“新内容”优先曝光
     recommend_new_video_window_seconds: int = 3 * 86400

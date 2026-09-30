@@ -16,6 +16,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import HTMLResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, issue_user_token
@@ -29,8 +30,11 @@ from app.models import (
     PublishedVideo,
     PublishedVideoSeo,
     ReferralInvite,
+    SocialNotification,
     User,
     UserToken,
+    VideoLike,
+    VideoView,
 )
 from app.public_origin import canonicalize_public_url
 from app.schemas_web import (
@@ -45,6 +49,7 @@ from app.schemas_web import (
     WebPublicationOut,
     WebPublicationPageOut,
     WebSessionOut,
+    WebSocialConfigOut,
 )
 from app.share_urls import published_share_url
 from app.users import (
@@ -103,6 +108,21 @@ def _bind_web_invite_if_present(
 
 def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
     following_count, follower_count = follow_counts(db, user.user_id)
+    work_count, received_like_count = db.query(
+        func.count(PublishedVideo.id),
+        func.coalesce(func.sum(PublishedVideo.like_count), 0),
+    ).filter(
+        PublishedVideo.user_id == user.user_id,
+        PublishedVideo.is_deleted == 0,
+        PublishedVideo.deleted_at.is_(None),
+        PublishedVideo.review_status == "approved",
+        PublishedVideo.distribution_enabled.is_(True),
+        PublishedVideo.cdn_ready.is_(True),
+    ).one()
+    unread_count = db.query(SocialNotification.id).filter(
+        SocialNotification.recipient_user_id == user.user_id,
+        SocialNotification.read_at.is_(None),
+    ).count()
     return WebProfileOut(
         user_id=user.user_id,
         provider=user.provider,
@@ -112,6 +132,9 @@ def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
         bio=user.bio or "",
         following_count=following_count,
         follower_count=follower_count,
+        work_count=int(work_count or 0),
+        received_like_count=int(received_like_count or 0),
+        unread_notification_count=unread_count,
     )
 
 
@@ -171,6 +194,12 @@ def get_web_config(
             generated_duration_seconds=settings.creator_video_duration_seconds,
             generated_ratio="9:16",
             generated_resolution="720p",
+        ),
+        social=WebSocialConfigOut(
+            creator_profiles=settings.social_creator_profiles_enabled,
+            video_likes=settings.social_video_likes_enabled,
+            comments=settings.social_comments_enabled,
+            notifications=settings.social_notifications_enabled,
         ),
     )
 
@@ -412,6 +441,20 @@ def list_web_publications(
         )
         .all()
     }
+    video_ids = [row.id for row in rows]
+    play_counts = {
+        video_id: int(count)
+        for video_id, count in db.query(VideoView.video_id, func.count(VideoView.id))
+        .filter(VideoView.video_id.in_(video_ids))
+        .group_by(VideoView.video_id)
+        .all()
+    } if video_ids else {}
+    liked_ids = {
+        video_id for (video_id,) in db.query(VideoLike.video_id).filter(
+            VideoLike.user_id == user.user_id,
+            VideoLike.video_id.in_(video_ids),
+        ).all()
+    } if video_ids else set()
     return WebPublicationPageOut(
         items=[
             WebPublicationOut(
@@ -433,6 +476,10 @@ def list_web_publications(
                 deleted=bool(row.is_deleted) or row.deleted_at is not None,
                 created_at=row.created_at.isoformat() if row.created_at else "",
                 updated_at=row.updated_at.isoformat() if row.updated_at else "",
+                unique_player_count=play_counts.get(row.id, 0),
+                like_count=max(0, row.like_count),
+                comment_count=max(0, row.comment_count),
+                viewer_liked=row.id in liked_ids,
             )
             for row in rows
         ],

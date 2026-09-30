@@ -19,11 +19,19 @@ class WebCreatorConfigOut(BaseModel):
     generated_resolution: str = "720p"
 
 
+class WebSocialConfigOut(BaseModel):
+    creator_profiles: bool = True
+    video_likes: bool = True
+    comments: bool = True
+    notifications: bool = True
+
+
 class WebConfigOut(BaseModel):
     google_client_id: str
     email_code_ttl_seconds: int
     email_resend_seconds: int
     creator: WebCreatorConfigOut
+    social: WebSocialConfigOut = Field(default_factory=WebSocialConfigOut)
 
 
 class WebProfileOut(BaseModel):
@@ -35,6 +43,9 @@ class WebProfileOut(BaseModel):
     bio: str
     following_count: int
     follower_count: int
+    work_count: int = 0
+    received_like_count: int = 0
+    unread_notification_count: int = 0
 
 
 class WebSessionOut(BaseModel):
@@ -79,6 +90,10 @@ class WebPublicationOut(BaseModel):
     deleted: bool
     created_at: str
     updated_at: str
+    unique_player_count: int = 0
+    like_count: int = 0
+    comment_count: int = 0
+    viewer_liked: bool = False
 
 
 class WebPublicationPageOut(BaseModel):

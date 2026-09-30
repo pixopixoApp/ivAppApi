@@ -115,6 +115,14 @@ _CONTENT_MODE_SINGLE = "single"
 _CONTENT_MODE_STORY = "story"
 
 
+def _activate_public_creator(db: Session, user_id: str | None, activated_at: datetime) -> None:
+    if not user_id:
+        return
+    creator = db.get(User, user_id)
+    if creator is not None and creator.creator_activated_at is None:
+        creator.creator_activated_at = activated_at
+
+
 def _admin_user_out(row: User, settings: Settings | None = None) -> AdminUserOut:
     active_settings = settings or get_settings()
     return AdminUserOut(
@@ -789,6 +797,7 @@ async def publish(
 
     compiled_version = runtime_spec_version_from_compiled(runtime_spec)
     now = datetime.now(timezone.utc)
+    _activate_public_creator(db, author_id, now)
     source_created_at = None
     if created_at:
         try:
@@ -997,6 +1006,7 @@ def publish_assets(
 
     compiled_version = runtime_spec_version_from_compiled(runtime_spec)
     now = datetime.now(timezone.utc)
+    _activate_public_creator(db, author_id, now)
     updated = existing is not None
     source_created_at = payload.created_at
     if source_created_at is not None and source_created_at.tzinfo is None:
@@ -1232,6 +1242,7 @@ def publish_html(
         )
 
     now = datetime.now(timezone.utc)
+    _activate_public_creator(db, author_id, now)
     normalized_title = payload.title.strip()
     normalized_description = payload.description.strip()
     if not normalized_title:

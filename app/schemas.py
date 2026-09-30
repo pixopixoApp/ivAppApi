@@ -469,6 +469,9 @@ class FeedItemOut(BaseModel):
         description="作品封面；存在时为 media.pixopixo.com 上的不可变资源",
     )
     play_count: int = Field(default=0, ge=0, description="去重登录用户播放量")
+    like_count: int = Field(default=0, ge=0, description="作品点赞数")
+    comment_count: int = Field(default=0, ge=0, description="可见评论与回复数")
+    viewer_liked: bool = Field(default=False, description="当前登录用户是否已点赞")
     is_following: bool = Field(default=False, description="当前登录用户是否关注作者")
     viewer_following_author: bool = Field(default=False, description="is_following 的兼容字段")
     following: bool = Field(default=False, description="is_following 的兼容字段")

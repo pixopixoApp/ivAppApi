@@ -10,7 +10,15 @@ from sqlalchemy.orm import Session
 from app.auth_user import AppUser, require_bearer_user
 from app.db import get_db
 from app.deps import require_publish_key
-from app.models import ContentReport, Follow, PublishedVideo, User, UserBlock, UserToken
+from app.models import (
+    Comment,
+    ContentReport,
+    Follow,
+    PublishedVideo,
+    User,
+    UserBlock,
+    UserToken,
+)
 from app.schemas_safety import (
     BlockedUserOut,
     BlockMutationOut,
@@ -43,6 +51,9 @@ def _report_out(db: Session, row: ContentReport) -> SafetyReportOut:
     if row.target_type == "video":
         video = db.get(PublishedVideo, row.target_id)
         target_label = (video.title if video is not None else "") or row.target_id
+    elif row.target_type == "comment":
+        comment = db.get(Comment, row.target_id)
+        target_label = ((comment.body[:80] if comment else "") or row.target_id)
     else:
         target_label = ((target_user.nickname if target_user else "") or row.target_id)
     return SafetyReportOut(
@@ -76,6 +87,11 @@ def create_report(
         if video is None or video.is_deleted != 0 or video.deleted_at is not None:
             raise HTTPException(status_code=404, detail="video not found")
         target_user_id = (video.user_id or "").strip() or None
+    elif payload.target_type == "comment":
+        comment = db.get(Comment, target_id)
+        if comment is None or comment.moderation_status == "hidden":
+            raise HTTPException(status_code=404, detail="comment not found")
+        target_user_id = comment.author_user_id
     else:
         target = db.get(User, target_id)
         if target is None or not target.enabled:
@@ -198,7 +214,7 @@ def list_blocks(
 def list_reports(
     db: Annotated[Session, Depends(get_db)],
     status: Literal["pending", "actioned", "dismissed"] | None = None,
-    target_type: Literal["video", "user"] | None = None,
+    target_type: Literal["video", "user", "comment"] | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> SafetyReportPage:
@@ -238,6 +254,21 @@ def decide_report(
         if video is not None and video.deleted_at is None:
             video.is_deleted = 1
             video.deleted_at = _now()
+    elif payload.action == "remove_comment":
+        if row.target_type != "comment":
+            raise HTTPException(status_code=400, detail="remove_comment requires a comment report")
+        comment = db.get(Comment, row.target_id)
+        if comment is not None and comment.deleted_at is None:
+            comment.body = ""
+            comment.moderation_status = "removed"
+            comment.deleted_at = _now()
+            video = db.get(PublishedVideo, comment.video_id)
+            if video is not None:
+                video.comment_count = max(0, video.comment_count - 1)
+            if comment.root_comment_id:
+                root = db.get(Comment, comment.root_comment_id)
+                if root is not None:
+                    root.reply_count = max(0, root.reply_count - 1)
     elif payload.action == "disable_user":
         target_user_id = (row.target_user_id or "").strip()
         target = db.get(User, target_user_id) if target_user_id else None

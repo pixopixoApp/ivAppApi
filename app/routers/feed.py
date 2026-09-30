@@ -56,6 +56,7 @@ from app.models import (
     RecommendCursor,
     RecommendStat,
     User,
+    VideoLike,
     VideoView,
 )
 from app.oss_storage import OssStorageError
@@ -122,6 +123,7 @@ from app.schemas import (
 from app.share_urls import published_share_url
 from app.users import get_or_create_user, is_author_visible, is_under_13, needs_birthday
 from app.verification_codes import PURPOSE_LOGIN, find_valid_code, issue_email_code
+from app.viewer_keys import viewer_key
 
 public_router = APIRouter(tags=["feed"])
 auth_router = APIRouter(tags=["feed"], dependencies=[Depends(require_app_user)])
@@ -144,6 +146,7 @@ class FeedItemContext:
     followed_author_ids: frozenset[str]
     seo_slugs_by_video_id: dict[str, str]
     seo_thumbnails_by_video_id: dict[str, str]
+    liked_video_ids: frozenset[str]
 
 
 def _load_feed_item_context(
@@ -188,6 +191,7 @@ def _load_feed_item_context(
         else []
     )
     followed_author_ids: frozenset[str] = frozenset()
+    liked_video_ids: frozenset[str] = frozenset()
     seo_rows = (
         db.query(
             PublishedVideoSeo.video_id,
@@ -215,6 +219,13 @@ def _load_feed_item_context(
                 .all()
             )
         )
+    if viewer_user_id and video_ids:
+        liked_video_ids = frozenset(
+            video_id for (video_id,) in db.query(VideoLike.video_id).filter(
+                VideoLike.user_id == viewer_user_id,
+                VideoLike.video_id.in_(video_ids),
+            ).all()
+        )
     return FeedItemContext(
         authors_by_id={author.user_id: author for author in authors},
         covers_by_id={cover.id: cover for cover in covers},
@@ -226,6 +237,7 @@ def _load_feed_item_context(
         seo_thumbnails_by_video_id={
             video_id: thumbnail for video_id, _slug, thumbnail in seo_rows
         },
+        liked_video_ids=liked_video_ids,
     )
 
 
@@ -386,6 +398,19 @@ def _item_from_published(
         avatar_url=avatar_url,
         thumbnail_url=thumbnail_url,
         play_count=play_count,
+        like_count=max(0, int(getattr(row, "like_count", 0) or 0)),
+        comment_count=max(0, int(getattr(row, "comment_count", 0) or 0)),
+        viewer_liked=(
+            row.id in context.liked_video_ids
+            if context is not None
+            else bool(
+                viewer_user_id
+                and db.query(VideoLike.id).filter(
+                    VideoLike.video_id == row.id,
+                    VideoLike.user_id == viewer_user_id,
+                ).first()
+            )
+        ),
         is_following=viewer_following_author,
         viewer_following_author=viewer_following_author,
         following=viewer_following_author,
@@ -1710,13 +1735,14 @@ def post_impression(
     except (RedisError, ImpressionUnavailableError):
         log.warning("impression user:seen write failed user_id=%s", user.user_id)
 
+    keyed_viewer = viewer_key(settings, user_id=user.user_id, anonymous_id=None)
     exists = (
         db.query(VideoView)
-        .filter(VideoView.video_id == video_id, VideoView.user_id == user.user_id)
+        .filter(VideoView.video_id == video_id, VideoView.viewer_key == keyed_viewer)
         .first()
     )
     if exists is None:
-        db.add(VideoView(video_id=video_id, user_id=user.user_id))
+        db.add(VideoView(video_id=video_id, user_id=user.user_id, viewer_key=keyed_viewer))
         try:
             db.commit()
         except IntegrityError:
@@ -1766,6 +1792,26 @@ def post_seen(
     # seen key：登录用户写 user:seen:{userId}；游客写 user:seen:guest:{ssid}
     is_guest = user is None
     seen_key = user_seen_key(user.user_id if user else ssid, is_guest=is_guest)
+
+    keyed_viewer = viewer_key(
+        settings,
+        user_id=user.user_id if user else None,
+        anonymous_id=None if user else ssid,
+    )
+    exists = db.query(VideoView.id).filter(
+        VideoView.video_id == video_id,
+        VideoView.viewer_key == keyed_viewer,
+    ).first()
+    if exists is None:
+        db.add(VideoView(
+            video_id=video_id,
+            user_id=user.user_id if user else None,
+            viewer_key=keyed_viewer,
+        ))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
 
     try:
         _write_user_seen(

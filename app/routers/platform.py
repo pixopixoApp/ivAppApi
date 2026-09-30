@@ -2332,6 +2332,9 @@ def publish_creation(
             updated_at=now,
         )
         db.add(published)
+        creator_account = db.get(User, user.user_id)
+        if creator_account is not None and creator_account.creator_activated_at is None:
+            creator_account.creator_activated_at = now
         row.status = "pending_review"
         row.progress_stage = "pending_review"
         row.progress_percent = 100
