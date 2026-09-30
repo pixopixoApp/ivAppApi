@@ -117,9 +117,14 @@ SSH=(
   -o BatchMode=yes
   -o ConnectTimeout=15
   -o ConnectionAttempts=4
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=4
+  -o ControlMaster=auto
+  -o ControlPersist=120
+  -o 'ControlPath=/tmp/pixo-ivapp-ssh-%C'
   "$DEPLOY_USER@$DEPLOY_HOST"
 )
-RSYNC_SSH="ssh -p $DEPLOY_PORT -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=4"
+RSYNC_SSH="ssh -p $DEPLOY_PORT -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=4 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=/tmp/pixo-ivapp-ssh-%C"
 RSYNC_FILTERS=(
   --exclude='.git/'
   --exclude='.venv/'
