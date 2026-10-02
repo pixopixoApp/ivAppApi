@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -135,12 +135,25 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
         assert generated.json()["ai_description_written"] is True
 
         listing = client.get("/api/v1/public/seo/experiences")
+        touch_listing = client.get(
+            "/api/v1/public/seo/experiences?interaction_group=touch"
+        )
+        camera_listing = client.get(
+            "/api/v1/public/seo/experiences?interaction_group=camera"
+        )
         slug = generated.json()["slug"]
         detail = client.get(f"/api/v1/public/seo/experiences/{slug}")
         resolved = client.get(f"/api/v1/public/seo/resolve/{row.id}")
 
     assert listing.status_code == 200
     assert listing.json()["total"] == 1
+    assert listing.json()["interaction_group"] is None
+    assert touch_listing.status_code == 200
+    assert touch_listing.json()["interaction_group"] == "touch"
+    assert touch_listing.json()["total"] == 1
+    assert camera_listing.status_code == 200
+    assert camera_listing.json()["interaction_group"] == "camera"
+    assert camera_listing.json()["total"] == 0
     assert re.fullmatch(r"tap-wake-city-\d{5}", slug)
     assert listing.json()["items"][0]["title"] == "Tap to Wake the City"
     assert listing.json()["items"][0]["embed_url"] == (
@@ -153,6 +166,66 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
     assert detail.status_code == 200
     assert detail.json()["canonical_url"].endswith(f"/videos/{slug}")
     assert resolved.json()["canonical_url"] == detail.json()["canonical_url"]
+
+
+def test_explore_orders_by_weight_then_recency_across_filtered_pages(db) -> None:
+    now = datetime.now(timezone.utc)
+    works = [
+        ("new-low", 0, now, ["tap"]),
+        ("old-high", 10, now - timedelta(days=3), ["tap"]),
+        ("recent-high-a", 10, now - timedelta(days=1), ["tap"]),
+        ("recent-high-z", 10, now - timedelta(days=1), ["tap"]),
+        ("camera-highest", 20, now - timedelta(days=5), ["camera_motion"]),
+    ]
+    for video_id, weight, created_at, types in works:
+        db.add(PublishedVideo(
+            id=video_id,
+            content_type="runtime",
+            video_url="https://video.example/work.mp4",
+            timeline={"interactions": []},
+            runtime_spec={"video": []},
+            runtime_spec_version="1.2",
+            feed_weight=weight,
+            created_at=created_at,
+            review_status="approved",
+            distribution_enabled=True,
+            cdn_ready=True,
+        ))
+        db.add(PublishedVideoSeo(
+            video_id=video_id,
+            slug=video_id,
+            status="ready",
+            page_title="Playable video",
+            page_description="An interactive video that responds to your actions.",
+            meta_title="Playable video | Pixopixo",
+            meta_description="Explore an interactive video that responds to your actions.",
+            interaction_types=types,
+        ))
+    db.commit()
+
+    with TestClient(app) as client:
+        all_items = client.get("/api/v1/public/seo/experiences").json()["items"]
+        assert [item["id"] for item in all_items] == [
+            "camera-highest", "recent-high-z", "recent-high-a", "old-high", "new-low",
+        ]
+        pages = [
+            client.get(
+                f"/api/v1/public/seo/experiences?interaction_group=touch&page_size=2&page={page}"
+            ).json()
+            for page in (1, 2)
+        ]
+        assert [item["id"] for result in pages for item in result["items"]] == [
+            "recent-high-z", "recent-high-a", "old-high", "new-low",
+        ]
+        assert all(result["total_pages"] == 2 for result in pages)
+
+        # An operations weight edit must change the next API ordering.
+        db.get(PublishedVideo, "new-low").feed_weight = 30
+        db.commit()
+        updated = client.get(
+            "/api/v1/public/seo/experiences?interaction_group=touch"
+        ).json()["items"]
+        assert updated[0]["id"] == "new-low"
 
 
 def test_legacy_slug_alias_resolves_to_the_current_permalink(db, monkeypatch) -> None:

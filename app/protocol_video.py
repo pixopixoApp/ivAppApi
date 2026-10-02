@@ -129,6 +129,7 @@ _DETECTION_BY_GESTURE: dict[str, dict[str, Any]] = {
         "response_window_ms": 0,
         "min_radius_dp": 24,
         "max_closure_gap_dp": 28,
+        "rotation_direction": DEFAULT_ROTATION_DIRECTION,
     },
     "erase": {**_TOUCH_MID, "response_window_ms": 0, "min_travel_dp": 100},
     "camera_motion": {
@@ -295,6 +296,37 @@ def normalize_rotation_direction(value: Any) -> str:
         choices = ", ".join(sorted(ROTATION_DIRECTIONS))
         raise RuntimeSpecError(f"rotation_direction must be one of: {choices}")
     return value
+
+
+def apply_default_circle_directions(source: dict[str, Any]) -> dict[str, Any]:
+    """Return authoring source with an explicit direction on every circle.
+
+    Existing authored directions are preserved.  This is intentionally a data
+    normalization step rather than a playback fallback, so every client sees
+    the same persisted interaction contract.
+    """
+    normalized = deepcopy(source)
+
+    def normalize_timeline(timeline: dict[str, Any]) -> None:
+        interactions = timeline.get("interactions")
+        if not isinstance(interactions, list):
+            return
+        for interaction in interactions:
+            if (
+                isinstance(interaction, dict)
+                and interaction.get("gesture") == "draw_circle"
+                and interaction.get("rotation_direction") is None
+            ):
+                interaction["rotation_direction"] = DEFAULT_ROTATION_DIRECTION
+
+    clips = normalized.get("clips")
+    if isinstance(clips, dict):
+        for body in clips.values():
+            if isinstance(body, dict) and isinstance(body.get("timeline"), dict):
+                normalize_timeline(body["timeline"])
+    else:
+        normalize_timeline(normalized)
+    return normalized
 
 
 def supported_gestures() -> frozenset[str]:

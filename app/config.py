@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     social_video_likes_enabled: bool = True
     social_comments_enabled: bool = True
     social_notifications_enabled: bool = True
+    social_web_immersive_feed_enabled: bool = True
     # Rotatable secret used to avoid persisting raw account/install identifiers
     # in distinct-player analytics. CURSOR_SECRET is the deployment fallback.
     viewer_key_secret: str = ""

@@ -24,6 +24,7 @@ class WebSocialConfigOut(BaseModel):
     video_likes: bool = True
     comments: bool = True
     notifications: bool = True
+    web_immersive_feed: bool = True
 
 
 class WebConfigOut(BaseModel):

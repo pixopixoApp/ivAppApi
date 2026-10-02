@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.models import (
     Comment,
+    Follow,
     PublishedVideo,
     SocialNotification,
     SocialRateEvent,
@@ -232,3 +233,75 @@ def test_social_toggle_rate_counts_unlikes_and_noop_retries(db) -> None:
     with TestClient(app) as client:
         response = client.delete("/api/v1/social/videos/video-1/like", headers=_auth(viewer))
     assert response.status_code == 429
+
+
+def test_social_state_batches_cookie_viewer_state_and_filters_blocks(db) -> None:
+    _user(db, "author")
+    viewer = _user(db, "viewer")
+    _user(db, "blocked-author")
+    _video(db, "video-1", "author")
+    _video(db, "video-blocked", "blocked-author")
+    db.add(Follow(follower_user_id="viewer", followee_user_id="author"))
+    db.add(UserBlock(blocker_user_id="viewer", blocked_user_id="blocked-author"))
+    db.commit()
+
+    with TestClient(app) as client:
+        client.cookies.set(WEB_SESSION_COOKIE, viewer)
+        client.get("/api/v1/web/config")
+        client.put(
+            "/api/v1/web/social/videos/video-1/like",
+            headers={"X-Pixo-CSRF": client.cookies.get(WEB_CSRF_COOKIE) or ""},
+        )
+        response = client.get(
+            "/api/v1/public/social/state",
+            params=[
+                ("video_id", "video-1"),
+                ("video_id", "video-blocked"),
+                ("creator_id", "author"),
+                ("creator_id", "blocked-author"),
+            ],
+        )
+
+    assert response.status_code == 200
+    assert response.json()["videos"]["video-1"]["viewer_liked"] is True
+    assert "video-blocked" not in response.json()["videos"]
+    assert response.json()["creators"]["author"] == {
+        "follower_count": 1,
+        "viewer_following": True,
+    }
+    assert "blocked-author" not in response.json()["creators"]
+
+
+def test_social_state_rejects_more_than_twelve_ids(db) -> None:
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/public/social/state",
+            params=[("video_id", f"video-{index}") for index in range(13)],
+        )
+    assert response.status_code == 422
+
+
+def test_web_follow_lists_require_cookie_session_and_paginate(db) -> None:
+    viewer = _user(db, "viewer")
+    _user(db, "author")
+    _user(db, "peer")
+    _video(db, "video-1", "author")
+    db.add(Follow(follower_user_id="peer", followee_user_id="author"))
+    db.add(Follow(follower_user_id="author", followee_user_id="peer"))
+    db.commit()
+
+    with TestClient(app) as client:
+        rejected = client.get("/api/v1/web/social/creators/author/followers")
+        client.cookies.set(WEB_SESSION_COOKIE, viewer)
+        followers = client.get(
+            "/api/v1/web/social/creators/author/followers", params={"limit": 1}
+        )
+        following = client.get(
+            "/api/v1/web/social/creators/author/following", params={"limit": 1}
+        )
+        capabilities = client.get("/api/v1/public/capabilities")
+
+    assert rejected.status_code == 401
+    assert [item["user_id"] for item in followers.json()["items"]] == ["peer"]
+    assert [item["user_id"] for item in following.json()["items"]] == ["peer"]
+    assert capabilities.json()["web_immersive_feed"] is True

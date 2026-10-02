@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import String, cast, or_
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
@@ -42,6 +43,26 @@ internal_router = APIRouter(
     dependencies=[Depends(require_publish_key)],
 )
 
+InteractionGroup = Literal["touch", "camera", "motion", "sound"]
+_INTERACTION_TYPES_BY_GROUP: dict[InteractionGroup, frozenset[str]] = {
+    "touch": frozenset({
+        "tap", "double_tap", "rapid_tap", "multi_tap", "hold", "hold_charge",
+        "swipe_left", "swipe_right", "swipe_up", "swipe_down", "drag_left",
+        "drag_right", "drag_up", "drag_down", "scrub_left", "scrub_right",
+        "scrub_up", "scrub_down", "continuous_swipe", "continuous_tap",
+        "continuous_hold", "pinch", "draw_circle", "erase",
+    }),
+    "camera": frozenset({"camera_motion", "camera_continuous"}),
+    "motion": frozenset({
+        "hold_still", "tilt_left", "tilt_right", "tilt_forward", "tilt_backward",
+        "shake", "rotate",
+    }),
+    "sound": frozenset({
+        "mic_level", "mic_level_continuous", "mic_blow", "mic_blow_continuous",
+        "mic_clap", "mic_quiet",
+    }),
+}
+
 
 def _site_url(settings: Settings) -> str:
     return settings.seo_public_base_url.strip().rstrip("/") or "https://pixopixo.com"
@@ -58,11 +79,22 @@ def list_public_experiences(
     settings: Annotated[Settings, Depends(get_settings)],
     page: int = Query(default=1, ge=1, le=100_000),
     page_size: int = Query(default=24, ge=1, le=48),
+    interaction_group: Annotated[InteractionGroup | None, Query()] = None,
 ) -> dict[str, Any]:
     query = visible_experience_query(db)
+    if interaction_group is not None:
+        serialized_types = cast(PublishedVideoSeo.interaction_types, String)
+        query = query.filter(or_(*(
+            serialized_types.like(f'%"{interaction_type}"%')
+            for interaction_type in _INTERACTION_TYPES_BY_GROUP[interaction_group]
+        )))
     total = query.count()
     rows = (
-        query.order_by(PublishedVideo.created_at.desc(), PublishedVideo.id.desc())
+        query.order_by(
+            PublishedVideo.feed_weight.desc(),
+            PublishedVideo.created_at.desc(),
+            PublishedVideo.id.desc(),
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
         .all()
@@ -75,6 +107,7 @@ def list_public_experiences(
         "page_size": page_size,
         "total": total,
         "total_pages": max(1, (total + page_size - 1) // page_size),
+        "interaction_group": interaction_group,
     }
 
 

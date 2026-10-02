@@ -395,6 +395,13 @@ environment="$5"
 "$deploy_path/scripts/compose_target.sh" \
   "$deploy_path" "$project" "$environment" run --rm --no-deps \
   "$service" alembic upgrade head
+echo "[deploy] auditing and applying draw_circle directions"
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" run --rm --no-deps \
+  "$service" python -m app.runtime_backfill --circle-directions
+"$deploy_path/scripts/compose_target.sh" \
+  "$deploy_path" "$project" "$environment" run --rm --no-deps \
+  "$service" python -m app.runtime_backfill --circle-directions --apply
 case "$backfill" in
 1)
   echo "[deploy] auditing and applying historic runtime specs"

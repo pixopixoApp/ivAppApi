@@ -200,6 +200,7 @@ def get_web_config(
             video_likes=settings.social_video_likes_enabled,
             comments=settings.social_comments_enabled,
             notifications=settings.social_notifications_enabled,
+            web_immersive_feed=settings.social_web_immersive_feed_enabled,
         ),
     )
 

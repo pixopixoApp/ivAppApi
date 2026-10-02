@@ -6,9 +6,11 @@ import pytest
 
 from app.models import CreatorCreation, CreatorVersion, PublishedVideo
 from app.protocol_video import (
+    DEFAULT_ROTATION_DIRECTION,
     RUNTIME_SPEC_VERSION,
     SUPPORTED_RUNTIME_SPEC_VERSIONS,
     RuntimeSpecError,
+    apply_default_circle_directions,
     compile_runtime_spec,
     mark_user_relative_tilt_semantics,
     read_runtime_spec,
@@ -96,6 +98,33 @@ def test_rotation_interactions_compile_selected_direction_and_reject_invalid_val
             },
             video_url=f"/media/invalid-{gesture}.mp4",
         )
+
+
+def test_circle_direction_normalization_fills_only_missing_values() -> None:
+    source = {
+        "entry_clip_id": "A",
+        "clips": {
+            "A": {
+                "timeline": {
+                    "interactions": [
+                        {"gesture": "draw_circle", "gate_at_ms": 100},
+                        {
+                            "gesture": "draw_circle",
+                            "gate_at_ms": 200,
+                            "rotation_direction": "clockwise",
+                        },
+                    ]
+                }
+            }
+        },
+    }
+
+    normalized = apply_default_circle_directions(source)
+    interactions = normalized["clips"]["A"]["timeline"]["interactions"]
+
+    assert interactions[0]["rotation_direction"] == DEFAULT_ROTATION_DIRECTION
+    assert interactions[1]["rotation_direction"] == "clockwise"
+    assert "rotation_direction" not in source["clips"]["A"]["timeline"]["interactions"][0]
 
 
 def test_continuous_swipe_compiles_as_a_sustained_playback_rule() -> None:
@@ -864,6 +893,155 @@ def test_backfill_updates_good_rows_and_preserves_bad_rows(db) -> None:
     assert good.runtime_spec_version != "legacy"
     assert bad.runtime_spec == legacy_spec
     assert bad.runtime_spec_version == "legacy"
+
+
+def test_backfill_persists_default_circle_direction_and_preserves_authored_direction(db) -> None:
+    row = PublishedVideo(
+        id="circle-backfill",
+        video_url="/media/circle-backfill.mp4",
+        timeline={
+            "interactions": [
+                {"gesture": "draw_circle", "gate_at_ms": 100},
+                {
+                    "gesture": "draw_circle",
+                    "gate_at_ms": 200,
+                    "rotation_direction": "clockwise",
+                },
+            ]
+        },
+        runtime_spec={"schema": "legacy"},
+        runtime_spec_version="legacy",
+        version="1",
+        content_mode="single",
+    )
+    db.add(row)
+    db.commit()
+
+    report = compile_all_runtime_specs(db, apply=True)
+
+    assert report.failures == []
+    db.refresh(row)
+    assert row.timeline["interactions"][0]["rotation_direction"] == DEFAULT_ROTATION_DIRECTION
+    assert row.timeline["interactions"][1]["rotation_direction"] == "clockwise"
+    detections = [
+        interaction["detection"]
+        for interaction in row.runtime_spec["video"][0]["interactions"]
+    ]
+    assert detections[0]["rotation_direction"] == DEFAULT_ROTATION_DIRECTION
+    assert detections[1]["rotation_direction"] == "clockwise"
+
+
+def test_scoped_circle_backfill_does_not_recompile_unrelated_works(db) -> None:
+    circle = PublishedVideo(
+        id="circle-only",
+        video_url="/media/circle-only.mp4",
+        timeline={"interactions": [{"gesture": "draw_circle", "gate_at_ms": 100}]},
+        runtime_spec={"schema": "legacy-circle"},
+        runtime_spec_version="legacy",
+        version="1",
+        content_mode="single",
+    )
+    unrelated = PublishedVideo(
+        id="tap-untouched",
+        video_url="/media/tap-untouched.mp4",
+        timeline={"interactions": [{"gesture": "tap", "gate_at_ms": 100}]},
+        runtime_spec={"schema": "legacy-tap"},
+        runtime_spec_version="legacy",
+        version="1",
+        content_mode="single",
+    )
+    authored = PublishedVideo(
+        id="circle-authored",
+        video_url="/media/circle-authored.mp4",
+        timeline={
+            "interactions": [
+                {
+                    "gesture": "draw_circle",
+                    "gate_at_ms": 100,
+                    "rotation_direction": "clockwise",
+                }
+            ]
+        },
+        runtime_spec={"schema": "legacy-authored-circle"},
+        runtime_spec_version="legacy",
+        version="1",
+        content_mode="single",
+    )
+    db.add_all([circle, authored, unrelated])
+    db.commit()
+
+    report = compile_all_runtime_specs(
+        db,
+        apply=True,
+        only_circle_directions=True,
+    )
+
+    assert report.total == report.compilable == report.updated == 2
+    db.refresh(circle)
+    db.refresh(authored)
+    db.refresh(unrelated)
+    assert circle.timeline["interactions"][0]["rotation_direction"] == (
+        DEFAULT_ROTATION_DIRECTION
+    )
+    assert authored.timeline["interactions"][0]["rotation_direction"] == "clockwise"
+    assert authored.runtime_spec["video"][0]["interactions"][0]["detection"][
+        "rotation_direction"
+    ] == "clockwise"
+    assert unrelated.runtime_spec == {"schema": "legacy-tap"}
+    assert unrelated.runtime_spec_version == "legacy"
+
+
+def test_scoped_circle_backfill_updates_published_story_version_and_active_creation(db) -> None:
+    source = {
+        "entry_clip_id": "A",
+        "clips": {
+            "A": {
+                "timeline": {
+                    "interactions": [{"gesture": "draw_circle", "gate_at_ms": 100}]
+                }
+            }
+        },
+    }
+    creation = CreatorCreation(
+        id="story-circle",
+        user_id="creator-user",
+        status="published",
+        active_version_id="story-circle-version",
+        source_timeline=copy.deepcopy(source),
+        runtime_spec={"schema": "legacy-creation"},
+        runtime_spec_version="legacy",
+    )
+    version = CreatorVersion(
+        id="story-circle-version",
+        creation_id=creation.id,
+        user_id=creation.user_id,
+        number=1,
+        request_id="story-circle-request",
+        status="published",
+        source_timeline=copy.deepcopy(source),
+        runtime_spec={
+            "video": [{"video_id": "A", "video": "/media/story-circle/A.mp4"}]
+        },
+        runtime_spec_version="legacy",
+    )
+    db.add_all([creation, version])
+    db.commit()
+
+    report = compile_all_runtime_specs(
+        db,
+        apply=True,
+        only_circle_directions=True,
+    )
+
+    assert report.failures == []
+    assert report.total == report.compilable == report.updated == 2
+    db.refresh(version)
+    db.refresh(creation)
+    assert version.source_timeline["clips"]["A"]["timeline"]["interactions"][0][
+        "rotation_direction"
+    ] == DEFAULT_ROTATION_DIRECTION
+    assert creation.source_timeline == version.source_timeline
+    assert creation.runtime_spec == version.runtime_spec
 
 
 def test_rotation_direction_backfill_updates_source_and_runtime_spec(db, monkeypatch) -> None:

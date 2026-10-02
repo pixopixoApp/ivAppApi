@@ -47,10 +47,13 @@ from app.schemas_social import (
     CommentPage,
     CommentReportRequest,
     CreatorProfile,
+    CreatorSocialState,
     CreatorWork,
     CreatorWorkPage,
     EngagementSummary,
     FollowMutation,
+    FollowUserOut,
+    FollowUserPage,
     LikeMutation,
     NotificationActor,
     NotificationOut,
@@ -58,8 +61,11 @@ from app.schemas_social import (
     ReadMutation,
     ReconcileResult,
     SocialCapabilities,
+    SocialState,
 )
 from app.users import follow_counts
+from app.pagination import CursorError
+from app.routers.user import _follow_page
 from app.web_session import optional_web_user, require_web_user
 
 public_router = APIRouter(prefix="/api/v1/public", tags=["social-public"])
@@ -218,6 +224,107 @@ def capabilities(settings: Annotated[Settings, Depends(get_settings)]) -> Social
         video_likes=settings.social_video_likes_enabled,
         comments=settings.social_comments_enabled,
         notifications=settings.social_notifications_enabled,
+        web_immersive_feed=settings.social_web_immersive_feed_enabled,
+    )
+
+
+@public_router.get("/social/state", response_model=SocialState)
+def get_social_state(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    video_id: list[str] = Query(default=[]),
+    creator_id: list[str] = Query(default=[]),
+) -> SocialState:
+    """Read viewer-aware engagement in one request for feed-sized batches."""
+    if len(video_id) > 12 or len(creator_id) > 12:
+        raise HTTPException(status_code=422, detail="at most 12 ids per resource type")
+    videos = list(dict.fromkeys(item.strip() for item in video_id if item.strip()))
+    creators = list(dict.fromkeys(item.strip() for item in creator_id if item.strip()))
+    if any(len(item) > 128 for item in videos) or any(len(item) > 128 for item in creators):
+        raise HTTPException(status_code=422, detail="invalid social state id")
+
+    viewer = _optional_user(request, db)
+    excluded = blocked_peer_ids(db, viewer.user_id) if viewer else set()
+    visible_rows = db.query(PublishedVideo).filter(
+        PublishedVideo.id.in_(videos),
+        PublishedVideo.is_deleted == 0,
+        PublishedVideo.deleted_at.is_(None),
+        PublishedVideo.review_status == "approved",
+        PublishedVideo.distribution_enabled.is_(True),
+        PublishedVideo.cdn_ready.is_(True),
+    ).all() if videos else []
+    author_ids = {row.user_id for row in visible_rows if row.user_id}
+    enabled_authors = {
+        row.user_id for row in db.query(User).filter(
+            User.user_id.in_(author_ids),
+            User.enabled.is_(True),
+            User.deletion_requested_at.is_(None),
+        ).all()
+    } if author_ids else set()
+    visible_rows = [
+        row for row in visible_rows
+        if row.user_id in enabled_authors and row.user_id not in excluded
+    ]
+    visible_video_ids = [row.id for row in visible_rows]
+    liked_ids = {
+        value for (value,) in db.query(VideoLike.video_id).filter(
+            VideoLike.user_id == viewer.user_id,
+            VideoLike.video_id.in_(visible_video_ids),
+        ).all()
+    } if viewer and visible_video_ids else set()
+    player_counts = {
+        value: int(count) for value, count in db.query(
+            VideoView.video_id, func.count(VideoView.id)
+        ).filter(VideoView.video_id.in_(visible_video_ids)).group_by(VideoView.video_id).all()
+    } if visible_video_ids else {}
+
+    creator_rows = db.query(User).filter(
+        User.user_id.in_(creators),
+        User.enabled.is_(True),
+        User.deletion_requested_at.is_(None),
+    ).all() if creators else []
+    creator_rows = [row for row in creator_rows if row.user_id not in excluded]
+    creator_row_ids = [row.user_id for row in creator_rows]
+    published_creator_ids = {
+        value for (value,) in db.query(PublishedVideo.user_id).filter(
+            PublishedVideo.user_id.in_(creator_row_ids)
+        ).distinct().all()
+    } if creator_row_ids else set()
+    visible_creators = [
+        row for row in creator_rows
+        if row.creator_activated_at is not None or row.user_id in published_creator_ids
+    ]
+    visible_creator_ids = [row.user_id for row in visible_creators]
+    followed_ids = {
+        value for (value,) in db.query(Follow.followee_user_id).filter(
+            Follow.follower_user_id == viewer.user_id,
+            Follow.followee_user_id.in_(visible_creator_ids),
+        ).all()
+    } if viewer and visible_creators else set()
+    follower_counts = {
+        value: int(count) for value, count in db.query(
+            Follow.followee_user_id, func.count(Follow.follower_user_id)
+        ).filter(Follow.followee_user_id.in_(visible_creator_ids)).group_by(
+            Follow.followee_user_id
+        ).all()
+    } if visible_creator_ids else {}
+
+    return SocialState(
+        videos={
+            row.id: EngagementSummary(
+                unique_player_count=player_counts.get(row.id, 0),
+                like_count=max(0, row.like_count),
+                comment_count=max(0, row.comment_count),
+                viewer_liked=row.id in liked_ids,
+            ) for row in visible_rows
+        },
+        creators={
+            row.user_id: CreatorSocialState(
+                follower_count=follower_counts.get(row.user_id, 0),
+                viewer_following=row.user_id in followed_ids,
+            ) for row in visible_creators
+        },
     )
 
 
@@ -662,6 +769,91 @@ def _mark_read(db: Session, user: AppUser, notification_id: str | None) -> ReadM
         SocialNotification.read_at.is_(None),
     ).count()
     return ReadMutation(updated=updated, unread_count=unread)
+
+
+def _web_follow_page(
+    *,
+    db: Session,
+    settings: Settings,
+    viewer: AppUser,
+    target_id: str,
+    direction: str,
+    limit: int,
+    cursor: str | None,
+) -> FollowUserPage:
+    target = db.get(User, target_id)
+    if (
+        target is None
+        or not target.enabled
+        or target.deletion_requested_at is not None
+        or users_blocked_between(db, viewer.user_id, target_id)
+    ):
+        raise HTTPException(status_code=404, detail="creator not found")
+    filter_column = Follow.followee_user_id if direction == "followers" else Follow.follower_user_id
+    peer_attr = "follower_user_id" if direction == "followers" else "followee_user_id"
+    try:
+        rows, next_cursor, has_more = _follow_page(
+            db,
+            filter_column=filter_column,
+            target_user_id=target_id,
+            cursor=cursor,
+            cursor_kind=f"{direction}:{target_id}",
+            cursor_secret=settings.cursor_secret or settings.publish_key,
+            limit=limit,
+        )
+    except CursorError:
+        raise HTTPException(status_code=400, detail="invalid cursor") from None
+    peer_ids = [getattr(row, peer_attr) for row in rows]
+    peers = {
+        row.user_id: row for row in db.query(User).filter(
+            User.user_id.in_(peer_ids),
+            User.enabled.is_(True),
+            User.deletion_requested_at.is_(None),
+        ).all()
+    } if peer_ids else {}
+    items = []
+    for relation in rows:
+        peer_id = getattr(relation, peer_attr)
+        peer = peers.get(peer_id)
+        if peer is None or users_blocked_between(db, viewer.user_id, peer_id):
+            continue
+        items.append(FollowUserOut(
+            user_id=peer.user_id,
+            nickname=peer.nickname or "",
+            avatar_url=canonicalize_public_url(settings, peer.avatar_url) or "",
+            created_at=_iso(relation.created_at),
+        ))
+    return FollowUserPage(items=items, next_cursor=next_cursor, has_more=has_more)
+
+
+@web_router.get("/creators/{user_id}/followers", response_model=FollowUserPage)
+def web_creator_followers(
+    user_id: str,
+    user: Annotated[AppUser, Depends(require_web_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = None,
+) -> FollowUserPage:
+    return _web_follow_page(
+        db=db, settings=settings, viewer=user, target_id=user_id,
+        direction="followers", limit=limit, cursor=cursor,
+    )
+
+
+@web_router.get("/creators/{user_id}/following", response_model=FollowUserPage)
+def web_creator_following(
+    user_id: str,
+    user: Annotated[AppUser, Depends(require_web_user)],
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: str | None = None,
+) -> FollowUserPage:
+    return _web_follow_page(
+        db=db, settings=settings, viewer=user, target_id=user_id,
+        direction="following", limit=limit, cursor=cursor,
+    )
 
 
 def _register_routes(router: APIRouter, auth: Callable[..., AppUser]) -> None:

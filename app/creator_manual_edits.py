@@ -11,6 +11,7 @@ from app.creator_interaction_presets import (
 )
 from app.protocol_video import (
     RuntimeSpecError,
+    apply_default_circle_directions,
     compile_runtime_spec,
     upgrade_tilt_semantics,
 )
@@ -22,7 +23,7 @@ def replace_interactions(source: dict, edits: list[dict[str, str]]) -> dict:
     # Any edited legacy version becomes a v1.10 authoring source as a whole.
     # This prevents untouched pitch nodes from keeping opposite wire meanings
     # beside newly selected user-relative nodes in the same work.
-    timeline = upgrade_tilt_semantics(source)
+    timeline = apply_default_circle_directions(upgrade_tilt_semantics(source))
     if isinstance(timeline.get("clips"), dict):
         groups: dict[str, list] = {}
         for edit in edits:

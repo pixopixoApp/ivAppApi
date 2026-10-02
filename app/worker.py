@@ -34,6 +34,7 @@ from app.models import (
 from app.oss_storage import delete_object
 from app.protocol_video import (
     RuntimeSpecError,
+    apply_default_circle_directions,
     compile_runtime_spec,
     runtime_spec_version_from_compiled,
 )
@@ -996,6 +997,7 @@ def _apply_remote_job(
         timeline = payload.get("timeline")
         if not isinstance(timeline, dict):
             raise CreationError("TIMELINE_MISSING", "Analysis completed without a timeline.")
+        timeline = apply_default_circle_directions(timeline)
         try:
             runtime = compile_runtime_spec(
                 item_id=f"{creation.id}-v{version.number}",

@@ -10,6 +10,7 @@ class SocialCapabilities(BaseModel):
     video_likes: bool = True
     comments: bool = True
     notifications: bool = True
+    web_immersive_feed: bool = True
 
 
 class EngagementSummary(BaseModel):
@@ -17,6 +18,29 @@ class EngagementSummary(BaseModel):
     like_count: int = 0
     comment_count: int = 0
     viewer_liked: bool = False
+
+
+class CreatorSocialState(BaseModel):
+    follower_count: int = 0
+    viewer_following: bool = False
+
+
+class SocialState(BaseModel):
+    videos: dict[str, EngagementSummary] = Field(default_factory=dict)
+    creators: dict[str, CreatorSocialState] = Field(default_factory=dict)
+
+
+class FollowUserOut(BaseModel):
+    user_id: str
+    nickname: str = ""
+    avatar_url: str = ""
+    created_at: str
+
+
+class FollowUserPage(BaseModel):
+    items: list[FollowUserOut] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
 
 
 class CreatorProfile(BaseModel):

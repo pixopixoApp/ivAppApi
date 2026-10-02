@@ -60,6 +60,7 @@ from app.oss_storage import OssStorageError, public_url
 from app.private_cdn import sign_private_media_url
 from app.protocol_video import (
     RuntimeSpecError,
+    apply_default_circle_directions,
     compile_runtime_spec,
     read_runtime_spec,
     runtime_spec_version_from_compiled,
@@ -227,7 +228,8 @@ def _remove_published_media(settings: Settings, item_id: str) -> None:
 
 def _normalize_timeline(data: Any) -> dict[str, Any]:
     """Validate business JSON without materializing omitted optional fields."""
-    return Timeline.model_validate(data).model_dump(mode="python", exclude_none=True)
+    timeline = Timeline.model_validate(data).model_dump(mode="python", exclude_none=True)
+    return apply_default_circle_directions(timeline)
 
 
 def _parse_timeline(raw: str) -> dict[str, Any]:
