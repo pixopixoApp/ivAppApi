@@ -394,23 +394,23 @@ backfill="$4"
 environment="$5"
 "$deploy_path/scripts/compose_target.sh" \
   "$deploy_path" "$project" "$environment" run --rm --no-deps \
-  "$service" alembic upgrade head
+  "$service" alembic upgrade head </dev/null
 echo "[deploy] auditing and applying draw_circle directions"
 "$deploy_path/scripts/compose_target.sh" \
   "$deploy_path" "$project" "$environment" run --rm --no-deps \
-  "$service" python -m app.runtime_backfill --circle-directions
+  "$service" python -m app.runtime_backfill --circle-directions </dev/null
 "$deploy_path/scripts/compose_target.sh" \
   "$deploy_path" "$project" "$environment" run --rm --no-deps \
-  "$service" python -m app.runtime_backfill --circle-directions --apply
+  "$service" python -m app.runtime_backfill --circle-directions --apply </dev/null
 case "$backfill" in
 1)
   echo "[deploy] auditing and applying historic runtime specs"
   "$deploy_path/scripts/compose_target.sh" \
     "$deploy_path" "$project" "$environment" run --rm --no-deps \
-    "$service" python -m app.runtime_backfill
+    "$service" python -m app.runtime_backfill </dev/null
   "$deploy_path/scripts/compose_target.sh" \
     "$deploy_path" "$project" "$environment" run --rm --no-deps \
-    "$service" python -m app.runtime_backfill --apply
+    "$service" python -m app.runtime_backfill --apply </dev/null
   ;;
 0)
   echo "[deploy] historic runtime backfill skipped"

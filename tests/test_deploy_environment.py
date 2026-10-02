@@ -88,3 +88,16 @@ def test_deploy_rejects_the_retired_development_server() -> None:
 
     assert result.returncode == 2
     assert "development server has been retired" in result.stderr
+
+
+def test_deploy_container_jobs_cannot_consume_the_remote_command_stream() -> None:
+    source = DEPLOY.read_text()
+
+    for command in (
+        '"$service" alembic upgrade head </dev/null',
+        '"$service" python -m app.runtime_backfill --circle-directions </dev/null',
+        '"$service" python -m app.runtime_backfill --circle-directions --apply </dev/null',
+        '"$service" python -m app.runtime_backfill </dev/null',
+        '"$service" python -m app.runtime_backfill --apply </dev/null',
+    ):
+        assert command in source
