@@ -36,9 +36,11 @@ from app.models import (
     VideoLike,
     VideoView,
 )
+from app.pagination import CursorError
 from app.protocol_video import normalize_client_runtime_spec_versions
 from app.public_origin import canonicalize_public_url
 from app.routers.feed import _item_from_published, _load_feed_item_context
+from app.routers.user import _follow_page
 from app.safety import blocked_peer_ids, users_blocked_between
 from app.schemas_social import (
     CommentAuthor,
@@ -64,8 +66,6 @@ from app.schemas_social import (
     SocialState,
 )
 from app.users import follow_counts
-from app.pagination import CursorError
-from app.routers.user import _follow_page
 from app.web_session import optional_web_user, require_web_user
 
 public_router = APIRouter(prefix="/api/v1/public", tags=["social-public"])
@@ -233,10 +233,12 @@ def get_social_state(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-    video_id: list[str] = Query(default=[]),
-    creator_id: list[str] = Query(default=[]),
+    video_id: Annotated[list[str] | None, Query()] = None,
+    creator_id: Annotated[list[str] | None, Query()] = None,
 ) -> SocialState:
     """Read viewer-aware engagement in one request for feed-sized batches."""
+    video_id = video_id or []
+    creator_id = creator_id or []
     if len(video_id) > 12 or len(creator_id) > 12:
         raise HTTPException(status_code=422, detail="at most 12 ids per resource type")
     videos = list(dict.fromkeys(item.strip() for item in video_id if item.strip()))
