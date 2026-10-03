@@ -646,6 +646,7 @@ class DeactivateSendCodeResponse(BaseModel):
 class VerifyBodyIn(BaseModel):
     email: str = Field(description="邮箱")
     code: str = Field(min_length=6, max_length=6, description="6 位数字验证码")
+    invite_code: str = Field(default="", max_length=32)
 
 
 def _verify_head() -> AuthProtocolHeadIn:
@@ -676,6 +677,7 @@ class VerifyResponse(BaseModel):
 
 class GoogleLoginBodyIn(BaseModel):
     id_token: str = Field(min_length=1, description="Google Sign-In 返回的 ID Token JWT")
+    invite_code: str = Field(default="", max_length=32)
 
 
 def _google_login_head() -> AuthProtocolHeadIn:

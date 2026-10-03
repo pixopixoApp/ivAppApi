@@ -22,7 +22,7 @@ from app.auth_user import (
     resolve_request_token,
 )
 from app.config import Settings, get_settings
-from app.credits import activate_referral_from_android
+from app.credits import activate_referral_from_android, bind_referral_for_new_user
 from app.db import get_db
 from app.feed_rank import (
     build_feed_sequence,
@@ -960,7 +960,15 @@ def post_verify(
         return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
 
     row.used_at = now
+    was_new = db.query(User).filter(User.provider == "email", User.subject == email).first() is None
     user = get_or_create_user(db, provider="email", subject=email)
+    if payload.body.invite_code.strip():
+        if not was_new:
+            return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
+        try:
+            bind_referral_for_new_user(db, user=user, code=payload.body.invite_code)
+        except ValueError:
+            return verify_error(status=101, ver=settings.server_ver, head_in=payload.head)
     if not user.enabled:
         db.commit()
         log.warning("verify disabled user email=%s user_id=%s", email, user.user_id)
@@ -1034,7 +1042,32 @@ def post_google_login(
         )
 
     now = datetime.now(timezone.utc)
+    was_new = (
+        db.query(User)
+        .filter(User.provider == "google", User.subject == identity.subject)
+        .first()
+        is None
+    )
     user = get_or_create_user(db, provider="google", subject=identity.subject)
+    if payload.body.invite_code.strip():
+        if not was_new:
+            return google_login_error(
+                status=101,
+                ver=settings.server_ver,
+                head_in=payload.head,
+                error_code="INVITE_NEW_ACCOUNT_ONLY",
+                message="Only a new account can use an invitation.",
+            )
+        try:
+            bind_referral_for_new_user(db, user=user, code=payload.body.invite_code)
+        except ValueError as exc:
+            return google_login_error(
+                status=101,
+                ver=settings.server_ver,
+                head_in=payload.head,
+                error_code="INVITE_INVALID",
+                message=str(exc),
+            )
     if not user.enabled:
         db.commit()
         log.warning(

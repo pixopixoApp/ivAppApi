@@ -180,9 +180,6 @@ class Settings(BaseSettings):
     # there is no hidden daily generation cap.
     creator_video_daily_quota: int = 0
     creator_video_draft_ttl_days: int = 30
-    creator_access_mode: Literal[
-        "invite", "web_open", "android_open", "all_open"
-    ] = "invite"
     public_share_base_url: str = ""
     # Canonical browser player used for shareable Runtime permalinks.
     public_game_base_url: str = "https://demo.pixopixo.cn/game/"

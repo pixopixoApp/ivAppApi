@@ -12,16 +12,14 @@ from app.config import get_settings
 from app.main import app
 from app.models import (
     CreatorAccessGrant,
-    CreatorApplication,
     CreatorCreation,
-    CreatorInvite,
     CreatorUpload,
     CreatorVersion,
     PublishedVideo,
+    ReferralRewardConfigHistory,
     User,
     UserToken,
 )
-from app.routers.platform import _invite_hash
 
 
 def _login(db, user_id: str = "creator") -> str:
@@ -68,7 +66,28 @@ def test_app_update_policy_is_database_managed(db) -> None:
     assert checked.json()["size_bytes"] == 13002342
 
 
-def test_single_use_invite_permanently_grants_creator_access(db) -> None:
+def test_referral_reward_policy_is_versioned_and_database_managed(db) -> None:
+    headers = {"X-Publish-Key": "test-publish-key"}
+    with TestClient(app) as client:
+        initial = client.get("/internal/v1/referral-rewards", headers=headers)
+        updated = client.put(
+            "/internal/v1/referral-rewards",
+            headers=headers,
+            json={
+                "inviter_activation_reward_credits": 12,
+                "invitee_registration_reward_credits": 4,
+                "updated_by": "manager@example.com",
+            },
+        )
+    assert initial.status_code == 200
+    assert initial.json()["version"] == 1
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+    assert updated.json()["inviter_activation_reward_credits"] == 12
+    assert db.query(ReferralRewardConfigHistory).count() == 2
+
+
+def test_creator_access_is_open_and_access_code_writes_are_gone(db) -> None:
     token = _login(db)
     headers = {"Authorization": f"Bearer {token}"}
     with TestClient(app) as client:
@@ -76,116 +95,42 @@ def test_single_use_invite_permanently_grants_creator_access(db) -> None:
             "/internal/v1/creator/invites",
             headers={"X-Publish-Key": "test-publish-key"},
             json={"count": 1},
-        ).json()
+        )
         redeemed = client.post(
             "/api/v1/creator/invites/redeem",
             headers=headers,
-            json={"code": created["codes"][0]},
+            json={"code": "RETIRED-CODE"},
         )
         access = client.get("/api/v1/creator/access", headers=headers)
-    assert redeemed.status_code == 200
+    assert created.status_code == 410
+    assert redeemed.status_code == 410
     assert access.json()["granted"] is True
-    assert access.json()["source"] == "invite"
+    assert access.json()["source"] == "open_access"
 
 
-def test_creator_waitlist_batch_sends_one_assigned_single_use_code(db, monkeypatch) -> None:
-    alice_token = _login(db, user_id="waitlist-alice")
-    bob_token = _login(db, user_id="waitlist-bob")
-    delivered: dict[str, str] = {}
-
-    def capture_invite(_settings, *, email: str, code: str) -> None:
-        delivered[email] = code
-
-    monkeypatch.setattr("app.routers.platform.send_creator_invite", capture_invite)
+def test_creator_application_write_routes_are_gone(db) -> None:
+    token = _login(db, user_id="waitlist-alice")
     publish_headers = {"X-Publish-Key": "test-publish-key"}
-    with TestClient(app) as client:
-        for user_id, token in (
-            ("waitlist-alice", alice_token),
-            ("waitlist-bob", bob_token),
-        ):
-            applied = client.post(
-                "/api/v1/creator/applications",
-                headers={"Authorization": f"Bearer {token}"},
-                json={
-                    "email": f"{user_id}@example.com",
-                    "message": "I want to create interactive clips.",
-                },
-            )
-            assert applied.status_code == 200
-            assert applied.json()["status"] == "pending"
-
-        processed = client.post(
-            "/internal/v1/creator/applications/invite",
-            headers=publish_headers,
-            json={"user_ids": ["waitlist-alice", "waitlist-bob"]},
-        )
-        repeated = client.post(
-            "/internal/v1/creator/applications/invite",
-            headers=publish_headers,
-            json={"user_ids": ["waitlist-alice"]},
-        )
-        wrong_account = client.post(
-            "/api/v1/creator/invites/redeem",
-            headers={"Authorization": f"Bearer {bob_token}"},
-            json={"code": delivered["waitlist-alice@example.com"]},
-        )
-        redeemed = client.post(
-            "/api/v1/creator/invites/redeem",
-            headers={"Authorization": f"Bearer {alice_token}"},
-            json={"code": delivered["waitlist-alice@example.com"]},
-        )
-
-    assert processed.status_code == 200
-    assert processed.json()["sent_count"] == 2
-    assert repeated.json()["skipped_count"] == 1
-    assert wrong_account.status_code == 400
-    assert redeemed.status_code == 200
-    db.expire_all()
-    alice_application = db.get(CreatorApplication, "waitlist-alice")
-    assert alice_application is not None
-    assert alice_application.status == "approved"
-    invites = db.query(CreatorInvite).order_by(CreatorInvite.id).all()
-    assert len(invites) == 2
-    assert {row.assigned_user_id for row in invites} == {
-        "waitlist-alice",
-        "waitlist-bob",
-    }
-    assert invites[0].redeemed_by_user_id == "waitlist-alice"
-
-
-def test_creator_waitlist_email_failure_rolls_back_invite_and_remains_retryable(
-    db,
-    monkeypatch,
-) -> None:
-    token = _login(db, user_id="waitlist-email-failure")
-
-    def fail_email(_settings, *, email: str, code: str) -> None:
-        del email, code
-        raise RuntimeError("smtp unavailable")
-
-    monkeypatch.setattr("app.routers.platform.send_creator_invite", fail_email)
     with TestClient(app) as client:
         applied = client.post(
             "/api/v1/creator/applications",
             headers={"Authorization": f"Bearer {token}"},
-            json={"email": "retry@example.com"},
+            json={"email": "waitlist-alice@example.com"},
         )
         processed = client.post(
             "/internal/v1/creator/applications/invite",
-            headers={"X-Publish-Key": "test-publish-key"},
-            json={"user_ids": ["waitlist-email-failure"]},
+            headers=publish_headers,
+            json={"user_ids": ["waitlist-alice"]},
+        )
+        decided = client.post(
+            "/internal/v1/creator/applications/waitlist-alice/decision",
+            headers=publish_headers,
+            json={"status": "rejected"},
         )
 
-    assert applied.status_code == 200
-    assert processed.status_code == 200
-    assert processed.json()["failed_count"] == 1
-    db.expire_all()
-    application = db.get(CreatorApplication, "waitlist-email-failure")
-    assert application is not None
-    assert application.status == "pending"
-    assert application.invite_id is None
-    assert "SMTP" in application.last_error
-    assert db.query(CreatorInvite).count() == 0
+    assert applied.status_code == 410
+    assert processed.status_code == 410
+    assert decided.status_code == 410
 
 
 def test_creator_upload_uses_resumable_shared_local_cache(db, monkeypatch, tmp_path) -> None:
@@ -360,31 +305,7 @@ def test_creator_upload_finalize_recovers_after_database_failure(
     get_settings.cache_clear()
 
 
-def test_single_character_invite_code_can_grant_creator_access(db) -> None:
-    token = _login(db, user_id="single-character-invite-user")
-    db.add(
-        CreatorInvite(
-            code_hash=_invite_hash("Q"),
-            code_hint="Q",
-            enabled=True,
-        )
-    )
-    db.commit()
-    headers = {"Authorization": f"Bearer {token}"}
-
-    with TestClient(app) as client:
-        redeemed = client.post(
-            "/api/v1/creator/invites/redeem",
-            headers=headers,
-            json={"code": "Q"},
-        )
-
-    assert redeemed.status_code == 200
-    assert redeemed.json()["granted"] is True
-    assert redeemed.json()["source"] == "invite"
-
-
-def test_operations_can_list_revoke_invites_and_revoke_redeemed_access(db) -> None:
+def test_operations_can_list_archived_invites_but_cannot_mutate_them(db) -> None:
     token = _login(db, user_id="invite-ops-user")
     auth = {"Authorization": f"Bearer {token}"}
     internal = {"X-Publish-Key": "test-publish-key"}
@@ -393,25 +314,12 @@ def test_operations_can_list_revoke_invites_and_revoke_redeemed_access(db) -> No
             "/internal/v1/creator/invites",
             headers=internal,
             json={"count": 2},
-        ).json()
+        )
         before = client.get("/internal/v1/creator/invites", headers=internal)
-        first_id = before.json()["items"][0]["id"]
-        second_id = before.json()["items"][1]["id"]
-        redeemed = client.post(
-            "/api/v1/creator/invites/redeem",
-            headers=auth,
-            json={"code": created["codes"][0]},
-        )
-        after_redeem = client.get(
-            "/internal/v1/creator/invites?status=redeemed",
-            headers=internal,
-        )
-        redeemed_id = after_redeem.json()["items"][0]["id"]
-        unused_id = second_id if redeemed_id == first_id else first_id
         revoked = client.post(
             "/internal/v1/creator/invites/revoke",
             headers=internal,
-            json={"invite_ids": [unused_id, redeemed_id, 999999]},
+            json={"invite_ids": [999999]},
         )
         access_revoked = client.post(
             "/internal/v1/creator/access/invite-ops-user/revoke",
@@ -420,14 +328,12 @@ def test_operations_can_list_revoke_invites_and_revoke_redeemed_access(db) -> No
         )
         access = client.get("/api/v1/creator/access", headers=auth)
 
-    assert before.json()["total"] == 2
-    assert redeemed.status_code == 200
-    assert after_redeem.json()["total"] == 1
-    assert revoked.json()["revoked_ids"] == [unused_id]
-    assert revoked.json()["skipped_redeemed_ids"] == [redeemed_id]
-    assert revoked.json()["missing_ids"] == [999999]
-    assert access_revoked.json()["granted"] is False
-    assert access.json()["granted"] is False
+    assert created.status_code == 410
+    assert before.status_code == 200
+    assert revoked.status_code == 410
+    assert access_revoked.status_code == 410
+    assert access.json()["granted"] is True
+    assert access.json()["source"] == "open_access"
 
 
 def test_creator_session_persists_version_fifo_and_restores_active_state(db) -> None:

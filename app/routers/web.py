@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import re
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import (
@@ -22,13 +24,15 @@ from sqlalchemy.orm import Session
 from app.auth_user import AppUser, issue_user_token
 from app.avatar_storage import AvatarStorageError, store_user_avatar
 from app.config import Settings, get_settings
-from app.credits import bind_referral_for_new_user
+from app.credits import bind_referral_for_new_user, get_referral_reward_config
 from app.db import get_db
 from app.google_auth import GoogleAuthUnavailable, verify_google_id_token
 from app.models import (
+    AppHandoffCode,
     AppVersion,
     PublishedVideo,
     PublishedVideoSeo,
+    ReferralBinding,
     ReferralInvite,
     SocialNotification,
     User,
@@ -38,6 +42,7 @@ from app.models import (
 )
 from app.public_origin import canonicalize_public_url
 from app.schemas_web import (
+    WebAppHandoffOut,
     WebCodeSentOut,
     WebConfigOut,
     WebCreatorConfigOut,
@@ -48,6 +53,7 @@ from app.schemas_web import (
     WebProfileUpdateRequest,
     WebPublicationOut,
     WebPublicationPageOut,
+    WebReferralSnapshotOut,
     WebSessionOut,
     WebSocialConfigOut,
 )
@@ -138,11 +144,26 @@ def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
     )
 
 
+def _referral_snapshot(db: Session, user_id: str) -> WebReferralSnapshotOut | None:
+    binding = db.get(ReferralBinding, user_id)
+    if binding is None:
+        return None
+    return WebReferralSnapshotOut(
+        config_version=binding.config_version,
+        inviter_activation_reward_credits=binding.inviter_reward_credits,
+        invitee_registration_reward_credits=binding.invitee_reward_credits,
+    )
+
+
 def _session(db: Session, settings: Settings, user: AppUser) -> WebSessionOut:
     row = db.get(User, user.user_id)
     if row is None:
         return WebSessionOut(authenticated=False)
-    return WebSessionOut(authenticated=True, user=_profile(db, settings, row))
+    return WebSessionOut(
+        authenticated=True,
+        user=_profile(db, settings, row),
+        referral=_referral_snapshot(db, row.user_id),
+    )
 
 
 def _login(
@@ -166,7 +187,37 @@ def _login(
         session_token=session.token,
         csrf_token=new_csrf_token(),
     )
-    return WebSessionOut(authenticated=True, user=_profile(db, settings, user))
+    return WebSessionOut(
+        authenticated=True,
+        user=_profile(db, settings, user),
+        referral=_referral_snapshot(db, user.user_id),
+    )
+
+
+@router.post("/auth/app-handoff", response_model=WebAppHandoffOut)
+def create_app_handoff(
+    request: Request,
+    user: Annotated[AppUser, Depends(require_web_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> WebAppHandoffOut:
+    verify_web_csrf(request)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=5)
+    raw = secrets.token_urlsafe(32)
+    db.add(
+        AppHandoffCode(
+            code_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            user_id=user.user_id,
+            created_at=now,
+            expires_at=expires_at,
+        )
+    )
+    db.commit()
+    return WebAppHandoffOut(
+        code=raw,
+        open_uri=f"pixo://handoff/{raw}",
+        expires_at=expires_at.isoformat(),
+    )
 
 
 @router.get("/config", response_model=WebConfigOut)
@@ -502,14 +553,27 @@ def referral_landing_page(
     if invite is None:
         raise HTTPException(status_code=404, detail="invite not found")
     android = db.get(AppVersion, "android")
+    reward_config = get_referral_reward_config(db)
     store_url = (android.store_url if android is not None else "").strip()
     safe_code = html.escape(normalized)
     safe_store_url = html.escape(store_url, quote=True)
     open_uri = html.escape(f"pixo://invite/{normalized}", quote=True)
+    login_url = html.escape(f"/login?invite={normalized}", quote=True)
+    reward_lines = []
+    if reward_config.invitee_registration_reward_credits > 0:
+        reward_lines.append(
+            f"Get {reward_config.invitee_registration_reward_credits} Credits when you create your account."
+        )
+    if reward_config.inviter_activation_reward_credits > 0:
+        reward_lines.append(
+            f"Your friend gets {reward_config.inviter_activation_reward_credits} Credits after your first Pixo App sign-in."
+        )
+    reward_copy = " ".join(reward_lines) or "Join your friend and start creating together."
     return HTMLResponse(
+        headers={"Cache-Control": "no-store"},
         content=f"""<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join Pixo</title>
 <style>body{{margin:0;background:#0d100d;color:#f0f3eb;font:16px Inter,Arial,sans-serif}}main{{max-width:390px;min-height:100vh;margin:auto;box-sizing:border-box;padding:52px 24px;background:radial-gradient(circle at top,#1c2812,#0d100d 55%)}}.tag{{color:#c8ff3d;font-size:12px;letter-spacing:.12em;text-transform:uppercase}}h1{{font-size:34px;line-height:1.08;margin:14px 0}}p{{color:#8e9888;line-height:1.5}}.card{{margin-top:28px;padding:20px;border:1px solid #3a4237;border-radius:18px;background:#141a12}}input,button,a{{box-sizing:border-box;width:100%;border-radius:12px;font:inherit}}input{{padding:14px;margin:8px 0;background:#0d100d;color:#f0f3eb;border:1px solid #3a4237}}button,a{{display:block;padding:14px;border:0;text-align:center;text-decoration:none;font-weight:700}}button{{background:#c8ff3d;color:#10140b;cursor:pointer}}a{{margin-top:10px;background:#20281d;color:#f0f3eb}}#code{{display:none}}#message{{min-height:24px;font-size:13px}}</style>
-<main><div class=\"tag\">Pixo invite</div><h1>Create together.</h1><p>Create a new Pixo account with this invitation, then sign in to the Android app to activate the invitation.</p><section class=\"card\"><div id=\"step1\"><label>Email<input id=\"email\" type=\"email\" autocomplete=\"email\" placeholder=\"you@example.com\"></label><button id=\"send\">Send code</button></div><div id=\"code\"><label>6-digit code<input id=\"otp\" inputmode=\"numeric\" maxlength=\"6\"></label><button id=\"verify\">Create account</button></div><p id=\"message\"></p><div id=\"finish\" hidden><a href=\"{open_uri}\">Open Pixo</a>{f'<a href="{safe_store_url}">Download Pixo for Android</a>' if safe_store_url else ''}</div></section></main>
-<script>const invite={safe_code!r};const message=document.querySelector('#message');const csrf=()=>document.cookie.split('; ').find(x=>x.startsWith('pixo_web_csrf='))?.split('=')[1]||'';async function api(path,body){{await fetch('/api/v1/web/auth/session',{{credentials:'same-origin'}});const r=await fetch(path,{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json','X-Pixo-CSRF':csrf()}},body:JSON.stringify(body)}});const d=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(typeof d.detail==='string'?d.detail:'Please try again.');return d}}document.querySelector('#send').onclick=async()=>{{try{{await api('/api/v1/web/auth/email/send-code',{{email:document.querySelector('#email').value}});document.querySelector('#code').style.display='block';message.textContent='Check your email for the six-digit code.'}}catch(e){{message.textContent=e.message}}}};document.querySelector('#verify').onclick=async()=>{{try{{await api('/api/v1/web/auth/email/verify',{{email:document.querySelector('#email').value,code:document.querySelector('#otp').value,invite_code:invite}});document.querySelector('#finish').hidden=false;message.textContent='Account created. Sign in to Pixo with this same email to activate the invite.'}}catch(e){{message.textContent=e.message}}}};</script></html>"""
+<main><div class=\"tag\">Pixo invite</div><h1>Create together.</h1><p>{html.escape(reward_copy)}</p><section class=\"card\"><div id=\"step1\"><label>Email<input id=\"email\" type=\"email\" autocomplete=\"email\" placeholder=\"you@example.com\"></label><button id=\"send\">Send code</button><a href=\"{login_url}\">Continue with email or Google</a></div><div id=\"code\"><label>6-digit code<input id=\"otp\" inputmode=\"numeric\" maxlength=\"6\"></label><button id=\"verify\">Create account</button></div><p id=\"message\"></p><div id=\"finish\" hidden><a id=\"open-app\" href=\"{open_uri}\">Open Pixo</a>{f'<a href="{safe_store_url}">Download Pixo for Android</a>' if safe_store_url else ''}</div></section></main>
+<script>const invite={safe_code!r};const message=document.querySelector('#message');const finish=document.querySelector('#finish');const openApp=document.querySelector('#open-app');const csrf=()=>document.cookie.split('; ').find(x=>x.startsWith('pixo_web_csrf='))?.split('=')[1]||'';async function api(path,body={{}}){{await fetch('/api/v1/web/auth/session',{{credentials:'same-origin'}});const r=await fetch(path,{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json','X-Pixo-CSRF':csrf()}},body:JSON.stringify(body)}});const d=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(typeof d.detail==='string'?d.detail:'Please try again.');return d}}async function handoff(snapshot){{const h=await api('/api/v1/web/auth/app-handoff');openApp.href=h.open_uri;finish.hidden=false;const amount=snapshot?.invitee_registration_reward_credits||0;message.textContent=amount>0?`Account created. ${{amount}} Credits have been added.`:'Account created. Open Pixo to continue.'}}document.querySelector('#send').onclick=async()=>{{try{{await api('/api/v1/web/auth/email/send-code',{{email:document.querySelector('#email').value}});document.querySelector('#code').style.display='block';message.textContent='Check your email for the six-digit code.'}}catch(e){{message.textContent=e.message}}}};document.querySelector('#verify').onclick=async()=>{{try{{const session=await api('/api/v1/web/auth/email/verify',{{email:document.querySelector('#email').value,code:document.querySelector('#otp').value,invite_code:invite}});await handoff(session.referral)}}catch(e){{message.textContent=e.message}}}};if(new URLSearchParams(location.search).get('registered')==='1'){{handoff().catch(e=>message.textContent=e.message)}}</script></html>"""
     )

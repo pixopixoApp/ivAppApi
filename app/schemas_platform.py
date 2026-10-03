@@ -92,7 +92,7 @@ class CreatorCapabilitiesOut(BaseModel):
     ai_source_duration_seconds: int = 3
     ai_ending_duration_seconds: int = 3
     credit_per_generated_second: int = 1
-    referral_reward_credits: int = 10
+    referral_reward_credits: int = 5
     supported_interactions: list[CreatorInteractionCapabilityOut] = Field(default_factory=list)
     interaction_presets: list[CreatorInteractionPresetOut] = Field(default_factory=list)
 
@@ -423,3 +423,41 @@ class ReferralInviteOut(BaseModel):
     code: str
     url: str
     status: Literal["none", "pending_activation", "activated"] = "none"
+    config_version: int = 1
+    inviter_activation_reward_credits: int = 5
+    invitee_registration_reward_credits: int = 5
+    locked_inviter_activation_reward_credits: int | None = None
+    locked_invitee_registration_reward_credits: int | None = None
+
+
+class ReferralPreviewOut(BaseModel):
+    code: str
+    valid: bool = True
+    config_version: int
+    inviter_activation_reward_credits: int
+    invitee_registration_reward_credits: int
+
+
+class ReferralRewardConfigUpdate(BaseModel):
+    inviter_activation_reward_credits: int = Field(ge=0, le=1000)
+    invitee_registration_reward_credits: int = Field(ge=0, le=1000)
+    updated_by: str = Field(min_length=1, max_length=128)
+
+
+class ReferralRewardConfigOut(ReferralRewardConfigUpdate):
+    version: int
+    updated_at: str
+
+
+class AppHandoffExchangeRequest(BaseModel):
+    code: str = Field(min_length=20, max_length=256)
+
+
+class AppHandoffExchangeOut(BaseModel):
+    token: str
+    user_id: str
+    email: str = ""
+    expires_at: str
+    needs_birthday: bool
+    birthday: str = ""
+    is_under_13: bool | None = None

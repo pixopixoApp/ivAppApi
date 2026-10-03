@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
+from app.credits import balance
 from app.main import app
 from app.models import (
+    AppHandoffCode,
     CreatorAccessGrant,
     EmailCode,
     PublishedVideo,
@@ -153,35 +155,105 @@ def test_web_invite_binds_only_a_new_web_account_pending_android_activation(db) 
                 "invite_code": invite.json()["code"],
             },
         )
+        handoff = client.post("/api/v1/web/auth/app-handoff", headers=_csrf(client), json={})
+
+    with TestClient(app) as client:
+        exchanged = client.post(
+            "/api/v1/app-handoff/exchange",
+            json={"code": handoff.json()["code"]},
+        )
+        replayed = client.post(
+            "/api/v1/app-handoff/exchange",
+            json={"code": handoff.json()["code"]},
+        )
 
     assert invite.status_code == 200
     assert landing.status_code == 200
+    assert landing.headers["cache-control"] == "no-store"
+    assert "Get 5 Credits" in landing.text
     assert 'pixo://invite/' in landing.text
     assert verified.status_code == 200
+    assert verified.json()["referral"]["invitee_registration_reward_credits"] == 5
+    assert handoff.status_code == 200
+    assert exchanged.status_code == 200
+    assert replayed.status_code == 400
     invitee = db.query(User).filter_by(subject="new-invite@example.com").one()
     binding = db.get(ReferralBinding, invitee.user_id)
     assert binding is not None
     assert binding.inviter_user_id == "inviter"
-    assert binding.status == "pending_activation"
+    assert binding.status == "activated"
+    assert balance(db, invitee.user_id) == 5
+    assert balance(db, "inviter") == 5
 
 
-def test_creator_access_modes_create_permanent_cross_client_grants(db, monkeypatch) -> None:
-    _, token = _identity(db, "policy-user")
-    monkeypatch.setenv("CREATOR_ACCESS_MODE", "web_open")
+def test_expired_app_handoff_cannot_be_exchanged(db) -> None:
+    _, token = _identity(db, "expired-handoff")
+    with _web_client(token) as client:
+        handoff = client.post(
+            "/api/v1/web/auth/app-handoff",
+            headers=_csrf(client),
+            json={},
+        )
+
+    row = db.query(AppHandoffCode).one()
+    row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db.commit()
+
+    with TestClient(app) as client:
+        exchanged = client.post(
+            "/api/v1/app-handoff/exchange",
+            json={"code": handoff.json()["code"]},
+        )
+
+    assert handoff.status_code == 200
+    assert exchanged.status_code == 400
+    assert exchanged.json()["detail"] == "handoff code is invalid or expired"
+
+
+def test_web_google_invite_registration_gets_locked_reward(db, monkeypatch) -> None:
+    monkeypatch.setenv("WEB_GOOGLE_CLIENT_ID", "web-client-id")
     get_settings.cache_clear()
+    monkeypatch.setattr(
+        "app.routers.web.verify_google_id_token",
+        lambda **_kwargs: SimpleNamespace(subject="google-invitee", email="invitee@gmail.com"),
+    )
+    _, inviter_token = _identity(db, "google-inviter")
+    with TestClient(app) as client:
+        invite = client.get(
+            "/api/v1/referrals/me",
+            headers={"Authorization": f"Bearer {inviter_token}"},
+        ).json()
+    with _web_client() as client:
+        registered = client.post(
+            "/api/v1/web/auth/google",
+            headers=_csrf(client),
+            json={"credential": "verified-token", "invite_code": invite["code"]},
+        )
+
+    assert registered.status_code == 200
+    assert registered.json()["referral"]["invitee_registration_reward_credits"] == 5
+    invitee = db.query(User).filter_by(provider="google", subject="google-invitee").one()
+    binding = db.get(ReferralBinding, invitee.user_id)
+    assert binding is not None
+    assert binding.config_version == 1
+    assert balance(db, invitee.user_id) == 5
+
+
+def test_creator_access_is_open_and_persists_across_clients(db) -> None:
+    _, token = _identity(db, "policy-user")
     with _web_client(token) as client:
         web_access = client.get("/api/v1/creator/access")
     assert web_access.json()["granted"] is True
-    assert web_access.json()["source"] == "web_open"
+    assert web_access.json()["source"] == "open_access"
 
-    monkeypatch.setenv("CREATOR_ACCESS_MODE", "invite")
-    get_settings.cache_clear()
     with TestClient(app) as client:
         android_access = client.get(
             "/api/v1/creator/access",
             headers={"Authorization": f"Bearer {token}"},
         )
     assert android_access.json()["granted"] is True
+    assert android_access.json()["source"] == "open_access"
+    assert db.query(CreatorAccessGrant).filter_by(user_id="policy-user").count() == 1
     assert db.get(CreatorAccessGrant, "policy-user") is not None
 
 
@@ -202,7 +274,7 @@ def test_web_session_can_read_shared_credits_referral_and_creator_capabilities(d
     body = capabilities.json()
     assert body["creator_contract_version"] == "2"
     assert body["credit_per_generated_second"] == 1
-    assert body["referral_reward_credits"] == 10
+    assert body["referral_reward_credits"] == 5
     assert len(body["supported_interactions"]) == 37
     assert {item["type"] for item in body["supported_interactions"]} == set(
         creator_supported_gestures()

@@ -15,6 +15,7 @@ from app.models import (
     CreatorUpload,
     CreatorVersion,
     CreditLedgerEntry,
+    CreditReservation,
     MediaObject,
     User,
     UserToken,
@@ -22,7 +23,12 @@ from app.models import (
 from app.worker import process_next_expired_source, process_source_generation
 
 
-def _creator(db, user_id: str = "text-video-user") -> tuple[str, dict[str, str]]:
+def _creator(
+    db,
+    user_id: str = "text-video-user",
+    *,
+    credits: int = 0,
+) -> tuple[str, dict[str, str]]:
     now = datetime.now(timezone.utc)
     token = f"token-{user_id}"
     db.add_all(
@@ -37,6 +43,18 @@ def _creator(db, user_id: str = "text-video-user") -> tuple[str, dict[str, str]]
             CreatorAccessGrant(user_id=user_id, source="test", granted_at=now),
         ]
     )
+    if credits:
+        db.add(
+            CreditLedgerEntry(
+                id=f"test-credit-{user_id}",
+                user_id=user_id,
+                kind="test_grant",
+                amount=credits,
+                reference_id=f"test:{user_id}",
+                note="test-only credit grant",
+                created_at=now,
+            )
+        )
     db.commit()
     return user_id, {"Authorization": f"Bearer {token}"}
 
@@ -70,9 +88,31 @@ def test_prompt_creation_is_disabled_by_default(db, monkeypatch) -> None:
     assert db.query(CreatorCreation).count() == 0
 
 
+def test_prompt_creation_requires_credits_without_creating_a_hold(db, monkeypatch) -> None:
+    _enable(monkeypatch)
+    user_id, headers = _creator(db, "unfunded-source-user")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/creator/creations",
+            headers=headers,
+            json={
+                "source_mode": "prompt",
+                "prompt": "An unfunded source video request",
+                "request_id": "unfunded-source-request",
+            },
+        )
+
+    assert response.status_code == 402
+    assert response.json()["detail"]["code"] == "INSUFFICIENT_CREDITS"
+    assert db.query(CreatorCreation).filter_by(user_id=user_id).count() == 0
+    assert db.query(CreditReservation).filter_by(user_id=user_id).count() == 0
+    assert db.query(CreditLedgerEntry).filter_by(user_id=user_id).count() == 0
+
+
 def test_prompt_creation_waits_for_source_confirmation(db, monkeypatch) -> None:
     _enable(monkeypatch)
-    user_id, headers = _creator(db)
+    user_id, headers = _creator(db, credits=5)
 
     with TestClient(app) as client:
         created = client.post(
@@ -356,7 +396,7 @@ def test_credits_allow_fourth_provider_attempt_without_hidden_daily_cap(db, monk
 
 def test_paid_source_regeneration_keeps_previous_ready_preview(db, monkeypatch) -> None:
     _enable(monkeypatch)
-    user_id, headers = _creator(db, "regenerate-preview-user")
+    user_id, headers = _creator(db, "regenerate-preview-user", credits=5)
     now = datetime.now(timezone.utc)
     with TestClient(app) as client:
         created = client.post(

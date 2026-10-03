@@ -89,7 +89,7 @@ def test_high_side_effect_operations_have_safe_contract_coverage(db) -> None:
                 headers=applicant_auth,
                 json={"message": "contract coverage"},
             ),
-            200,
+            410,
         )
         _assert_safe(
             client.post(
@@ -97,7 +97,7 @@ def test_high_side_effect_operations_have_safe_contract_coverage(db) -> None:
                 headers=PUBLISH_HEADERS,
                 json={"status": "approved"},
             ),
-            200,
+            410,
         )
 
         for method, path in (

@@ -17,7 +17,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.account_deletion import AccountDeletionUnavailable, delete_account_data
-from app.auth_user import AppUser, require_bearer_user
+from app.auth_user import AppUser, issue_user_token, require_bearer_user
 from app.cdn_cache import enqueue_prefetch, private_media_delivery_url
 from app.cdn_publication import (
     CdnPublicationError,
@@ -34,20 +34,21 @@ from app.creator_interaction_presets import (
 )
 from app.creator_manual_edits import SUSTAINED, compile_edits, manual_edit_options
 from app.credits import (
-    REFERRAL_CREDITS,
     InsufficientCredits,
+    activate_referral_from_android,
     ensure_referral_invite,
-    grant_welcome_credit,
+    get_referral_reward_config,
+    update_referral_reward_config,
 )
 from app.credits import balance as credit_balance
 from app.credits import release_reference as release_credit_reference
 from app.credits import reserve as reserve_credits
 from app.db import get_db
 from app.deps import require_publish_key
-from app.mail import send_creator_invite
 from app.media_cache import local_path_for_sha256
 from app.media_service import MediaServiceError, media_mode_is_oss
 from app.models import (
+    AppHandoffCode,
     AppVersion,
     CdnPublicationGate,
     CreatorAccessGrant,
@@ -62,6 +63,7 @@ from app.models import (
     PublishedVideo,
     PublishedVideoSeo,
     ReferralBinding,
+    ReferralInvite,
     User,
 )
 from app.oss_storage import OssStorageError
@@ -83,6 +85,8 @@ from app.publication_service import RuntimeSourceAsset, publish_runtime_assets
 from app.schemas_platform import (
     AccountDeletionRequest,
     AccountDeletionResponse,
+    AppHandoffExchangeOut,
+    AppHandoffExchangeRequest,
     AppUpdateCheckRequest,
     AppUpdateCheckResponse,
     AppVersionOut,
@@ -92,7 +96,6 @@ from app.schemas_platform import (
     CreatorApplicationDecisionRequest,
     CreatorApplicationInviteRequest,
     CreatorApplicationInviteResponse,
-    CreatorApplicationInviteResult,
     CreatorApplicationOut,
     CreatorApplicationRequest,
     CreatorCapabilitiesOut,
@@ -124,10 +127,14 @@ from app.schemas_platform import (
     InviteRevokeResponse,
     Platform,
     ReferralInviteOut,
+    ReferralPreviewOut,
+    ReferralRewardConfigOut,
+    ReferralRewardConfigUpdate,
 )
 from app.seo import ensure_seo_row
 from app.share_urls import published_share_url, runtime_experience_url
 from app.storage import LocalMediaStorage, StorageError
+from app.users import is_under_13, needs_birthday
 from app.verification_codes import PURPOSE_DEACTIVATE, find_valid_code
 from app.video_probe import VideoProbeError, probe_video
 from app.web_session import require_app_or_web_user, require_creator_user
@@ -210,10 +217,6 @@ def _reserve_source_credits(
     user_id: str,
     generation_id: str,
 ) -> None:
-    # The Alembic migration backfills historic users. This idempotent fallback
-    # also protects a deployment where a creator request races the backfill.
-    grant_welcome_credit(db, user_id)
-    db.flush()
     cost = max(1, settings.creator_video_duration_seconds)
     try:
         reserve_credits(
@@ -311,14 +314,84 @@ def get_credits(
 def get_my_referral_invite(
     user: Annotated[AppUser, Depends(require_app_or_web_user)],
     db: Annotated[Session, Depends(get_db)],
+    response: Response,
 ) -> ReferralInviteOut:
     invite = ensure_referral_invite(db, user.user_id)
     binding = db.get(ReferralBinding, user.user_id)
+    config = get_referral_reward_config(db)
+    response.headers["Cache-Control"] = "no-store"
     db.commit()
     return ReferralInviteOut(
         code=invite.code,
         url=f"https://www.pixopixo.com/invite/{invite.code}",
         status=(binding.status if binding is not None else "none"),
+        config_version=config.version,
+        inviter_activation_reward_credits=config.inviter_activation_reward_credits,
+        invitee_registration_reward_credits=config.invitee_registration_reward_credits,
+        locked_inviter_activation_reward_credits=(binding.inviter_reward_credits if binding else None),
+        locked_invitee_registration_reward_credits=(binding.invitee_reward_credits if binding else None),
+    )
+
+
+@public_router.get("/referrals/preview/{code}", response_model=ReferralPreviewOut)
+def preview_referral_invite(
+    code: str,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+) -> ReferralPreviewOut:
+    normalized = code.strip().upper()
+    invite = db.query(ReferralInvite).filter(ReferralInvite.code == normalized).one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=404, detail="invite not found")
+    config = get_referral_reward_config(db)
+    response.headers["Cache-Control"] = "no-store"
+    return ReferralPreviewOut(
+        code=invite.code,
+        config_version=config.version,
+        inviter_activation_reward_credits=config.inviter_activation_reward_credits,
+        invitee_registration_reward_credits=config.invitee_registration_reward_credits,
+    )
+
+
+@public_router.post("/app-handoff/exchange", response_model=AppHandoffExchangeOut)
+def exchange_app_handoff(
+    payload: AppHandoffExchangeRequest,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AppHandoffExchangeOut:
+    now = _now()
+    digest = hashlib.sha256(payload.code.strip().encode("utf-8")).hexdigest()
+    row = (
+        db.query(AppHandoffCode)
+        .filter(AppHandoffCode.code_hash == digest)
+        .with_for_update()
+        .one_or_none()
+    )
+    expires_at = row.expires_at if row is not None else None
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if row is None or row.used_at is not None or expires_at is None or expires_at <= now:
+        raise HTTPException(status_code=400, detail="handoff code is invalid or expired")
+    user = db.get(User, row.user_id)
+    if user is None or not user.enabled:
+        raise HTTPException(status_code=400, detail="handoff account is unavailable")
+    row.used_at = now
+    activate_referral_from_android(db, user.user_id)
+    session = issue_user_token(
+        db,
+        user_id=user.user_id,
+        token_ttl_days=settings.token_ttl_days,
+        now=now,
+    )
+    db.commit()
+    return AppHandoffExchangeOut(
+        token=session.token,
+        user_id=user.user_id,
+        email=user.subject if user.provider == "email" else "",
+        expires_at=session.expires_at.isoformat(),
+        needs_birthday=needs_birthday(user),
+        birthday=user.birthday or "",
+        is_under_13=is_under_13(user),
     )
 
 
@@ -614,6 +687,46 @@ def get_app_version(
     )
 
 
+@operations_router.get(
+    "/referral-rewards",
+    response_model=ReferralRewardConfigOut,
+    dependencies=[Depends(require_publish_key)],
+)
+def get_referral_reward_policy(
+    db: Annotated[Session, Depends(get_db)],
+) -> ReferralRewardConfigOut:
+    row = get_referral_reward_config(db)
+    db.commit()
+    return ReferralRewardConfigOut(
+        version=row.version,
+        inviter_activation_reward_credits=row.inviter_activation_reward_credits,
+        invitee_registration_reward_credits=row.invitee_registration_reward_credits,
+        updated_by=row.updated_by,
+        updated_at=_iso(row.updated_at),
+    )
+
+
+@operations_router.put(
+    "/referral-rewards",
+    response_model=ReferralRewardConfigOut,
+    dependencies=[Depends(require_publish_key)],
+)
+def put_referral_reward_policy(
+    payload: ReferralRewardConfigUpdate,
+    db: Annotated[Session, Depends(get_db)],
+) -> ReferralRewardConfigOut:
+    row = update_referral_reward_config(db, **payload.model_dump())
+    db.commit()
+    db.refresh(row)
+    return ReferralRewardConfigOut(
+        version=row.version,
+        inviter_activation_reward_credits=row.inviter_activation_reward_credits,
+        invitee_registration_reward_credits=row.invitee_registration_reward_credits,
+        updated_by=row.updated_by,
+        updated_at=_iso(row.updated_at),
+    )
+
+
 _TOUCH_INTERACTIONS = frozenset({
     "tap", "double_tap", "rapid_tap", "multi_tap", "hold", "hold_charge",
     "swipe_left", "swipe_right", "swipe_up", "swipe_down",
@@ -646,6 +759,7 @@ def get_creator_capabilities(
 ) -> CreatorCapabilitiesOut:
     _require_creator(db, user)
     source_enabled = bool(settings.creator_text_to_video_enabled)
+    referral_config = get_referral_reward_config(db)
     return CreatorCapabilitiesOut(
         creator_contract_version="2",
         ai_source_enabled=source_enabled,
@@ -653,7 +767,7 @@ def get_creator_capabilities(
         ai_source_duration_seconds=settings.creator_video_duration_seconds,
         ai_ending_duration_seconds=settings.creator_video_duration_seconds,
         credit_per_generated_second=1,
-        referral_reward_credits=REFERRAL_CREDITS,
+        referral_reward_credits=referral_config.inviter_activation_reward_credits,
         supported_interactions=[
             {
                 "type": gesture,
@@ -696,56 +810,8 @@ def redeem_creator_invite(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorAccessOut:
-    existing = _access_grant(db, user.user_id)
-    if existing is not None:
-        return CreatorAccessOut(
-            granted=True,
-            source=existing.source,
-            granted_at=_iso(existing.granted_at),
-            video_generation=_generation_quota_out(db, user.user_id, settings),
-        )
-    normalized = _normalize_invite(payload.code)
-    if not normalized:
-        raise HTTPException(status_code=400, detail="invalid invite code")
-    invite = (
-        db.query(CreatorInvite)
-        .filter(CreatorInvite.code_hash == _invite_hash(normalized))
-        .with_for_update()
-        .one_or_none()
-    )
-    if invite is None or not invite.enabled or invite.redeemed_by_user_id:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="invite code is invalid or already used")
-    if invite.assigned_user_id and invite.assigned_user_id != user.user_id:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="invite code is assigned to another account")
-    now = _now()
-    invite.redeemed_by_user_id = user.user_id
-    invite.redeemed_at = now
-    grant = CreatorAccessGrant(
-        user_id=user.user_id,
-        source="invite",
-        invite_id=invite.id,
-        granted_at=now,
-    )
-    db.add(grant)
-    application = db.get(CreatorApplication, user.user_id)
-    if application is not None:
-        if application.invite_id and application.invite_id != invite.id:
-            previous = db.get(CreatorInvite, application.invite_id)
-            if previous is not None and not previous.redeemed_by_user_id:
-                previous.enabled = False
-        application.invite_id = invite.id
-        application.status = "approved"
-        application.last_error = ""
-        application.updated_at = now
-    db.commit()
-    return CreatorAccessOut(
-        granted=True,
-        source="invite",
-        granted_at=_iso(now),
-        video_generation=_generation_quota_out(db, user.user_id, settings),
-    )
+    del payload, user, db, settings
+    raise HTTPException(status_code=410, detail="creator access codes are retired")
 
 
 @creator_router.post("/applications", response_model=CreatorApplicationOut)
@@ -754,40 +820,8 @@ def apply_for_creator_access(
     user: Annotated[AppUser, Depends(require_creator_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorApplicationOut:
-    if _access_grant(db, user.user_id) is not None:
-        raise HTTPException(status_code=409, detail="creator access already granted")
-    now = _now()
-    email = _creator_application_email(payload.email, user)
-    row = db.get(CreatorApplication, user.user_id)
-    if row is None:
-        row = CreatorApplication(
-            user_id=user.user_id,
-            email=email,
-            message=payload.message.strip(),
-            status="pending",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(row)
-    elif row.status == "pending":
-        row.email = email
-        row.message = payload.message.strip()
-        row.last_error = ""
-        row.updated_at = now
-    elif row.status == "rejected":
-        row.email = email
-        row.message = payload.message.strip()
-        row.status = "pending"
-        row.invite_id = None
-        row.invited_at = None
-        row.email_sent_at = None
-        row.last_error = ""
-        row.updated_at = now
-    else:
-        raise HTTPException(status_code=409, detail="creator application is already being processed")
-    db.commit()
-    db.refresh(row)
-    return _creator_application_out(db, row)
+    del payload, user, db
+    raise HTTPException(status_code=410, detail="creator access applications are retired")
 
 
 @operations_router.post(
@@ -799,13 +833,8 @@ def create_creator_invites(
     payload: InviteCreateRequest,
     db: Annotated[Session, Depends(get_db)],
 ) -> InviteCreateResponse:
-    codes: list[str] = []
-    while len(codes) < payload.count:
-        code, invite = _new_creator_invite(db)
-        db.add(invite)
-        codes.append(code)
-    db.commit()
-    return InviteCreateResponse(codes=codes)
+    del payload, db
+    raise HTTPException(status_code=410, detail="creator access codes are retired")
 
 
 def _invite_status(row: CreatorInvite) -> Literal["unused", "redeemed", "revoked"]:
@@ -917,31 +946,8 @@ def revoke_creator_invites(
     payload: InviteRevokeRequest,
     db: Annotated[Session, Depends(get_db)],
 ) -> InviteRevokeResponse:
-    requested = list(dict.fromkeys(payload.invite_ids))
-    rows = (
-        db.query(CreatorInvite)
-        .filter(CreatorInvite.id.in_(requested))
-        .with_for_update()
-        .all()
-    )
-    by_id = {row.id: row for row in rows}
-    revoked: list[int] = []
-    skipped: list[int] = []
-    for invite_id in requested:
-        row = by_id.get(invite_id)
-        if row is None:
-            continue
-        if row.redeemed_by_user_id:
-            skipped.append(invite_id)
-            continue
-        row.enabled = False
-        revoked.append(invite_id)
-    db.commit()
-    return InviteRevokeResponse(
-        revoked_ids=revoked,
-        skipped_redeemed_ids=skipped,
-        missing_ids=[invite_id for invite_id in requested if invite_id not in by_id],
-    )
+    del payload, db
+    raise HTTPException(status_code=410, detail="creator access codes are retired")
 
 
 @operations_router.post(
@@ -953,57 +959,8 @@ def revoke_creator_access(
     user_id: str,
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorAccessRevokeResponse:
-    uid = user_id.strip()
-    if db.get(User, uid) is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    db.query(CreatorAccessGrant).filter(CreatorAccessGrant.user_id == uid).delete()
-    active = (
-        db.query(CreatorCreation)
-        .filter(
-            CreatorCreation.user_id == uid,
-            CreatorCreation.status.in_(_ACTIVE_CREATION_STATUSES),
-        )
-        .all()
-    )
-    creation_ids = [row.id for row in active]
-    for row in active:
-        row.cancel_requested = True
-    if creation_ids:
-        for version in (
-            db.query(CreatorVersion)
-            .filter(
-                CreatorVersion.creation_id.in_(creation_ids),
-                CreatorVersion.status.in_(_ACTIVE_VERSION_STATUSES),
-            )
-            .all()
-        ):
-            version.cancel_requested = True
-        for generation in (
-            db.query(CreatorSourceGeneration)
-            .filter(
-                CreatorSourceGeneration.creation_id.in_(creation_ids),
-                CreatorSourceGeneration.status.in_(("queued", "running")),
-            )
-            .all()
-        ):
-            if generation.status == "queued" and not generation.ivadmin_job_id:
-                generation.status = "cancelled"
-                generation.progress_stage = "cancelled"
-                if generation.quota_state == "reserved":
-                    generation.quota_state = "released"
-                release_credit_reference(
-                    db,
-                    user_id=generation.user_id,
-                    reference_id=f"source:{generation.id}",
-                )
-            else:
-                generation.cancel_requested = True
-    db.commit()
-    return CreatorAccessRevokeResponse(
-        user_id=uid,
-        granted=False,
-        cancelled_creation_ids=creation_ids,
-    )
+    del user_id, db
+    raise HTTPException(status_code=410, detail="creator access revocation is retired")
 
 
 @operations_router.get(
@@ -1032,98 +989,8 @@ def invite_creator_applicants(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> CreatorApplicationInviteResponse:
-    requested = list(
-        dict.fromkeys(user_id.strip() for user_id in payload.user_ids if user_id.strip())
-    )
-    if not requested:
-        raise HTTPException(status_code=400, detail="at least one user_id is required")
-    results: list[CreatorApplicationInviteResult] = []
-    for user_id in requested:
-        row = (
-            db.query(CreatorApplication)
-            .filter(CreatorApplication.user_id == user_id)
-            .with_for_update()
-            .one_or_none()
-        )
-        if row is None:
-            results.append(CreatorApplicationInviteResult(
-                user_id=user_id,
-                status="failed",
-                error="Creator application not found.",
-            ))
-            db.rollback()
-            continue
-        if row.status != "pending" or row.invite_id:
-            results.append(CreatorApplicationInviteResult(
-                user_id=user_id,
-                email=row.email,
-                status="skipped",
-                application_status=row.status,
-                invite_id=row.invite_id,
-                error="This application has already been processed.",
-            ))
-            db.rollback()
-            continue
-        try:
-            email = _creator_application_email(row.email)
-        except HTTPException as exc:
-            row.last_error = str(exc.detail)
-            row.updated_at = _now()
-            db.commit()
-            results.append(CreatorApplicationInviteResult(
-                user_id=user_id,
-                email=row.email,
-                status="failed",
-                application_status=row.status,
-                error=str(exc.detail),
-            ))
-            continue
-
-        code, invite = _new_creator_invite(db, assigned_user_id=user_id)
-        db.add(invite)
-        db.flush()
-        now = _now()
-        row.invite_id = invite.id
-        row.status = "invited"
-        row.invited_at = now
-        row.email_sent_at = now
-        row.last_error = ""
-        row.updated_at = now
-        try:
-            send_creator_invite(settings, email=email, code=code)
-        # Any delivery failure must roll back the assigned one-time code so the
-        # application remains retryable by operations.
-        except Exception:  # noqa: BLE001
-            db.rollback()
-            failed = db.get(CreatorApplication, user_id)
-            if failed is not None:
-                failed.last_error = "Email could not be sent. Check SMTP settings and retry."
-                failed.updated_at = _now()
-                db.commit()
-            results.append(CreatorApplicationInviteResult(
-                user_id=user_id,
-                email=email,
-                status="failed",
-                application_status="pending",
-                error="Email could not be sent. Check SMTP settings and retry.",
-            ))
-            continue
-        db.commit()
-        results.append(CreatorApplicationInviteResult(
-            user_id=user_id,
-            email=email,
-            status="sent",
-            application_status="invited",
-            invite_id=invite.id,
-            invite_code_hint=invite.code_hint,
-        ))
-
-    return CreatorApplicationInviteResponse(
-        items=results,
-        sent_count=sum(item.status == "sent" for item in results),
-        skipped_count=sum(item.status == "skipped" for item in results),
-        failed_count=sum(item.status == "failed" for item in results),
-    )
+    del payload, db, settings
+    raise HTTPException(status_code=410, detail="creator access application processing is retired")
 
 
 @operations_router.post(
@@ -1136,25 +1003,8 @@ def decide_creator_application(
     payload: CreatorApplicationDecisionRequest,
     db: Annotated[Session, Depends(get_db)],
 ) -> CreatorApplicationOut:
-    row = db.get(CreatorApplication, user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="creator application not found")
-    row.status = payload.status
-    row.updated_at = _now()
-    linked_invite = db.get(CreatorInvite, row.invite_id) if row.invite_id else None
-    if linked_invite is not None and not linked_invite.redeemed_by_user_id:
-        linked_invite.enabled = False
-    if payload.status == "approved" and _access_grant(db, user_id) is None:
-        db.add(
-            CreatorAccessGrant(
-                user_id=user_id,
-                source="application",
-                granted_at=row.updated_at,
-            )
-        )
-    db.commit()
-    db.refresh(row)
-    return _creator_application_out(db, row)
+    del user_id, payload, db
+    raise HTTPException(status_code=410, detail="creator access application decisions are retired")
 
 
 @creator_router.post("/uploads", response_model=CreatorUploadOut, status_code=201)

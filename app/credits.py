@@ -12,11 +12,14 @@ from app.models import (
     CreditReservation,
     ReferralBinding,
     ReferralInvite,
+    ReferralRewardConfig,
+    ReferralRewardConfigHistory,
     User,
 )
 
 WELCOME_CREDITS = 5
-REFERRAL_CREDITS = 10
+DEFAULT_INVITER_REWARD_CREDITS = 5
+DEFAULT_INVITEE_REWARD_CREDITS = 5
 _REFERRAL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -96,9 +99,73 @@ def ensure_referral_invite(db: Session, user_id: str) -> ReferralInvite:
 
 
 def provision_new_user(db: Session, user: User) -> None:
-    """Give a newly verified user its one-time grant and personal invite code."""
-    grant_welcome_credit(db, user.user_id)
+    """Create the stable personal invite code for a newly verified user."""
     ensure_referral_invite(db, user.user_id)
+
+
+def get_referral_reward_config(db: Session, *, lock: bool = False) -> ReferralRewardConfig:
+    query = db.query(ReferralRewardConfig).filter(ReferralRewardConfig.id == 1)
+    if lock:
+        query = query.with_for_update()
+    row = query.one_or_none()
+    if row is not None:
+        return row
+    now = _now()
+    row = ReferralRewardConfig(
+        id=1,
+        version=1,
+        inviter_activation_reward_credits=DEFAULT_INVITER_REWARD_CREDITS,
+        invitee_registration_reward_credits=DEFAULT_INVITEE_REWARD_CREDITS,
+        updated_by="system",
+        updated_at=now,
+    )
+    db.add(row)
+    db.add(
+        ReferralRewardConfigHistory(
+            version=1,
+            inviter_activation_reward_credits=DEFAULT_INVITER_REWARD_CREDITS,
+            invitee_registration_reward_credits=DEFAULT_INVITEE_REWARD_CREDITS,
+            updated_by="system",
+            updated_at=now,
+        )
+    )
+    db.flush()
+    return row
+
+
+def update_referral_reward_config(
+    db: Session,
+    *,
+    inviter_activation_reward_credits: int,
+    invitee_registration_reward_credits: int,
+    updated_by: str,
+) -> ReferralRewardConfig:
+    values = (inviter_activation_reward_credits, invitee_registration_reward_credits)
+    if any(value < 0 or value > 1000 for value in values):
+        raise ValueError("referral reward credits must be between 0 and 1000")
+    row = get_referral_reward_config(db, lock=True)
+    if values == (
+        row.inviter_activation_reward_credits,
+        row.invitee_registration_reward_credits,
+    ):
+        return row
+    now = _now()
+    row.version += 1
+    row.inviter_activation_reward_credits = inviter_activation_reward_credits
+    row.invitee_registration_reward_credits = invitee_registration_reward_credits
+    row.updated_by = updated_by.strip() or "unknown"
+    row.updated_at = now
+    db.add(
+        ReferralRewardConfigHistory(
+            version=row.version,
+            inviter_activation_reward_credits=inviter_activation_reward_credits,
+            invitee_registration_reward_credits=invitee_registration_reward_credits,
+            updated_by=row.updated_by,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    return row
 
 
 def reserve(
@@ -222,33 +289,55 @@ def bind_referral_for_new_user(db: Session, *, user: User, code: str) -> Referra
         if existing.inviter_user_id != invite.owner_user_id:
             raise ValueError("this account already has an invite")
         return existing
+    config = get_referral_reward_config(db)
+    now = _now()
     row = ReferralBinding(
         invitee_user_id=user.user_id,
         inviter_user_id=invite.owner_user_id,
         invite_code=invite.code,
+        config_version=config.version,
+        inviter_reward_credits=config.inviter_activation_reward_credits,
+        invitee_reward_credits=config.invitee_registration_reward_credits,
         status="pending_activation",
-        created_at=_now(),
+        created_at=now,
     )
     db.add(row)
+    db.flush()
+    if row.invitee_reward_credits > 0:
+        _entry(
+            db,
+            entry_id=f"referral-registration:{row.invitee_user_id}",
+            user_id=row.invitee_user_id,
+            kind="referral_registration",
+            amount=row.invitee_reward_credits,
+            reference_id=row.inviter_user_id,
+            note="Invite registration reward",
+        )
+        row.invitee_rewarded_at = now
     return row
 
 
 def activate_referral_from_android(db: Session, user_id: str) -> bool:
-    row = db.get(ReferralBinding, user_id)
+    row = (
+        db.query(ReferralBinding)
+        .filter(ReferralBinding.invitee_user_id == user_id)
+        .with_for_update()
+        .one_or_none()
+    )
     if row is None or row.status != "pending_activation":
         return False
     if db.get(User, row.inviter_user_id) is None:
         return False
-    grant_id = f"referral:{row.invitee_user_id}"
-    _entry(
-        db,
-        entry_id=grant_id,
-        user_id=row.inviter_user_id,
-        kind="referral",
-        amount=REFERRAL_CREDITS,
-        reference_id=row.invitee_user_id,
-        note="Invite activation",
-    )
+    if row.inviter_reward_credits > 0:
+        _entry(
+            db,
+            entry_id=f"referral-activation:{row.invitee_user_id}",
+            user_id=row.inviter_user_id,
+            kind="referral_activation",
+            amount=row.inviter_reward_credits,
+            reference_id=row.invitee_user_id,
+            note="Invite activation reward",
+        )
     row.status = "activated"
     row.activated_at = _now()
     db.add(row)

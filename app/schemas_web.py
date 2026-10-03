@@ -49,9 +49,22 @@ class WebProfileOut(BaseModel):
     unread_notification_count: int = 0
 
 
+class WebReferralSnapshotOut(BaseModel):
+    config_version: int
+    inviter_activation_reward_credits: int
+    invitee_registration_reward_credits: int
+
+
 class WebSessionOut(BaseModel):
     authenticated: bool
     user: WebProfileOut | None = None
+    referral: WebReferralSnapshotOut | None = None
+
+
+class WebAppHandoffOut(BaseModel):
+    code: str
+    open_uri: str
+    expires_at: str
 
 
 class WebEmailRequest(BaseModel):

@@ -306,6 +306,18 @@ class UserToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AppHandoffCode(Base):
+    """Short-lived, single-use Web-to-App account handoff."""
+
+    __tablename__ = "app_handoff_codes"
+
+    code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class CreditLedgerEntry(Base):
     """Append-only account-credit movements.
 
@@ -356,6 +368,32 @@ class ReferralInvite(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ReferralRewardConfig(Base):
+    """The single active referral reward policy."""
+
+    __tablename__ = "referral_reward_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    inviter_activation_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    invitee_registration_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ReferralRewardConfigHistory(Base):
+    """Append-only audit history for referral reward policy changes."""
+
+    __tablename__ = "referral_reward_config_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    inviter_activation_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False)
+    invitee_registration_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ReferralBinding(Base):
     """One invitee can be attributed once and activates from Android once."""
 
@@ -364,8 +402,12 @@ class ReferralBinding(Base):
     invitee_user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     inviter_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     invite_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    inviter_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    invitee_reward_credits: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending_activation", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    invitee_rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

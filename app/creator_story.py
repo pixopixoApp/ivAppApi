@@ -19,7 +19,7 @@ from app.creator_interaction_presets import (
     resolve_interaction_preset,
 )
 from app.creator_manual_edits import SUSTAINED
-from app.credits import InsufficientCredits, grant_welcome_credit, reserve
+from app.credits import InsufficientCredits, reserve
 from app.models import (
     CreatorCreation,
     CreatorSourceGeneration,
@@ -158,8 +158,6 @@ def start_generation(db: Session, creation: CreatorCreation, payload: dict) -> N
         ):
             raise HTTPException(409, f"Ending {role} does not need a retry")
         selected.append(role)
-    grant_welcome_credit(db, creation.user_id)
-    db.flush()
     number = int(db.query(func.max(CreatorSourceGeneration.attempt)).filter_by(creation_id=creation.id).scalar() or 0)
     for role in selected:
         number += 1

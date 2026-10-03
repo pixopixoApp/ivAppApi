@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, bearer_token_from_request, load_app_user
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.db import get_db
 from app.models import CreatorAccessGrant
 
@@ -121,24 +121,14 @@ def require_app_or_web_user(
     return user
 
 
-def _policy_allows(settings: Settings, channel: str) -> bool:
-    mode = settings.creator_access_mode
-    return mode == "all_open" or mode == f"{channel}_open"
-
-
-def _grant_policy_access(
-    db: Session,
-    settings: Settings,
-    user: AppUser,
-) -> None:
+def _grant_open_creator_access(db: Session, user: AppUser) -> None:
+    """Persist the open-access creator grant once for every signed-in account."""
     if db.get(CreatorAccessGrant, user.user_id) is not None:
-        return
-    if not _policy_allows(settings, user.channel):
         return
     db.add(
         CreatorAccessGrant(
             user_id=user.user_id,
-            source=f"{user.channel}_open",
+            source="open_access",
             granted_at=datetime.now(timezone.utc),
         )
     )
@@ -153,7 +143,6 @@ def _grant_policy_access(
 def require_creator_user(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
-    settings: Annotated[Settings, Depends(get_settings)],
 ) -> AppUser:
     bearer = bearer_token_from_request(request)
     if bearer:
@@ -166,7 +155,7 @@ def require_creator_user(
         user = optional_web_user(request, db)
         if user is None:
             raise HTTPException(status_code=401, detail="sign in required")
-    _grant_policy_access(db, settings, user)
+    _grant_open_creator_access(db, user)
     request.state.app_user = user
     request.state.app_token = user.token
     return user
