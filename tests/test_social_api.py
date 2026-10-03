@@ -111,6 +111,20 @@ def test_public_creator_like_comment_reply_and_notifications(db) -> None:
     assert (video.like_count, video.comment_count) == (1, 2)
 
 
+def test_public_creator_profile_is_available_before_first_publication(db) -> None:
+    _user(db, "new-creator")
+
+    with TestClient(app) as client:
+        profile = client.get("/api/v1/public/creators/new-creator")
+        works = client.get("/api/v1/public/creators/new-creator/works")
+
+    assert profile.status_code == 200
+    assert profile.json()["user_id"] == "new-creator"
+    assert profile.json()["work_count"] == 0
+    assert works.status_code == 200
+    assert works.json()["items"] == []
+
+
 def test_like_is_idempotent_and_reconcile_repairs_counts(db) -> None:
     _user(db, "author")
     viewer = _user(db, "viewer")

@@ -342,9 +342,6 @@ def get_creator(
     viewer = _optional_user(request, db)
     if row is None or not row.enabled or row.deletion_requested_at is not None:
         raise HTTPException(status_code=404, detail="creator not found")
-    ever_published = db.query(PublishedVideo.id).filter(PublishedVideo.user_id == user_id).first()
-    if row.creator_activated_at is None and ever_published is None:
-        raise HTTPException(status_code=404, detail="creator not found")
     if viewer and users_blocked_between(db, viewer.user_id, user_id):
         raise HTTPException(status_code=404, detail="creator not found")
     return _profile(db, settings, row, viewer)
