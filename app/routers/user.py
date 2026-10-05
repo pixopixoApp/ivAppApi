@@ -99,6 +99,7 @@ from app.schemas import (
     UserVideosResponse,
     VideoBodyOut,
 )
+from app.social_seed import is_seed_user, preview_enabled
 from app.users import (
     apply_user_update,
     follow_counts,
@@ -160,7 +161,7 @@ def _resolve_list_target(
 ) -> User | None:
     uid = (raw_user_id or "").strip() or me_user_id
     user = db.get(User, uid)
-    if user is None or not user.enabled:
+    if user is None or not user.enabled or (is_seed_user(user) and not preview_enabled(db)):
         return None
     if uid != me_user_id and users_blocked_between(db, me_user_id, uid):
         return None
@@ -183,6 +184,8 @@ def _follow_list_items(
     for row in rows:
         peer_id = getattr(row, peer_attr)
         peer = by_id.get(peer_id)
+        if is_seed_user(peer) and not preview_enabled(db):
+            continue
         items.append(
             FollowingItemOut(
                 user_id=peer_id,
@@ -409,7 +412,7 @@ def post_user_profile(
 
     uid = payload.body.user_id.strip()
     user = db.get(User, uid) if uid else None
-    if user is None or not user.enabled:
+    if user is None or not user.enabled or (is_seed_user(user) and not preview_enabled(db)):
         return user_profile_error(ver=settings.server_ver, head_in=payload.head)
     if user.user_id != me.user_id and users_blocked_between(db, me.user_id, user.user_id):
         return user_profile_error(ver=settings.server_ver, head_in=payload.head)
@@ -602,7 +605,9 @@ def post_follow(
     if not followee_id or followee_id == me.user_id:
         return follow_error(ver=settings.server_ver, head_in=payload.head)
     followee = db.get(User, followee_id)
-    if followee is None or not followee.enabled:
+    if followee is None or not followee.enabled or (
+        is_seed_user(followee) and not preview_enabled(db)
+    ):
         log.warning("follow unknown user_id=%s by=%s", followee_id, me.user_id)
         return follow_error(ver=settings.server_ver, head_in=payload.head)
     if users_blocked_between(db, me.user_id, followee_id):
@@ -784,7 +789,9 @@ def post_user_videos(
 
     uid = payload.body.user_id.strip()
     author = db.get(User, uid) if uid else None
-    if author is None or not author.enabled:
+    if author is None or not author.enabled or (
+        is_seed_user(author) and not preview_enabled(db)
+    ):
         return user_videos_error(ver=settings.server_ver, head_in=payload.head)
     if author.user_id != me.user_id and users_blocked_between(db, me.user_id, author.user_id):
         return user_videos_error(ver=settings.server_ver, head_in=payload.head)

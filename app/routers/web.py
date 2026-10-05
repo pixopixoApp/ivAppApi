@@ -58,6 +58,11 @@ from app.schemas_web import (
     WebSocialConfigOut,
 )
 from app.share_urls import published_share_url
+from app.social_seed import (
+    displayed_comment_count,
+    displayed_like_count,
+    preview_enabled,
+)
 from app.users import (
     follow_counts,
     get_or_create_user,
@@ -114,9 +119,12 @@ def _bind_web_invite_if_present(
 
 def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
     following_count, follower_count = follow_counts(db, user.user_id)
+    received_expression = PublishedVideo.like_count
+    if preview_enabled(db):
+        received_expression = PublishedVideo.like_count + PublishedVideo.seed_like_count
     work_count, received_like_count = db.query(
         func.count(PublishedVideo.id),
-        func.coalesce(func.sum(PublishedVideo.like_count), 0),
+        func.coalesce(func.sum(received_expression), 0),
     ).filter(
         PublishedVideo.user_id == user.user_id,
         PublishedVideo.is_deleted == 0,
@@ -529,8 +537,8 @@ def list_web_publications(
                 created_at=row.created_at.isoformat() if row.created_at else "",
                 updated_at=row.updated_at.isoformat() if row.updated_at else "",
                 unique_player_count=play_counts.get(row.id, 0),
-                like_count=max(0, row.like_count),
-                comment_count=max(0, row.comment_count),
+                like_count=displayed_like_count(row, preview_enabled(db)),
+                comment_count=displayed_comment_count(row, preview_enabled(db)),
                 viewer_liked=row.id in liked_ids,
             )
             for row in rows

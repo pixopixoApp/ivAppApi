@@ -145,6 +145,111 @@ def test_like_is_idempotent_and_reconcile_repairs_counts(db) -> None:
     assert db.query(SocialNotification).filter_by(type="video_like").count() == 1
 
 
+def test_social_seed_interactions_are_isolated_and_preview_gated(db) -> None:
+    _user(db, "author")
+    _video(db, "video-1", "author")
+    db.add(User(
+        user_id="social-seed-prelaunch-v1-001",
+        provider="internal",
+        subject="social-seed:prelaunch-v1:001",
+        nickname="AmberBadger",
+        avatar_url="/media/avatars/seed.png",
+        source="admin",
+        internal_purpose="social_seed",
+        internal_batch="prelaunch-v1",
+        enabled=True,
+    ))
+    db.commit()
+    headers = {"X-Publish-Key": "test-publish-key"}
+    actor = {
+        "actor_user_id": "social-seed-prelaunch-v1-001",
+        "batch_id": "prelaunch-v1",
+    }
+    comment_body = {
+        **actor,
+        "body": "The timing on this interaction feels crisp.",
+        "idempotency_key": "robot-run-1-comment-1",
+    }
+
+    with TestClient(app) as client:
+        accounts = client.get(
+            "/internal/v1/social-seed/accounts",
+            headers=headers,
+            params={"batch_id": "prelaunch-v1"},
+        )
+        liked = client.put(
+            "/internal/v1/social-seed/videos/video-1/like",
+            headers=headers,
+            json=actor,
+        )
+        liked_again = client.put(
+            "/internal/v1/social-seed/videos/video-1/like",
+            headers=headers,
+            json=actor,
+        )
+        comment = client.post(
+            "/internal/v1/social-seed/videos/video-1/comments",
+            headers=headers,
+            json=comment_body,
+        )
+        replay = client.post(
+            "/internal/v1/social-seed/videos/video-1/comments",
+            headers=headers,
+            json=comment_body,
+        )
+        hidden_engagement = client.get("/api/v1/public/videos/video-1/engagement")
+        hidden_comments = client.get("/api/v1/public/videos/video-1/comments")
+        hidden_profile = client.get(
+            "/api/v1/public/creators/social-seed-prelaunch-v1-001"
+        )
+        enabled = client.put(
+            "/internal/v1/social-seed-preview",
+            headers=headers,
+            json={"enabled": True, "updated_by": "test-manager"},
+        )
+        shown_engagement = client.get("/api/v1/public/videos/video-1/engagement")
+        shown_comments = client.get("/api/v1/public/videos/video-1/comments")
+        shown_creator = client.get("/api/v1/public/creators/author")
+        shown_detail = client.post(
+            "/video_detail",
+            json={
+                "head": {"act": "video_detail", "ver": "1.2"},
+                "body": {
+                    "video_id": "video-1",
+                    "supported_experience_spec_versions": ["1.0", "1.1", "1.2"],
+                },
+            },
+        )
+        disabled = client.put(
+            "/internal/v1/social-seed-preview",
+            headers=headers,
+            json={"enabled": False, "updated_by": "release-check"},
+        )
+        hidden_again = client.get("/api/v1/public/videos/video-1/comments")
+
+    assert accounts.json()["items"][0]["user_id"] == actor["actor_user_id"]
+    assert liked.json() == {"active": True, "like_count": 0}
+    assert liked_again.json() == liked.json()
+    assert replay.json()["id"] == comment.json()["id"]
+    assert hidden_engagement.json()["like_count"] == 0
+    assert hidden_engagement.json()["comment_count"] == 0
+    assert hidden_comments.json()["items"] == []
+    assert hidden_profile.status_code == 404
+    assert enabled.json()["enabled"] is True
+    assert shown_engagement.json()["like_count"] == 1
+    assert shown_engagement.json()["comment_count"] == 1
+    assert shown_comments.json()["items"][0]["body"] == comment_body["body"]
+    assert shown_creator.json()["received_like_count"] == 1
+    assert shown_detail.json()["body"]["items"][0]["like_count"] == 1
+    assert shown_detail.json()["body"]["items"][0]["comment_count"] == 1
+    assert disabled.json()["enabled"] is False
+    assert hidden_again.json()["items"] == []
+    video = db.get(PublishedVideo, "video-1")
+    assert (video.like_count, video.comment_count) == (0, 0)
+    assert (video.seed_like_count, video.seed_comment_count) == (1, 1)
+    assert db.query(SocialNotification).count() == 0
+
+
 def test_liked_videos_respect_declared_runtime_capabilities(db) -> None:
     _user(db, "author")
     viewer = _user(db, "viewer")

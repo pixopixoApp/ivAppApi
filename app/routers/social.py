@@ -65,6 +65,14 @@ from app.schemas_social import (
     SocialCapabilities,
     SocialState,
 )
+from app.social_seed import (
+    displayed_comment_count,
+    displayed_like_count,
+    is_seed_user,
+    preview_enabled,
+)
+from app.social_service import create_comment as create_social_comment
+from app.social_service import mutate_video_like
 from app.users import follow_counts
 from app.web_session import optional_web_user, require_web_user
 
@@ -140,6 +148,9 @@ def _notify(
 ) -> None:
     if not recipient_user_id or recipient_user_id == actor_user_id:
         return
+    recipient = db.get(User, recipient_user_id)
+    if is_seed_user(recipient):
+        return
     target = comment_id or video_id or recipient_user_id
     key = f"{recipient_user_id}:{actor_user_id}:{kind}:{target}"
     if db.query(SocialNotification.id).filter(SocialNotification.dedupe_key == key).first():
@@ -195,8 +206,12 @@ def _profile(db: Session, settings: Settings, row: User, viewer: AppUser | None)
         PublishedVideo.distribution_enabled.is_(True),
         PublishedVideo.cdn_ready.is_(True),
     )
+    seed_preview = preview_enabled(db)
+    received_expression = PublishedVideo.like_count
+    if seed_preview:
+        received_expression = PublishedVideo.like_count + PublishedVideo.seed_like_count
     work_count, received = eligible.with_entities(
-        func.count(PublishedVideo.id), func.coalesce(func.sum(PublishedVideo.like_count), 0)
+        func.count(PublishedVideo.id), func.coalesce(func.sum(received_expression), 0)
     ).one()
     following_count, follower_count = follow_counts(db, row.user_id)
     viewer_following = bool(viewer and db.query(Follow.id).filter(
@@ -316,8 +331,8 @@ def get_social_state(
         videos={
             row.id: EngagementSummary(
                 unique_player_count=player_counts.get(row.id, 0),
-                like_count=max(0, row.like_count),
-                comment_count=max(0, row.comment_count),
+                like_count=displayed_like_count(row, preview_enabled(db)),
+                comment_count=displayed_comment_count(row, preview_enabled(db)),
                 viewer_liked=row.id in liked_ids,
             ) for row in visible_rows
         },
@@ -340,7 +355,12 @@ def get_creator(
     _enabled(settings, "social_creator_profiles_enabled")
     row = db.get(User, user_id)
     viewer = _optional_user(request, db)
-    if row is None or not row.enabled or row.deletion_requested_at is not None:
+    if (
+        row is None
+        or not row.enabled
+        or row.deletion_requested_at is not None
+        or (is_seed_user(row) and not preview_enabled(db))
+    ):
         raise HTTPException(status_code=404, detail="creator not found")
     if viewer and users_blocked_between(db, viewer.user_id, user_id):
         raise HTTPException(status_code=404, detail="creator not found")
@@ -398,8 +418,8 @@ def get_creator_works(
             interaction_types=(seo[row.id].interaction_types if row.id in seo else []),
             engagement=EngagementSummary(
                 unique_player_count=context.play_counts_by_video_id.get(row.id, 0),
-                like_count=max(0, row.like_count),
-                comment_count=max(0, row.comment_count),
+                like_count=displayed_like_count(row, preview_enabled(db)),
+                comment_count=displayed_comment_count(row, preview_enabled(db)),
                 viewer_liked=row.id in liked_ids,
             ),
             review_status=row.review_status,
@@ -423,11 +443,14 @@ def _comments_page(
         raise HTTPException(status_code=404, detail="video not found")
     excluded = blocked_peer_ids(db, viewer.user_id) if viewer else set()
     offset = _offset(cursor)
+    seed_preview = preview_enabled(db)
     query = db.query(Comment).filter(
         Comment.video_id == video_id,
         Comment.root_comment_id.is_(None) if root_comment_id is None else Comment.root_comment_id == root_comment_id,
         Comment.moderation_status != "hidden",
     )
+    if not seed_preview:
+        query = query.filter(Comment.is_seed.is_(False))
     if excluded:
         query = query.filter(~Comment.author_user_id.in_(excluded))
     rows = query.order_by(Comment.created_at.desc(), Comment.id.desc()).offset(offset).limit(limit + 1).all()
@@ -497,8 +520,8 @@ def get_video_engagement(
     players = db.query(VideoView.id).filter(VideoView.video_id == video_id).count()
     return EngagementSummary(
         unique_player_count=players,
-        like_count=max(0, video.like_count),
-        comment_count=max(0, video.comment_count),
+        like_count=displayed_like_count(video, preview_enabled(db)),
+        comment_count=displayed_comment_count(video, preview_enabled(db)),
         viewer_liked=liked,
     )
 
@@ -511,33 +534,23 @@ def list_replies(
     limit: int = Query(default=20, ge=1, le=50), cursor: str | None = None,
 ) -> CommentPage:
     root = db.get(Comment, comment_id)
-    if root is None or root.root_comment_id is not None:
+    if (
+        root is None
+        or root.root_comment_id is not None
+        or (root.is_seed and not preview_enabled(db))
+    ):
         raise HTTPException(status_code=404, detail="comment not found")
     return _comments_page(db=db, settings=settings, request=request, video_id=root.video_id, root_comment_id=root.id, limit=limit, cursor=cursor)
 
 
 def _like_video(db: Session, settings: Settings, user: AppUser, video_id: str, active: bool) -> LikeMutation:
-    _enabled(settings, "social_video_likes_enabled")
-    video = _visible_video(db, video_id)
-    if users_blocked_between(db, user.user_id, video.user_id or ""):
-        raise HTTPException(status_code=403, detail="interaction unavailable")
-    _enforce_toggle_rate(db, user.user_id, "video_like")
-    row = db.query(VideoLike).filter(VideoLike.video_id == video_id, VideoLike.user_id == user.user_id).one_or_none()
-    if active and row is None:
-        db.add(VideoLike(video_id=video_id, user_id=user.user_id))
-        video.like_count = max(0, video.like_count) + 1
-        _notify(db, recipient_user_id=video.user_id, actor_user_id=user.user_id, kind="video_like", video_id=video_id)
-    elif not active and row is not None:
-        db.delete(row)
-        video.like_count = max(0, video.like_count - 1)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        current = db.query(VideoLike.id).filter(VideoLike.video_id == video_id, VideoLike.user_id == user.user_id).first() is not None
-        video = db.get(PublishedVideo, video_id)
-        return LikeMutation(active=current, like_count=max(0, video.like_count if video else 0))
-    return LikeMutation(active=active, like_count=max(0, video.like_count))
+    return mutate_video_like(
+        db,
+        settings,
+        actor_user_id=user.user_id,
+        video_id=video_id,
+        active=active,
+    )
 
 
 def _follow(db: Session, settings: Settings, user: AppUser, target_id: str, active: bool) -> FollowMutation:
@@ -566,53 +579,25 @@ def _follow(db: Session, settings: Settings, user: AppUser, target_id: str, acti
 
 
 def _create_comment(db: Session, settings: Settings, user: AppUser, video_id: str, body: str, root_id: str | None = None) -> CommentOut:
-    _enabled(settings, "social_comments_enabled")
-    video = _visible_video(db, video_id)
-    if users_blocked_between(db, user.user_id, video.user_id or ""):
-        raise HTTPException(status_code=403, detail="interaction unavailable")
-    _enforce_comment_rate(db, user.user_id)
-    root = None
-    if root_id:
-        root = db.get(Comment, root_id)
-        if root is None or root.video_id != video_id or root.root_comment_id is not None or root.moderation_status == "hidden":
-            raise HTTPException(status_code=404, detail="comment not found")
-        if users_blocked_between(db, user.user_id, root.author_user_id):
-            raise HTTPException(status_code=403, detail="interaction unavailable")
-    now = _now()
-    row = Comment(
-        id=f"cmt_{secrets.token_urlsafe(18)}",
+    return create_social_comment(
+        db,
+        settings,
+        actor_user_id=user.user_id,
         video_id=video_id,
-        author_user_id=user.user_id,
-        root_comment_id=root.id if root else None,
-        reply_to_user_id=root.author_user_id if root else None,
         body=body,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(row)
-    video.comment_count = max(0, video.comment_count) + 1
-    if root:
-        root.reply_count = max(0, root.reply_count) + 1
-        recipient = root.author_user_id
-        kind = "reply"
-    else:
-        recipient = video.user_id
-        kind = "comment"
-    _notify(db, recipient_user_id=recipient, actor_user_id=user.user_id, kind=kind, video_id=video_id, comment_id=row.id)
-    db.commit()
-    author = db.get(User, user.user_id)
-    return CommentOut(
-        id=row.id, video_id=video_id,
-        author=CommentAuthor(user_id=user.user_id, nickname=(author.nickname if author else "") or "", avatar_url=canonicalize_public_url(settings, author.avatar_url if author else "") or ""),
-        body=row.body, root_comment_id=row.root_comment_id, reply_to_user_id=row.reply_to_user_id,
-        can_delete=True, created_at=_iso(row.created_at),
+        root_id=root_id,
     )
 
 
 def _like_comment(db: Session, settings: Settings, user: AppUser, comment_id: str, active: bool) -> LikeMutation:
     _enabled(settings, "social_comments_enabled")
     comment = db.get(Comment, comment_id)
-    if comment is None or comment.moderation_status != "visible" or comment.deleted_at is not None:
+    if (
+        comment is None
+        or comment.moderation_status != "visible"
+        or comment.deleted_at is not None
+        or (comment.is_seed and not preview_enabled(db))
+    ):
         raise HTTPException(status_code=404, detail="comment not found")
     _visible_video(db, comment.video_id)
     if users_blocked_between(db, user.user_id, comment.author_user_id):
@@ -636,7 +621,7 @@ def _like_comment(db: Session, settings: Settings, user: AppUser, comment_id: st
 
 def _remove_comment(db: Session, user: AppUser, comment_id: str, *, hide: bool) -> CommentOut:
     comment = db.get(Comment, comment_id)
-    if comment is None:
+    if comment is None or (comment.is_seed and not preview_enabled(db)):
         raise HTTPException(status_code=404, detail="comment not found")
     video = db.get(PublishedVideo, comment.video_id)
     if video is None:
@@ -651,7 +636,10 @@ def _remove_comment(db: Session, user: AppUser, comment_id: str, *, hide: bool) 
         comment.body = ""
         comment.deleted_at = _now()
         comment.moderation_status = "removed"
-    video.comment_count = max(0, video.comment_count - 1)
+    if comment.is_seed:
+        video.seed_comment_count = max(0, video.seed_comment_count - 1)
+    else:
+        video.comment_count = max(0, video.comment_count - 1)
     if comment.root_comment_id:
         root = db.get(Comment, comment.root_comment_id)
         if root:
@@ -721,7 +709,12 @@ def _liked(
             items.append(CreatorWork(
                 video_id=row.id, title=row.title or "", description=row.description or "",
                 thumbnail_url=item.thumbnail_url, share_url=item.share_url,
-                engagement=EngagementSummary(unique_player_count=context.play_counts_by_video_id.get(row.id, 0), like_count=row.like_count, comment_count=row.comment_count, viewer_liked=True),
+                engagement=EngagementSummary(
+                    unique_player_count=context.play_counts_by_video_id.get(row.id, 0),
+                    like_count=displayed_like_count(row, preview_enabled(db)),
+                    comment_count=displayed_comment_count(row, preview_enabled(db)),
+                    viewer_liked=True,
+                ),
                 review_status=row.review_status, created_at=_iso(row.created_at),
             ))
     return CreatorWorkPage(
@@ -902,7 +895,11 @@ def _register_routes(router: APIRouter, auth: Callable[..., AppUser]) -> None:
     @router.post("/comments/{comment_id}/report")
     def report_comment(comment_id: str, payload: CommentReportRequest, user: Annotated[AppUser, Depends(auth)], db: Annotated[Session, Depends(get_db)]) -> dict[str, bool]:
         comment = db.get(Comment, comment_id)
-        if comment is None or comment.moderation_status == "hidden":
+        if (
+            comment is None
+            or comment.moderation_status == "hidden"
+            or (comment.is_seed and not preview_enabled(db))
+        ):
             raise HTTPException(status_code=404, detail="comment not found")
         if comment.author_user_id == user.user_id:
             raise HTTPException(status_code=400, detail="cannot report yourself")
@@ -972,20 +969,41 @@ _register_routes(web_router, require_web_user)
 def reconcile_counts(db: Annotated[Session, Depends(get_db)]) -> ReconcileResult:
     videos_updated = 0
     for video in db.query(PublishedVideo).all():
-        likes = db.query(VideoLike.id).filter(VideoLike.video_id == video.id).count()
+        likes = db.query(VideoLike.id).filter(
+            VideoLike.video_id == video.id,
+            VideoLike.is_seed.is_(False),
+        ).count()
+        seed_likes = db.query(VideoLike.id).filter(
+            VideoLike.video_id == video.id,
+            VideoLike.is_seed.is_(True),
+        ).count()
         comments = db.query(Comment.id).filter(
             Comment.video_id == video.id,
+            Comment.is_seed.is_(False),
             Comment.moderation_status == "visible",
             Comment.deleted_at.is_(None),
         ).count()
-        if video.like_count != likes or video.comment_count != comments:
+        seed_comments = db.query(Comment.id).filter(
+            Comment.video_id == video.id,
+            Comment.is_seed.is_(True),
+            Comment.moderation_status == "visible",
+            Comment.deleted_at.is_(None),
+        ).count()
+        if (
+            video.like_count != likes
+            or video.comment_count != comments
+            or video.seed_like_count != seed_likes
+            or video.seed_comment_count != seed_comments
+        ):
             video.like_count, video.comment_count = likes, comments
+            video.seed_like_count, video.seed_comment_count = seed_likes, seed_comments
             videos_updated += 1
     comments_updated = 0
     for comment in db.query(Comment).all():
         likes = db.query(CommentLike.id).filter(CommentLike.comment_id == comment.id).count()
         replies = db.query(Comment.id).filter(
             Comment.root_comment_id == comment.id,
+            Comment.is_seed.is_(False),
             Comment.moderation_status == "visible",
             Comment.deleted_at.is_(None),
         ).count()

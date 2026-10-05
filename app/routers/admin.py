@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, Response
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, load_only
 
 from app.avatar_storage import (
@@ -100,6 +100,7 @@ from app.schemas import (
     UserImpressionsOut,
 )
 from app.seo import ensure_seo_row, mark_seo_stale
+from app.social_seed import SOCIAL_SEED_PURPOSE
 from app.users import (
     USER_SOURCE_ADMIN,
     USER_SOURCE_APP,
@@ -485,6 +486,10 @@ def random_user(
     query = db.query(User).filter(
         User.source == src,
         User.enabled.is_(is_enabled),
+        or_(
+            User.internal_purpose.is_(None),
+            User.internal_purpose != SOCIAL_SEED_PURPOSE,
+        ),
     )
     if exclude_user_ids:
         cleaned = [u for u in exclude_user_ids if u and u.strip()]

@@ -8,7 +8,14 @@ from app.models import User
 PUBLISH_HEADERS = {"X-Publish-Key": "test-publish-key"}
 
 
-def _add_user(db, user_id: str, *, source: str = "admin", enabled: bool = True) -> None:
+def _add_user(
+    db,
+    user_id: str,
+    *,
+    source: str = "admin",
+    enabled: bool = True,
+    internal_purpose: str | None = None,
+) -> None:
     db.add(
         User(
             user_id=user_id,
@@ -17,6 +24,8 @@ def _add_user(db, user_id: str, *, source: str = "admin", enabled: bool = True) 
             nickname=user_id.title(),
             source=source,
             enabled=enabled,
+            internal_purpose=internal_purpose,
+            internal_batch="prelaunch-v1" if internal_purpose else None,
         )
     )
 
@@ -26,6 +35,7 @@ def test_random_user_picks_only_enabled_admin_and_respects_excludes(db) -> None:
     _add_user(db, "admin-b", source="admin", enabled=True)
     _add_user(db, "disabled", source="admin", enabled=False)
     _add_user(db, "app-user", source="app", enabled=True)
+    _add_user(db, "seed-user", internal_purpose="social_seed")
     db.commit()
 
     with TestClient(app) as client:

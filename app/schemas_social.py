@@ -163,3 +163,42 @@ class ReadMutation(BaseModel):
 class ReconcileResult(BaseModel):
     videos_updated: int
     comments_updated: int
+
+
+class SocialSeedAccountOut(BaseModel):
+    user_id: str
+    nickname: str
+    avatar_url: str
+
+
+class SocialSeedAccountPage(BaseModel):
+    items: list[SocialSeedAccountOut] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class SocialSeedActorRequest(BaseModel):
+    actor_user_id: str = Field(min_length=1, max_length=64)
+    batch_id: str = Field(min_length=1, max_length=64)
+
+
+class SocialSeedCommentRequest(SocialSeedActorRequest):
+    body: str = Field(min_length=1, max_length=1120)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("body")
+    @classmethod
+    def validate_seed_comment(cls, value: str) -> str:
+        return CommentCreateRequest.validate_unicode_length(value)
+
+
+class SocialSeedPreviewUpdate(BaseModel):
+    enabled: bool
+    updated_by: str = Field(min_length=1, max_length=128)
+
+
+class SocialSeedPreviewOut(BaseModel):
+    enabled: bool
+    version: int
+    updated_by: str
+    updated_at: str

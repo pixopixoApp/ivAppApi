@@ -112,6 +112,12 @@ class PublishedVideo(Base):
     comment_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    seed_like_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    seed_comment_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
     )
@@ -265,7 +271,10 @@ class User(Base):
     """一人一种登录：user_id 稳定；provider+subject 为登录身份。"""
 
     __tablename__ = "users"
-    __table_args__ = (UniqueConstraint("provider", "subject", name="uq_users_provider_subject"),)
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_users_provider_subject"),
+        Index("ix_users_internal_purpose_batch", "internal_purpose", "internal_batch"),
+    )
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(32), nullable=False, default="email", index=True)
@@ -283,6 +292,12 @@ class User(Base):
     source: Mapped[str] = mapped_column(
         String(16), nullable=False, default="app", index=True
     )  # app=真实用户；admin=管理后台创建
+    internal_purpose: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, default=None, index=True
+    )
+    internal_batch: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None, index=True
+    )
     deletion_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
@@ -394,6 +409,18 @@ class ReferralRewardConfigHistory(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class SocialSeedPreviewConfig(Base):
+    """Singleton switch controlling public visibility of seed interactions."""
+
+    __tablename__ = "social_seed_preview_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ReferralBinding(Base):
     """One invitee can be attributed once and activates from Android once."""
 
@@ -496,6 +523,7 @@ class VideoLike(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     video_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    is_seed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -504,6 +532,9 @@ class Comment(Base):
     __table_args__ = (
         Index("ix_comments_video_root_created", "video_id", "root_comment_id", "created_at"),
         Index("ix_comments_author_created", "author_user_id", "created_at"),
+        UniqueConstraint(
+            "author_user_id", "idempotency_key", name="uq_comments_author_idempotency"
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -512,6 +543,8 @@ class Comment(Base):
     root_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     reply_to_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     body: Mapped[str] = mapped_column(String(1120), nullable=False, default="")
+    is_seed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0", index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     moderation_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="visible", index=True
     )

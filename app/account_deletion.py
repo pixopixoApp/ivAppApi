@@ -140,7 +140,10 @@ def delete_account_data(
     for like in own_likes:
         video = db.get(PublishedVideo, like.video_id)
         if video is not None:
-            video.like_count = max(0, video.like_count - 1)
+            if like.is_seed:
+                video.seed_like_count = max(0, video.seed_like_count - 1)
+            else:
+                video.like_count = max(0, video.like_count - 1)
         db.delete(like)
     own_comment_likes = db.query(CommentLike).filter(CommentLike.user_id == user_id).all()
     for like in own_comment_likes:
@@ -152,7 +155,10 @@ def delete_account_data(
         if comment.deleted_at is None and comment.moderation_status == "visible":
             video = db.get(PublishedVideo, comment.video_id)
             if video is not None:
-                video.comment_count = max(0, video.comment_count - 1)
+                if comment.is_seed:
+                    video.seed_comment_count = max(0, video.seed_comment_count - 1)
+                else:
+                    video.comment_count = max(0, video.comment_count - 1)
             if comment.root_comment_id:
                 root = db.get(Comment, comment.root_comment_id)
                 if root is not None:

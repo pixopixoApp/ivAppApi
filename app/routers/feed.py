@@ -121,6 +121,11 @@ from app.schemas import (
     VideoResponse,
 )
 from app.share_urls import published_share_url
+from app.social_seed import (
+    displayed_comment_count,
+    displayed_like_count,
+    preview_enabled,
+)
 from app.users import get_or_create_user, is_author_visible, is_under_13, needs_birthday
 from app.verification_codes import PURPOSE_LOGIN, find_valid_code, issue_email_code
 from app.viewer_keys import viewer_key
@@ -147,6 +152,7 @@ class FeedItemContext:
     seo_slugs_by_video_id: dict[str, str]
     seo_thumbnails_by_video_id: dict[str, str]
     liked_video_ids: frozenset[str]
+    social_seed_preview_enabled: bool
 
 
 def _load_feed_item_context(
@@ -238,6 +244,7 @@ def _load_feed_item_context(
             video_id: thumbnail for video_id, _slug, thumbnail in seo_rows
         },
         liked_video_ids=liked_video_ids,
+        social_seed_preview_enabled=preview_enabled(db),
     )
 
 
@@ -398,8 +405,14 @@ def _item_from_published(
         avatar_url=avatar_url,
         thumbnail_url=thumbnail_url,
         play_count=play_count,
-        like_count=max(0, int(getattr(row, "like_count", 0) or 0)),
-        comment_count=max(0, int(getattr(row, "comment_count", 0) or 0)),
+        like_count=displayed_like_count(
+            row,
+            context.social_seed_preview_enabled if context is not None else preview_enabled(db),
+        ),
+        comment_count=displayed_comment_count(
+            row,
+            context.social_seed_preview_enabled if context is not None else preview_enabled(db),
+        ),
         viewer_liked=(
             row.id in context.liked_video_ids
             if context is not None

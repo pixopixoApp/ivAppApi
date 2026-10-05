@@ -28,6 +28,7 @@ from app.schemas_safety import (
     SafetyReportPage,
     SafetyReportRequest,
 )
+from app.social_seed import preview_enabled
 
 client_router = APIRouter(prefix="/api/v1/safety", tags=["safety"])
 operations_router = APIRouter(
@@ -89,7 +90,11 @@ def create_report(
         target_user_id = (video.user_id or "").strip() or None
     elif payload.target_type == "comment":
         comment = db.get(Comment, target_id)
-        if comment is None or comment.moderation_status == "hidden":
+        if (
+            comment is None
+            or comment.moderation_status == "hidden"
+            or (comment.is_seed and not preview_enabled(db))
+        ):
             raise HTTPException(status_code=404, detail="comment not found")
         target_user_id = comment.author_user_id
     else:
@@ -264,7 +269,10 @@ def decide_report(
             comment.deleted_at = _now()
             video = db.get(PublishedVideo, comment.video_id)
             if video is not None:
-                video.comment_count = max(0, video.comment_count - 1)
+                if comment.is_seed:
+                    video.seed_comment_count = max(0, video.seed_comment_count - 1)
+                else:
+                    video.comment_count = max(0, video.comment_count - 1)
             if comment.root_comment_id:
                 root = db.get(Comment, comment.root_comment_id)
                 if root is not None:

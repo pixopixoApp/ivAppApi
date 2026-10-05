@@ -21,6 +21,7 @@ from app.routers import (
     safety,
     seo,
     social,
+    social_seed,
     user,
     web,
 )
@@ -81,6 +82,7 @@ app.include_router(social.public_router)
 app.include_router(social.app_router)
 app.include_router(social.web_router)
 app.include_router(social.operations_router)
+app.include_router(social_seed.router)
 app.include_router(web.router)
 app.include_router(web.invite_router)
 app.include_router(seo.public_router)
