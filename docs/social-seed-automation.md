@@ -52,6 +52,23 @@ curl --fail-with-body \
 
 响应按 `user_id` 稳定排序，只返回 `user_id`、`nickname`、`avatar_url`。
 
+### 查询某视频已互动的种子账号
+
+后台“注”功能需要只对**尚未互动**的账号注入，以保证新增数准确。此只读接口
+返回指定批次中已经点赞 / 评论过该视频的账号：
+
+```sh
+curl --fail-with-body \
+  -H "X-Publish-Key: $PIXOPIXO_PUBLISH_KEY" \
+  "$PIXOPIXO_IVAPP_URL/internal/v1/social-seed/videos/$VIDEO_ID/engaged?batch_id=prelaunch-v1"
+```
+
+响应：
+
+```json
+{ "video_id": "...", "liked_account_ids": ["..."], "commented_account_ids": ["..."] }
+```
+
 ## 点赞和取消点赞
 
 点赞是并发幂等操作，数据库仍以 `(video_id, user_id)` 唯一约束兜底。重复调用

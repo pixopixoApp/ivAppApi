@@ -295,6 +295,58 @@ def test_seed_second_comment_hits_rate_check_without_typeerror(db) -> None:
     assert r2.status_code == 429
 
 
+def test_social_seed_engaged_lists_only_used_batch_accounts(db) -> None:
+    _user(db, "author")
+    _video(db, "video-1", "author")
+    for suffix in ("001", "002"):
+        db.add(User(
+            user_id=f"social-seed-prelaunch-v1-{suffix}",
+            provider="internal",
+            subject=f"social-seed:prelaunch-v1:{suffix}",
+            source="admin",
+            internal_purpose="social_seed",
+            internal_batch="prelaunch-v1",
+            enabled=True,
+        ))
+    # A seed account from a different batch must not appear.
+    db.add(User(
+        user_id="social-seed-other-001",
+        provider="internal",
+        subject="social-seed:other:001",
+        source="admin",
+        internal_purpose="social_seed",
+        internal_batch="other",
+        enabled=True,
+    ))
+    db.commit()
+    headers = {"X-Publish-Key": "test-publish-key"}
+    with TestClient(app) as client:
+        client.put(
+            "/internal/v1/social-seed/videos/video-1/like",
+            headers=headers,
+            json={"actor_user_id": "social-seed-prelaunch-v1-001", "batch_id": "prelaunch-v1"},
+        )
+        client.post(
+            "/internal/v1/social-seed/videos/video-1/comments",
+            headers=headers,
+            json={
+                "actor_user_id": "social-seed-prelaunch-v1-002",
+                "batch_id": "prelaunch-v1",
+                "body": "engaged endpoint probe",
+                "idempotency_key": "probe:engaged:1",
+            },
+        )
+        resp = client.get(
+            "/internal/v1/social-seed/videos/video-1/engaged",
+            headers=headers,
+            params={"batch_id": "prelaunch-v1"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["liked_account_ids"] == ["social-seed-prelaunch-v1-001"]
+    assert body["commented_account_ids"] == ["social-seed-prelaunch-v1-002"]
+
+
 def test_liked_videos_respect_declared_runtime_capabilities(db) -> None:
     _user(db, "author")
     viewer = _user(db, "viewer")

@@ -182,6 +182,14 @@ class SocialSeedActorRequest(BaseModel):
     batch_id: str = Field(min_length=1, max_length=64)
 
 
+class SocialSeedEngagedOut(BaseModel):
+    """Seed accounts that already acted on one video (for idempotent injection)."""
+
+    video_id: str
+    liked_account_ids: list[str] = Field(default_factory=list)
+    commented_account_ids: list[str] = Field(default_factory=list)
+
+
 class SocialSeedCommentRequest(SocialSeedActorRequest):
     body: str = Field(min_length=1, max_length=1120)
     idempotency_key: str = Field(min_length=1, max_length=128)

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import require_publish_key
-from app.models import User
+from app.models import Comment, User, VideoLike
 from app.public_origin import canonicalize_public_url
 from app.schemas_social import (
     CommentOut,
@@ -18,6 +18,7 @@ from app.schemas_social import (
     SocialSeedAccountPage,
     SocialSeedActorRequest,
     SocialSeedCommentRequest,
+    SocialSeedEngagedOut,
     SocialSeedPreviewOut,
     SocialSeedPreviewUpdate,
 )
@@ -171,3 +172,56 @@ def put_social_seed_preview(
     db.commit()
     db.refresh(row)
     return _preview_out(row)
+
+
+@router.get(
+    "/social-seed/videos/{video_id}/engaged",
+    response_model=SocialSeedEngagedOut,
+)
+def list_social_seed_engaged_accounts(
+    video_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    batch_id: Annotated[str, Query(min_length=1, max_length=64)],
+) -> SocialSeedEngagedOut:
+    """Seed accounts in ``batch_id`` that already liked/commented this video.
+
+    Read-only helper so callers can inject only *new* seed interaction and
+    report an accurate added count.
+    """
+    batch_members = {
+        row.user_id
+        for row in db.query(User.user_id)
+        .filter(
+            User.source == "admin",
+            User.internal_purpose == SOCIAL_SEED_PURPOSE,
+            User.internal_batch == batch_id.strip(),
+        )
+        .all()
+    }
+    if not batch_members:
+        return SocialSeedEngagedOut(video_id=video_id)
+
+    liked = {
+        str(user_id)
+        for (user_id,) in db.query(VideoLike.user_id)
+        .filter(
+            VideoLike.video_id == video_id,
+            VideoLike.is_seed.is_(True),
+        )
+        .all()
+    }
+    commented = {
+        str(user_id)
+        for (user_id,) in db.query(Comment.author_user_id)
+        .filter(
+            Comment.video_id == video_id,
+            Comment.is_seed.is_(True),
+            Comment.deleted_at.is_(None),
+        )
+        .all()
+    }
+    return SocialSeedEngagedOut(
+        video_id=video_id,
+        liked_account_ids=sorted(liked & batch_members),
+        commented_account_ids=sorted(commented & batch_members),
+    )
