@@ -250,6 +250,51 @@ def test_social_seed_interactions_are_isolated_and_preview_gated(db) -> None:
     assert db.query(SocialNotification).count() == 0
 
 
+def test_seed_second_comment_hits_rate_check_without_typeerror(db) -> None:
+    """Posting a second comment within 5s must return 429, not crash (500).
+
+    Regression: the rate check compared a naive DB datetime with an aware one.
+    """
+    _user(db, "author")
+    _video(db, "video-1", "author")
+    db.add(User(
+        user_id="social-seed-prelaunch-v1-009",
+        provider="internal",
+        subject="social-seed:prelaunch-v1:009",
+        source="admin",
+        internal_purpose="social_seed",
+        internal_batch="prelaunch-v1",
+        enabled=True,
+    ))
+    db.commit()
+    headers = {"X-Publish-Key": "test-publish-key"}
+    first = {
+        "actor_user_id": "social-seed-prelaunch-v1-009",
+        "batch_id": "prelaunch-v1",
+        "body": "first comment here",
+        "idempotency_key": "run-a:video-1:1",
+    }
+    second = {
+        **first,
+        "body": "second comment right after",
+        "idempotency_key": "run-a:video-1:2",
+    }
+    with TestClient(app) as client:
+        r1 = client.post(
+            "/internal/v1/social-seed/videos/video-1/comments",
+            headers=headers,
+            json=first,
+        )
+        r2 = client.post(
+            "/internal/v1/social-seed/videos/video-1/comments",
+            headers=headers,
+            json=second,
+        )
+    assert r1.status_code == 200
+    # Second comment within 5s is rate-limited (429), never a 500.
+    assert r2.status_code == 429
+
+
 def test_liked_videos_respect_declared_runtime_capabilities(db) -> None:
     _user(db, "author")
     viewer = _user(db, "viewer")

@@ -73,7 +73,11 @@ def _enforce_comment_rate(db: Session, user_id: str) -> None:
     recent = db.query(Comment.created_at).filter(
         Comment.author_user_id == user_id
     ).order_by(Comment.created_at.desc()).first()
-    if recent and recent[0] > now - timedelta(seconds=5):
+    recent_at = recent[0] if recent else None
+    if recent_at is not None and recent_at.tzinfo is None:
+        # MySQL returns naive datetimes; the column stores UTC.
+        recent_at = recent_at.replace(tzinfo=timezone.utc)
+    if recent_at is not None and recent_at > now - timedelta(seconds=5):
         raise HTTPException(status_code=429, detail="wait before commenting again")
     hourly = db.query(Comment.id).filter(
         Comment.author_user_id == user_id,

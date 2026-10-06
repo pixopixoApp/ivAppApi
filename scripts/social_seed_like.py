@@ -1,46 +1,49 @@
 #!/usr/bin/env python3
-"""Automated social-seed likes for prelaunch acceptance.
+"""Automated social-seed likes + comments for prelaunch acceptance.
 
 Runs as a cron-driven, idempotent task inside the ivapp container. Each run:
 
-1. Reads the "internal interaction preview" switch and **stops if disabled**.
+1. Reads the "internal interaction preview" switch and **stops if disabled**
+   (both likes and comments are a no-op when preview is off).
 2. Loads the visible video pool (same filter the recommendation pool builder
-   uses) and buckets it by ``feed_weight`` (level 1..5).
+   uses) with each video's quality level (``feed_weight`` 1..5) and its
+   grounded comment context (title, description, interaction summary/types/hints).
 3. Loads the social-seed account batch from the internal account API.
-4. Distributes a daily quota of likes across videos using the *exposure
-   weights* of each level, so that like counts track what the recommender
-   actually surfaces.
-5. Places those likes on a US-Eastern-majority + UK-secondary time-of-day
-   curve (so ``created_at`` looks like real human behaviour and future seed
-   comments line up with believable timestamps).
-6. Executes them through the validated ``/internal/v1/social-seed`` like
-   endpoint, honouring the platform rate limits, idempotently.
+4. **Likes**: distributes a daily quota across videos by level exposure weight,
+   placed on a US-Eastern-majority + UK-secondary time-of-day curve.
+5. **Comments**: rarer than likes (random ~10:1 ratio, tilted by quality level),
+   generated per video from its interaction gameplay via an LLM (persona-driven),
+   with a per-interaction template fallback when the LLM is unavailable.
+6. Executes both through the validated ``/internal/v1/social-seed`` endpoints,
+   honouring the platform rate limits, idempotently.
 
 Design notes
 ------------
 * Only the actions themselves go through the HTTP API so that all of the
   existing validation (visibility, blocking, rate limiting, seed counting)
   applies. Reading is done from the same process/DB the API uses.
-* ``video_likes`` has a ``(video_id, user_id)`` unique constraint, so a like
-  is idempotent: replaying a run never double counts.
-* **No separate state file.** Daily/hourly budgets and already-liked pairs are
-  derived directly from ``video_likes.created_at`` each run, so the task is
-  stateless and safe to re-run at any cadence.
-* Level exposure weights come from the recommender's olive-shaped supply
-  (default ``2/3/5/6/4`` over levels 1..5). A per-video lifetime like target
-  is drawn from a per-level band (10 ~ a few hundred), so higher-exposure
-  levels accumulate more likes.
+* ``video_likes``/``comments`` have unique constraints, so actions are
+  idempotent: replaying a run never double counts.
+* **No separate state file.** Daily/hourly budgets and already-done pairs are
+  derived directly from the DB each run, so the task is stateless and safe to
+  re-run at any cadence.
+* Comment text is generated from the video's own gameplay so it stays grounded
+  and varied; accounts carry a fixed persona for a consistent voice.
+* LLM config is read from the environment (SOCIAL_SEED_LLM_BASE_URL/API_KEY/
+  MODEL); when unset the task falls back to per-interaction templates.
 
 Usage
 -----
     python scripts/social_seed_like.py --dry-run
     python scripts/social_seed_like.py                 # normal cron run
     python scripts/social_seed_like.py --daily-total 1200
+    python scripts/social_seed_like.py --comments-only
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -129,6 +132,106 @@ TIMEZONE_MIX: dict[str, float] = {
 SLEEP_MIN_SECONDS = 0.15
 SLEEP_MAX_SECONDS = 0.6
 
+# --------------------------------------------------------------------------
+# Comments — merged into the same task (like + comment).
+# --------------------------------------------------------------------------
+
+# Overall like:comment ratio. Comments are far rarer than likes on a real app.
+# We do NOT apply a fixed ratio; each video's comment target is its lifetime
+# like target times a random ratio in this band (mean ~0.10), then scaled by
+# the level quality factor below.
+COMMENT_RATIO_MIN = 0.06
+COMMENT_RATIO_MAX = 0.16
+
+# Quality tilt: higher-exposure (higher feed_weight) videos attract more
+# comments per like; low-quality videos can end up with zero comments.
+COMMENT_LEVEL_FACTOR: dict[int, float] = {1: 0.35, 2: 0.7, 3: 1.0, 4: 1.5, 5: 2.0}
+
+# A video never receives more than this many seed comments in total, and low
+# target videos may receive none.
+COMMENT_PER_VIDEO_MAX = 30
+COMMENT_PER_VIDEO_MIN_ELIGIBLE = 1
+
+# Per-account comment ceilings (platform hard limit is 30/hour and >=5s spacing,
+# shared with likes in the rate table, so stay conservative).
+MAX_COMMENTS_PER_ACCOUNT_HOUR = 20
+MAX_COMMENTS_PER_ACCOUNT_DAY = 8
+
+# Cap number of comments executed per run.
+MAX_COMMENTS_PER_RUN = 60
+
+# Comment text rules.
+COMMENT_MAX_CHARS = 200
+
+# LLM configuration is read from the environment so no key lives in the repo.
+# When unset, comment generation falls back to the built-in template library.
+LLM_ENV_BASE_URL = "SOCIAL_SEED_LLM_BASE_URL"
+LLM_ENV_API_KEY = "SOCIAL_SEED_LLM_API_KEY"
+LLM_ENV_MODEL = "SOCIAL_SEED_LLM_MODEL"
+LLM_DEFAULT_MODEL = "qwen3.7-plus"
+LLM_TIMEOUT_SECONDS = 40.0
+LLM_TEMPERATURE = 0.9
+
+# Commenter personas. Each seed account is deterministically bound to one, so
+# its voice stays consistent across videos.
+PERSONAS: dict[str, str] = {
+    "curious": "curious and asks short genuine questions about how the effect works",
+    "hype": "easily excited, uses enthusiastic language and occasional emoji",
+    "chill": "casual and brief, often just a few words, lowercase, low effort",
+    "techy": "observes technical detail: timing, tracking, responsiveness, polish",
+    "emotional": "reacts with feelings, often mentions how it made them feel",
+}
+
+# Built-in fallback comment templates, grouped by interaction family. Used only
+# when the LLM is unavailable; kept per-interaction so fallbacks still match the
+# gameplay instead of being generic.
+FALLBACK_COMMENTS: dict[str, tuple[str, ...]] = {
+    "tap": (
+        "the tap timing is so satisfying",
+        "kept tapping just to see what happens",
+        "didn't expect that after the tap lol",
+        "ok the tap part got me",
+    ),
+    "swipe": (
+        "the swipe felt so smooth",
+        "swiping back and forth is weirdly fun",
+        "didn't know swiping would do that",
+        "the swipe transition is clean",
+    ),
+    "hold": (
+        "holding it down actually worked, nice",
+        "love when holding reveals something",
+        "the press and hold is such a good touch",
+    ),
+    "mic": (
+        "blew into my mic not expecting it to work lol",
+        "the mic detection is surprisingly accurate",
+        "my mic picked it up first try",
+    ),
+    "camera": (
+        "the camera tracking is actually wild",
+        "moved around and it tracked me, cool",
+        "the face tracking works really well",
+    ),
+    "tilt": (
+        "tilting my phone actually changed things, fun",
+        "the tilt controls are so smooth",
+    ),
+    "shake": (
+        "shaking my phone did something, love it",
+        "the shake reaction is great",
+    ),
+    "draw": (
+        "drawing on the screen is so fun",
+        "tracing it out actually worked",
+        "the drawing part is really satisfying",
+    ),
+    "generic": (
+        "so fun", "need more like this", "this is great", "love these",
+        "kept replaying it", "so creative",
+    ),
+}
+
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "data" / "social-seed" / "like-config.json"
 
 
@@ -143,6 +246,15 @@ class VideoTarget:
     level: int
     weight: float
     lifetime_target: int
+    # Comment context: grounded features used for comment generation.
+    title: str = ""
+    description: str = ""
+    interaction_summary: str = ""
+    interaction_types: tuple[str, ...] = ()
+    interaction_hints: tuple[str, ...] = ()
+    comment_target: int = 0
+    # Raw interaction family (tap/swipe/hold/mic/camera/tilt/shake/generic).
+    interaction_family: str = "generic"
 
 
 @dataclass
@@ -150,6 +262,7 @@ class SeedAccount:
     user_id: str
     nickname: str = ""
     avatar_url: str = ""
+    persona: str = "chill"
 
 
 @dataclass
@@ -161,13 +274,26 @@ class LikePlanItem:
 
 
 @dataclass
+class CommentPlanItem:
+    video_id: str
+    actor_user_id: str
+    batch_id: str
+    body: str
+    idempotency_key: str
+    scheduled_at: datetime  # UTC
+
+
+@dataclass
 class RunStats:
     liked: int = 0
+    commented: int = 0
     skipped_duplicate: int = 0
     failed: int = 0
     rate_limited: int = 0
     not_found: int = 0
     forbidden: int = 0
+    comment_failed: int = 0
+    comment_rate_limited: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -254,38 +380,108 @@ def preview_is_enabled(*, base_url: str, publish_key: str) -> bool:
 
 
 _VISIBLE_SQL = (
-    "SELECT id, feed_weight FROM published_videos "
-    "WHERE is_deleted = 0 AND deleted_at IS NULL "
-    "AND review_status = 'approved' "
-    "AND distribution_enabled = 1 AND cdn_ready = 1 "
+    "SELECT p.id, p.feed_weight, p.title, p.description, p.timeline, "
+    "       s.interaction_types, s.interaction_summary "
+    "FROM published_videos p "
+    "LEFT JOIN published_video_seo s ON s.video_id = p.id "
+    "WHERE p.is_deleted = 0 AND p.deleted_at IS NULL "
+    "AND p.review_status = 'approved' "
+    "AND p.distribution_enabled = 1 AND p.cdn_ready = 1 "
     "AND ("
-    "  (content_type = 'runtime' AND runtime_spec IS NOT NULL "
-    "   AND runtime_spec_version IS NOT NULL) "
+    "  (p.content_type = 'runtime' AND p.runtime_spec IS NOT NULL "
+    "   AND p.runtime_spec_version IS NOT NULL) "
     "  OR "
-    "  (content_type = 'html' AND html_url IS NOT NULL AND bridge_version = 1)"
+    "  (p.content_type = 'html' AND p.html_url IS NOT NULL AND p.bridge_version = 1)"
     ")"
 )
 
 
+def _interaction_family(types: list[str], hints: list[str]) -> str:
+    """Map raw interaction types/hints to a coarse family for fallback text."""
+    joined = " ".join([*(types or []), *(hints or [])]).lower()
+    if any(k in joined for k in ("mic", "blow", "clap", "sound", "volume", "voice")):
+        return "mic"
+    if any(k in joined for k in ("camera", "face", "smile", "vision", "motion")):
+        return "camera"
+    if any(k in joined for k in ("tilt", "rotate", "turn")):
+        return "tilt"
+    if any(k in joined for k in ("shake", "grab", "wave")):
+        return "shake"
+    if any(k in joined for k in ("hold", "press")):
+        return "hold"
+    if any(k in joined for k in ("swipe", "drag", "scrub")):
+        return "swipe"
+    if any(k in joined for k in ("tap",)):
+        return "tap"
+    if any(k in joined for k in ("erase", "draw", "pinch", "circle")):
+        return "draw"
+    return "generic"
+
+
+def _timeline_hints(timeline: Any) -> list[str]:
+    import json
+
+    tl = timeline
+    if isinstance(tl, str):
+        try:
+            tl = json.loads(tl)
+        except (ValueError, TypeError):
+            tl = None
+    hints: list[str] = []
+    for item in (tl or {}).get("interactions", []) or []:
+        if isinstance(item, dict):
+            hint = str(item.get("hint") or "").strip()
+            if hint:
+                hints.append(hint)
+    return hints
+
+
+def _parse_interaction_types(value: Any) -> list[str]:
+    """``interaction_types`` is a JSON column that may arrive as str or list."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(value, (list, tuple)):
+        return [str(t) for t in value if t is not None]
+    return []
+
+
 def load_video_targets(db, *, rng: random.Random) -> list[VideoTarget]:
-    """Return visible videos with an exposure-weighted lifetime like target."""
+    """Return visible videos with like + comment targets and comment context."""
     from sqlalchemy import text
 
     rows = db.execute(text(_VISIBLE_SQL)).all()
     targets: list[VideoTarget] = []
-    for video_id, raw_weight in rows:
+    for row in rows:
+        video_id, raw_weight, title, description, timeline, types, summary = row
         weight = int(raw_weight or 0)
         if weight <= 0:
             continue  # not in the recommendation pool
         level = weight if weight in LEVEL_WEIGHTS else 5
         low, high = LEVEL_LIFETIME_TARGETS[level]
         lifetime = rng.randint(low, high)
+        lifetime = max(LIKES_PER_VIDEO_MIN, min(lifetime, LIKES_PER_VIDEO_MAX))
+        # Comment target: proportional to like target, tilted by quality level.
+        ratio = rng.uniform(COMMENT_RATIO_MIN, COMMENT_RATIO_MAX)
+        comment_target = int(round(lifetime * ratio * COMMENT_LEVEL_FACTOR[level]))
+        comment_target = max(0, min(comment_target, COMMENT_PER_VIDEO_MAX))
+        hints = _timeline_hints(timeline)
+        type_list = _parse_interaction_types(types)
         targets.append(
             VideoTarget(
                 video_id=str(video_id),
                 level=level,
                 weight=float(LEVEL_WEIGHTS[level]),
-                lifetime_target=max(LIKES_PER_VIDEO_MIN, min(lifetime, LIKES_PER_VIDEO_MAX)),
+                lifetime_target=lifetime,
+                title=str(title or ""),
+                description=str(description or ""),
+                interaction_summary=str(summary or ""),
+                interaction_types=tuple(type_list),
+                interaction_hints=tuple(hints),
+                comment_target=comment_target,
+                interaction_family=_interaction_family(type_list, hints),
             )
         )
     return targets
@@ -313,11 +509,13 @@ def load_seed_accounts(
         )
         for item in page.get("items", []):
             if isinstance(item, dict) and item.get("user_id"):
+                uid = str(item["user_id"])
                 accounts.append(
                     SeedAccount(
-                        user_id=str(item["user_id"]),
+                        user_id=uid,
                         nickname=str(item.get("nickname") or ""),
                         avatar_url=str(item.get("avatar_url") or ""),
+                        persona=persona_for_account(uid),
                     )
                 )
         cursor = page.get("next_cursor")
@@ -563,6 +761,280 @@ def like_key(video_id: str, actor_user_id: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Comments — persona, DB-derived state, LLM generation, template fallback
+# --------------------------------------------------------------------------
+
+
+def persona_for_account(user_id: str) -> str:
+    """Deterministically bind a seed account to one persona."""
+    names = sorted(PERSONAS)
+    digest = hashlib.sha256(user_id.encode("utf-8")).digest()
+    return names[digest[0] % len(names)]
+
+
+@dataclass
+class CommentState:
+    """Seed-comment counters derived from the ``comments`` table."""
+
+    total_today: int
+    per_account_today: dict[str, int]
+    per_account_hour: dict[str, int]
+    per_video_total: dict[str, int]
+    used_bodies_by_video: dict[str, set[str]]
+    used_accounts_by_video: dict[str, set[str]]
+
+
+def load_comment_state(db, *, now_utc: datetime, batch_id: str) -> CommentState:
+    from sqlalchemy import text
+
+    day_start = now_utc.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    hour_start = now_utc.astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    )
+    total_today = db.execute(
+        text(
+            "SELECT COUNT(*) FROM comments "
+            "WHERE is_seed = 1 AND deleted_at IS NULL AND created_at >= :s"
+        ),
+        {"s": day_start},
+    ).scalar() or 0
+    per_account_today = {
+        str(u): int(c)
+        for u, c in db.execute(
+            text(
+                "SELECT author_user_id, COUNT(*) FROM comments "
+                "WHERE is_seed = 1 AND deleted_at IS NULL AND created_at >= :s "
+                "GROUP BY author_user_id"
+            ),
+            {"s": day_start},
+        ).all()
+    }
+    per_account_hour = {
+        str(u): int(c)
+        for u, c in db.execute(
+            text(
+                "SELECT author_user_id, COUNT(*) FROM comments "
+                "WHERE is_seed = 1 AND deleted_at IS NULL AND created_at >= :s "
+                "GROUP BY author_user_id"
+            ),
+            {"s": hour_start},
+        ).all()
+    }
+    per_video_total = {
+        str(v): int(c)
+        for v, c in db.execute(
+            text(
+                "SELECT video_id, COUNT(*) FROM comments "
+                "WHERE is_seed = 1 AND deleted_at IS NULL GROUP BY video_id"
+            )
+        ).all()
+    }
+    used_bodies_by_video: dict[str, set[str]] = {}
+    used_accounts_by_video: dict[str, set[str]] = {}
+    for vid, author, body in db.execute(
+        text(
+            "SELECT video_id, author_user_id, body FROM comments "
+            "WHERE is_seed = 1 AND deleted_at IS NULL"
+        )
+    ).all():
+        used_bodies_by_video.setdefault(str(vid), set()).add(str(body))
+        used_accounts_by_video.setdefault(str(vid), set()).add(str(author))
+    return CommentState(
+        total_today=int(total_today),
+        per_account_today=per_account_today,
+        per_account_hour=per_account_hour,
+        per_video_total=per_video_total,
+        used_bodies_by_video=used_bodies_by_video,
+        used_accounts_by_video=used_accounts_by_video,
+    )
+
+
+def _llm_config() -> tuple[str, str, str]:
+    return (
+        os.getenv(LLM_ENV_BASE_URL, "").strip(),
+        os.getenv(LLM_ENV_API_KEY, "").strip(),
+        os.getenv(LLM_ENV_MODEL, LLM_DEFAULT_MODEL).strip() or LLM_DEFAULT_MODEL,
+    )
+
+
+def llm_available() -> bool:
+    base, key, _ = _llm_config()
+    return bool(base and key)
+
+
+def generate_comment_llm(
+    *, target: VideoTarget, persona: str, existing_bodies: set[str], rng: random.Random
+) -> str | None:
+    """Ask the LLM for one short grounded English comment. None on failure."""
+    base, key, model = _llm_config()
+    if not base or not key:
+        return None
+    import httpx
+
+    avoid = "; ".join(sorted(existing_bodies))[:600] or "(none)"
+    rules = [
+        "Output ONE short English comment only, no quotes, no explanation.",
+        f"Maximum {COMMENT_MAX_CHARS} characters.",
+        "Sound like a real viewer, casual, not an ad, no hashtags, no links.",
+        "Ground it in the described interaction; do not invent story events, people, brands or outcomes.",
+        f"Voice/persona: {PERSONAS.get(persona, PERSONAS['chill'])}.",
+        "Vary length, casing and emoji naturally; do not always end with punctuation.",
+        f"Do NOT reuse or closely paraphrase any of these existing comments: {avoid}.",
+    ]
+    payload = {
+        "task": "Write one social comment for this Pixopixo interactive video.",
+        "content": {
+            "title": target.title,
+            "description": target.description[:600],
+            "interaction_summary": target.interaction_summary[:600],
+            "interaction_types": list(target.interaction_types),
+            "interaction_hints": list(target.interaction_hints)[:4],
+        },
+        "rules": rules,
+    }
+    try:
+        with httpx.Client(timeout=LLM_TIMEOUT_SECONDS, trust_env=False) as client:
+            resp = client.post(
+                base.rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": model,
+                    "temperature": LLM_TEMPERATURE,
+                    "max_tokens": 80,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You write short, natural viewer comments. Output only the comment text.",
+                        },
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            text = str(body["choices"][0]["message"]["content"] or "").strip()
+    except Exception:  # noqa: BLE001 - fall back to templates on any LLM error
+        return None
+    return _clean_comment(text)
+
+
+def _clean_comment(text: str) -> str | None:
+    text = text.strip().strip('"').strip("'").strip()
+    # Drop a leading "Comment:" style prefix the model may add.
+    for prefix in ("comment:", "comment -", "comment —"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):].strip()
+    # Keep first line only.
+    text = text.splitlines()[0].strip() if text else ""
+    if not text or len(text) > COMMENT_MAX_CHARS:
+        return None
+    return text
+
+
+def fallback_comment(
+    *,
+    target: VideoTarget,
+    existing_bodies: set[str],
+    rng: random.Random,
+    globally_used: set[str] | None = None,
+) -> str:
+    pool = FALLBACK_COMMENTS.get(target.interaction_family) or FALLBACK_COMMENTS["generic"]
+    gused = globally_used or set()
+    # Prefer: family pool unused per-video AND globally; then relax constraints.
+    candidates = [c for c in pool if c not in existing_bodies and c not in gused]
+    if not candidates:
+        candidates = [c for c in pool if c not in existing_bodies]
+    if not candidates:
+        candidates = [c for c in pool if c not in gused]
+    if not candidates:
+        candidates = list(pool)
+    return rng.choice(candidates)
+
+
+def plan_comments(
+    *,
+    targets: list[VideoTarget],
+    accounts: list[SeedAccount],
+    state: CommentState,
+    rng: random.Random,
+    max_comments: int,
+    now_utc: datetime,
+) -> list[CommentPlanItem]:
+    """Decide which videos still need comments and by/with what.
+
+    ``max_comments`` is the per-run ceiling (already the catch-up delta against
+    the day's comment curve, computed by the caller). A comment's body is
+    generated lazily during execution (LLM or fallback), so this only selects
+    (video, account) pairs and their idempotency keys.
+    """
+    if max_comments <= 0 or not accounts:
+        return []
+
+    # Candidate videos that still have comment headroom, weighted by level.
+    weighted: list[VideoTarget] = []
+    for t in targets:
+        remaining = t.comment_target - state.per_video_total.get(t.video_id, 0)
+        if remaining <= 0:
+            continue
+        repeats = max(1, int(round(t.weight / 5)))
+        weighted.extend([t] * repeats)
+    if not weighted:
+        return []
+
+    acc_today = dict(state.per_account_today)
+    acc_hour = dict(state.per_account_hour)
+    used_video_accounts = {k: set(v) for k, v in state.used_accounts_by_video.items()}
+    today_count = dict(state.per_video_total)
+
+    plan: list[CommentPlanItem] = []
+    # Build a rotating account order for balance.
+    order = list(accounts)
+    rng.shuffle(order)
+    pointer = 0
+    attempts = 0
+    max_attempts = max_comments * 8
+    while len(plan) < max_comments and attempts < max_attempts:
+        attempts += 1
+        target = rng.choice(weighted)
+        remaining = target.comment_target - today_count.get(target.video_id, 0)
+        if remaining <= 0:
+            continue
+        # Pick an account that has not commented this video and is under limits.
+        chosen: SeedAccount | None = None
+        for _ in range(len(order)):
+            cand = order[pointer % len(order)]
+            pointer += 1
+            if cand.user_id in used_video_accounts.get(target.video_id, set()):
+                continue
+            if acc_today.get(cand.user_id, 0) >= MAX_COMMENTS_PER_ACCOUNT_DAY:
+                continue
+            if acc_hour.get(cand.user_id, 0) >= MAX_COMMENTS_PER_ACCOUNT_HOUR:
+                continue
+            chosen = cand
+            break
+        if chosen is None:
+            continue
+        today_count[target.video_id] = today_count.get(target.video_id, 0) + 1
+        acc_today[chosen.user_id] = acc_today.get(chosen.user_id, 0) + 1
+        acc_hour[chosen.user_id] = acc_hour.get(chosen.user_id, 0) + 1
+        used_video_accounts.setdefault(target.video_id, set()).add(chosen.user_id)
+        key = f"seed-comment:{DEFAULT_BATCH_ID}:{target.video_id}:{chosen.user_id}"
+        plan.append(
+            CommentPlanItem(
+                video_id=target.video_id,
+                actor_user_id=chosen.user_id,
+                batch_id=DEFAULT_BATCH_ID,
+                body="",  # filled at execution time
+                idempotency_key=key,
+                scheduled_at=now_utc,
+            )
+        )
+    return plan
+
+
+# --------------------------------------------------------------------------
 # Main orchestration
 # --------------------------------------------------------------------------
 
@@ -605,6 +1077,8 @@ def run(
     now_utc: datetime | None = None,
     rng: random.Random | None = None,
     force: bool = False,
+    enable_likes: bool = True,
+    enable_comments: bool = True,
 ) -> RunStats:
     now_utc = now_utc or datetime.now(timezone.utc)
     rng = rng or random.Random()
@@ -627,6 +1101,7 @@ def run(
     try:
         targets = load_video_targets(db, rng=rng)
         state = load_like_state(db, now_utc=now_utc, batch_id=batch_id)
+        comment_state = load_comment_state(db, now_utc=now_utc, batch_id=batch_id)
     finally:
         db.close()
     accounts = load_seed_accounts(
@@ -643,11 +1118,12 @@ def run(
             )
         )
         return stats
+    account_by_id = {a.user_id: a for a in accounts}
+    target_by_id = {t.video_id: t for t in targets}
 
-    # --- 3. catch up to the day's expected curve ---
+    # --- 3. catch up to the day's expected like curve ---
     day = _iso_week_key(now_utc)
     done_keys = set(state.done_keys)
-    # How many likes *should* have happened by now, capped by the daily budget.
     curve_target = min(daily_total, cumulative_target_by_now(
         daily_total=daily_total, now_utc=now_utc
     ))
@@ -656,6 +1132,8 @@ def run(
     due_count = max(0, curve_target - state.today_total)
     due_count = min(due_count, MAX_LIKES_PER_RUN)
 
+    if not enable_likes:
+        due_count = 0
     plan = plan_due_likes(
         targets=targets,
         count=due_count,
@@ -670,15 +1148,46 @@ def run(
         seed_this_hour=dict(state.per_account_hour),
     )
 
+    # --- 3b. plan comments (independent catch-up; quality-tilted targets) ---
+    # Daily comment budget derives from the like budget at ~10:1, but is also
+    # clamped so it never exceeds the pool's total comment demand.
+    comment_budget = int(daily_total * rng.uniform(COMMENT_RATIO_MIN, COMMENT_RATIO_MAX))
+    comment_budget = min(comment_budget, MAX_COMMENTS_PER_RUN * 8)
+    if force:
+        comment_due = MAX_COMMENTS_PER_RUN
+    else:
+        comment_curve_target = min(
+            comment_budget,
+            cumulative_target_by_now(daily_total=comment_budget, now_utc=now_utc),
+        )
+        comment_due = max(0, comment_curve_target - comment_state.total_today)
+        comment_due = min(comment_due, MAX_COMMENTS_PER_RUN)
+    comment_plan = (
+        plan_comments(
+            targets=targets,
+            accounts=accounts,
+            state=comment_state,
+            rng=rng,
+            max_comments=comment_due,
+            now_utc=now_utc,
+        )
+        if enable_comments
+        else []
+    )
+
     if dry_run:
         summary = _dry_run_summary(plan=plan, due=plan, targets=targets, accounts=accounts)
         summary["already_today"] = state.today_total
         summary["curve_target"] = curve_target
         summary["due_now"] = len(plan)
+        summary["comments_planned"] = len(comment_plan)
+        summary["comments_already_today"] = comment_state.total_today
+        summary["llm_available"] = llm_available()
+        summary["comment_target_total"] = sum(t.comment_target for t in targets)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return stats
 
-    # --- 4. execute ---
+    # --- 4. execute likes ---
     for item in plan:
         key = like_key(item.video_id, item.actor_user_id)
         if key in done_keys:
@@ -706,19 +1215,74 @@ def run(
             continue
         stats.liked += 1
         done_keys.add(key)
-        sleep_for = rng.uniform(SLEEP_MIN_SECONDS, SLEEP_MAX_SECONDS)
-        time.sleep(sleep_for)
+        time.sleep(rng.uniform(SLEEP_MIN_SECONDS, SLEEP_MAX_SECONDS))
+
+    # --- 5. execute comments (generate body, then post) ---
+    globally_used_bodies: set[str] = set()
+    for item in comment_plan:
+        target = target_by_id.get(item.video_id)
+        account = account_by_id.get(item.actor_user_id)
+        if target is None or account is None:
+            continue
+        existing_bodies = comment_state.used_bodies_by_video.setdefault(
+            item.video_id, set()
+        )
+        body = generate_comment_llm(
+            target=target,
+            persona=account.persona,
+            existing_bodies=existing_bodies | globally_used_bodies,
+            rng=rng,
+        )
+        if body is None:
+            body = fallback_comment(
+                target=target,
+                existing_bodies=existing_bodies,
+                rng=rng,
+                globally_used=globally_used_bodies,
+            )
+        existing_bodies.add(body)
+        globally_used_bodies.add(body)
+        try:
+            _api(
+                base_url=base_url,
+                publish_key=publish_key,
+                method="POST",
+                path=f"/internal/v1/social-seed/videos/{item.video_id}/comments",
+                body={
+                    "actor_user_id": item.actor_user_id,
+                    "batch_id": batch_id,
+                    "body": body,
+                    "idempotency_key": item.idempotency_key,
+                },
+            )
+        except ApiError as exc:
+            if exc.status == 429:
+                stats.comment_rate_limited += 1
+            else:
+                stats.comment_failed += 1
+            if len(stats.errors) < 20:
+                stats.errors.append(
+                    f"comment {item.video_id}/{item.actor_user_id}: {exc}"
+                )
+            continue
+        stats.commented += 1
+        time.sleep(rng.uniform(SLEEP_MIN_SECONDS, SLEEP_MAX_SECONDS))
 
     result = {
         "status": "ok",
         "day": day,
         "liked": stats.liked,
+        "commented": stats.commented,
         "skipped_duplicate": stats.skipped_duplicate,
         "rate_limited": stats.rate_limited,
         "not_found": stats.not_found,
         "forbidden": stats.forbidden,
         "failed": stats.failed,
+        "comment_failed": stats.comment_failed,
+        "comment_rate_limited": stats.comment_rate_limited,
         "today_total": state.today_total + stats.liked,
+        "comments_today_total": comment_state.total_today + stats.commented,
+        "llm_available": llm_available(),
         "errors": stats.errors,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -780,6 +1344,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--seed", type=int, default=None, help="Random seed (reproducible planning)."
     )
+    parser.add_argument(
+        "--no-comments", action="store_true", help="Only likes; skip commenting."
+    )
+    parser.add_argument(
+        "--comments-only", action="store_true", help="Only comments; skip likes."
+    )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -802,6 +1372,8 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         rng=rng,
         force=args.force,
+        enable_likes=not args.comments_only,
+        enable_comments=not args.no_comments,
     )
     return 0 if stats.failed == 0 or stats.liked > 0 else 1
 

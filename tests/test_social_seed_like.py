@@ -183,3 +183,139 @@ def test_dry_run_summary_shape() -> None:
     assert summary["planned_today"] == 20
     assert summary["due_now"] == 5
     assert set(summary["planned_by_level"]) <= {"1", "5"}
+
+
+# --------------------------------------------------------------------------
+# Comment features
+# --------------------------------------------------------------------------
+
+
+def test_persona_assignment_is_deterministic() -> None:
+    a = like.persona_for_account("social-seed-prelaunch-v1-001")
+    b = like.persona_for_account("social-seed-prelaunch-v1-001")
+    assert a == b
+    assert a in like.PERSONAS
+    seen = {
+        like.persona_for_account(f"social-seed-prelaunch-v1-{i:03d}")
+        for i in range(60)
+    }
+    assert len(seen) >= 3
+
+
+def test_comment_quality_tilt_is_monotonic() -> None:
+    assert like.COMMENT_LEVEL_FACTOR[5] > like.COMMENT_LEVEL_FACTOR[1]
+    assert like.COMMENT_RATIO_MIN < like.COMMENT_RATIO_MAX
+
+
+def test_fallback_comment_matches_interaction_family() -> None:
+    rng = random.Random(2)
+    t = like.VideoTarget(
+        video_id="v1",
+        level=1,
+        weight=10.0,
+        lifetime_target=20,
+        interaction_family="mic",
+    )
+    body = like.fallback_comment(target=t, existing_bodies=set(), rng=rng)
+    assert body in like.FALLBACK_COMMENTS["mic"]
+    used = set(like.FALLBACK_COMMENTS["mic"]) - {body}
+    body2 = like.fallback_comment(target=t, existing_bodies=used, rng=rng)
+    assert body2 == body
+
+
+def test_clean_comment_strips_noise() -> None:
+    assert like._clean_comment('  "so fun"  ') == "so fun"
+    assert like._clean_comment("Comment: the tap is clean") == "the tap is clean"
+    assert like._clean_comment("first line\nsecond line") == "first line"
+    assert like._clean_comment("") is None
+    assert like._clean_comment("x" * 500) is None
+
+
+def test_llm_unavailable_without_env(monkeypatch) -> None:
+    monkeypatch.delenv(like.LLM_ENV_BASE_URL, raising=False)
+    monkeypatch.delenv(like.LLM_ENV_API_KEY, raising=False)
+    assert like.llm_available() is False
+    t = like.VideoTarget(video_id="v1", level=1, weight=10.0, lifetime_target=20)
+    assert (
+        like.generate_comment_llm(
+            target=t, persona="chill", existing_bodies=set(), rng=random.Random(1)
+        )
+        is None
+    )
+
+
+def test_plan_comments_respects_targets_and_account_limits() -> None:
+    rng = random.Random(5)
+    now = datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)
+    targets = [
+        like.VideoTarget(
+            video_id=f"v{i}",
+            level=3,
+            weight=25.0,
+            lifetime_target=100,
+            comment_target=2,
+        )
+        for i in range(5)
+    ]
+    accounts = _accounts(50)
+    state = like.CommentState(
+        total_today=0,
+        per_account_today={},
+        per_account_hour={},
+        per_video_total={},
+        used_bodies_by_video={},
+        used_accounts_by_video={},
+    )
+    plan = like.plan_comments(
+        targets=targets,
+        accounts=accounts,
+        state=state,
+        rng=rng,
+        max_comments=100,
+        now_utc=now,
+    )
+    assert len(plan) == 10  # 5 videos * 2 target
+    per_video: dict[str, int] = {}
+    per_account: dict[str, int] = {}
+    for item in plan:
+        per_video[item.video_id] = per_video.get(item.video_id, 0) + 1
+        per_account[item.actor_user_id] = per_account.get(item.actor_user_id, 0) + 1
+    assert all(v <= 2 for v in per_video.values())
+    assert all(v <= like.MAX_COMMENTS_PER_ACCOUNT_DAY for v in per_account.values())
+    seen_pairs = {(i.video_id, i.actor_user_id) for i in plan}
+    assert len(seen_pairs) == len(plan)
+
+
+def test_fallback_comment_avoids_globally_used() -> None:
+    rng = random.Random(3)
+    t = like.VideoTarget(
+        video_id="v1", level=1, weight=10.0, lifetime_target=20,
+        interaction_family="tap",
+    )
+    pool = set(like.FALLBACK_COMMENTS["tap"])
+    # Mark all but one as globally used -> must pick the remaining one.
+    remaining = "kept tapping just to see what happens"
+    used = pool - {remaining}
+    body = like.fallback_comment(
+        target=t, existing_bodies=set(), rng=rng, globally_used=used
+    )
+    assert body == remaining
+
+
+def test_interaction_family_mapping() -> None:
+    assert like._interaction_family(["mic_blow"], []) == "mic"
+    assert like._interaction_family(["camera_motion"], ["Smile at the camera"]) == "camera"
+    assert like._interaction_family(["hold"], []) == "hold"
+    assert like._interaction_family(["continuous_tap"], ["Tap"]) == "tap"
+    assert like._interaction_family(["continuous_swipe"], []) == "swipe"
+    assert like._interaction_family(["tilt_left"], []) == "tilt"
+    assert like._interaction_family(["drag_up"], []) == "swipe"
+    assert like._interaction_family(["draw_circle"], []) == "draw"
+    assert like._interaction_family([], []) == "generic"
+
+
+def test_parse_interaction_types_handles_json_string() -> None:
+    assert like._parse_interaction_types('["tap", "swipe_up"]') == ["tap", "swipe_up"]
+    assert like._parse_interaction_types(["hold"]) == ["hold"]
+    assert like._parse_interaction_types(None) == []
+    assert like._parse_interaction_types("not-json") == []
