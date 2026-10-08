@@ -65,14 +65,53 @@ NICKNAMES = (
     "drewdaily", "Flora", "robinroundhere", "Cora", "blakeonbreak",
     "Elsie", "quinnquietly", "Thea", "morganmoves", "Imogen",
     "roryonline", "Faye", "skylarside", "Willa", "kitandcoffee",
+    # --- expansion to 250+ (appended; do NOT reorder existing entries:
+    # account index -> nickname must stay stable for existing accounts) ---
+    "lilywaves", "marcusjune", "orla_sky", "devonreef",
+    "kaitowrites", "RowanFrost", "niallbloom", "paisleyq",
+    "soren_vale", "MiaWanders", "julesvine", "harperlee",
+    "theo_wild", "nadiaskybook", "corbin_tide", "elsiesnow",
+    "robinbanksx", "FinnickRay", "marlowe_q", "daxatmoss",
+    "wrensoflight", "safiya_kai", "hugo_marlowe", "ivyredwood",
+    "theo_north", "lucymeadow", "arjunwaves", "nora_skyfall",
+    "felixharbor", "maeve_bell", "oscarwestwood", "juneberryx",
+    "leowildfire", "tessmoonrise", "kai_breaker", "sadieatlas",
+    "milogrey", "lucas_frost", "emmastonex", "noahdrift",
+    "avaeverest", "liamnorthx", "zoeatdusk", "benjiwaves",
+    "chloe_harper", "mollysunray", "dylanreef", "calebstorm",
+    "rubyatlasx", "ellie_moon", "maxwellgreen", "ivy_north",
+    "jasperwaves", "sophieholly", "theo_rain", "ninaatlasx",
+    "arlo_frost", "lena_wilde", "owenreef", "mia_parker",
+    "finnharbor", "cleomoonx", "ethanwilde", "daisy_frost",
+    "jacobreef", "stellanorth", "harrywaves", "rosieredwood",
+    "grace_atlas", "charlie_moon", "masonfrost", "lilyharbor",
+    "nora_wilde", "parkerreef", "hazelstone", "wrenadrift",
+    "sunny_wren", "bonnie_moon", "oliveatlas", "jesse_reed",
+    "esmefrost", "cameronnorth", "oliveree", "phoebewaves",
+    "ash_harbor", "mabelmoon", "taylorreef", "siennafrost",
+    "casey_wilde", "hallie_reed", "drewatlas", "flora_north",
+    "robinreef", "corastone", "blake_moon", "elsiewilde",
+    "quinnreef", "theafrost", "morganharbor", "rory_north",
+    "fayeatlas", "skylarreef", "willa_moon", "kit_harbor",
+    "lilyfrost", "marcus_wave", "orla_north", "devon_moon",
+    "kai_reef", "rowan_wild", "niall_frost", "paisley_moon",
+    "soren_harbor", "mia_wilde", "jules_north", "harper_reef",
+    "theo_moon", "nadia_frost", "corbin_wild", "elsie_harbor",
+    "robin_moon", "finnick_north", "marlowe_frost", "dax_wilde",
+    "wren_reef", "safiya_north", "hugo_moon", "ivy_frost",
+    "lucy_harbor", "arjun_moon", "nora_reef", "felix_north",
+    "maeve_frost", "oscar_moon", "june_reef", "leo_north",
+    "tess_frost", "kai_moon", "sadie_wren", "milo_harbor",
+    "lucas_moon", "emma_frost", "noah_wilde", "ava_north",
+    "liam_reef", "zoe_moon", "benji_frost", "chloe_harbor",
+    "molly_north", "dylan_moon",
 )
 
 
 def account_specs(batch_id: str, count: int) -> list[dict[str, str]]:
     if count > len(NICKNAMES):
         raise ValueError(f"only {len(NICKNAMES)} curated nicknames are available")
-    invalid = [
-        nickname
+    invalid = [        nickname
         for nickname in NICKNAMES
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,31}", nickname) is None
     ]
@@ -123,8 +162,8 @@ def provision(*, batch_id: str, count: int, manifest_path: Path) -> list[dict[st
     from app.db import SessionLocal
     from app.models import User
 
-    if count < 1 or count > 100:
-        raise ValueError("count must be between 1 and 100")
+    if count < 1 or count > len(NICKNAMES):
+        raise ValueError(f"count must be between 1 and {len(NICKNAMES)}")
     settings = get_settings()
     if settings.media_storage_mode.strip().lower() != "oss":
         raise RuntimeError("social seed avatars must be provisioned with MEDIA_STORAGE_MODE=oss")
@@ -215,8 +254,10 @@ def provision(*, batch_id: str, count: int, manifest_path: Path) -> list[dict[st
             User.internal_purpose == SOCIAL_SEED_PURPOSE,
             User.internal_batch == batch_id,
         ).count()
-    if count == 100 and total != 100:
-        raise RuntimeError(f"batch must contain exactly 100 accounts, found {total}")
+    if total < count:
+        raise RuntimeError(
+            f"batch must contain at least {count} accounts, found {total}"
+        )
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
         json.dumps({"batch_id": batch_id, "accounts": manifest}, indent=2) + "\n",

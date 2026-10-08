@@ -11,22 +11,25 @@
 
 ## 初始化账号
 
-账号批次固定为 `prelaunch-v1`，用途固定为 `social_seed`。先试运行 5 个：
+账号批次固定为 `prelaunch-v1`，用途固定为 `social_seed`。脚本按“编号 1..N”
+幂等补齐：`--count N` 表示把该批次补到 N 个账号（已存在的账号只刷新昵称/头像，
+不改变编号）。先试运行 5 个：
 
 ```sh
 .venv/bin/python scripts/init_social_seed_accounts.py --count 5
 ```
 
-验收昵称和头像后补齐到 100 个：
+验收后补齐到目标规模（昵称池上限 250）：
 
 ```sh
-.venv/bin/python scripts/init_social_seed_accounts.py --count 100
+.venv/bin/python scripts/init_social_seed_accounts.py --count 250
 ```
 
-脚本幂等，只补齐缺失账号或头像，最终校验批次恰好为 100 个账号。账号没有
+脚本幂等，只补齐缺失账号或头像，最终校验批次账号数不少于 `--count`。账号没有
 登录凭据。头像由 DiceBear `10.x` 的 12 个 CC0 风格确定性混排生成，复制到
 OSS 的 `internal/social-seed/prelaunch-v1/avatars/natural-v2/` 前缀，不依赖
-运行时外链。
+运行时外链。**昵称池为 append-only**：新昵称只能追加到 `NICKNAMES` 末尾，
+不能改动或重排已有条目，否则已存在账号的昵称会与编号错位。
 
 - 清单：`data/social-seed/prelaunch-v1-manifest.json`
 - 许可证：`docs/licenses/dicebear-social-seed-styles-cc0.md`
