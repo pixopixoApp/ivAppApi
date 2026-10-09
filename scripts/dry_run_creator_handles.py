@@ -4,48 +4,78 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+from collections import Counter
+from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import inspect, text
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.creator_channels import (
     RESERVED_HANDLES,
     _nickname_handle,
-    should_have_public_handle,
 )
-from app.db import SessionLocal
-from app.models import CreatorHandleAlias, User
+from app.db import engine
+
+
+def _candidate(nickname: str, user_id: str, occupied: set[str]) -> tuple[str, bool]:
+    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    base = _nickname_handle(nickname)
+    candidates: list[str] = []
+    if len(base) >= 3 and base not in RESERVED_HANDLES:
+        candidates.extend((base, f"{base[:21]}_{digest[:8]}"))
+    candidates.append(f"pixo_{digest[:10]}")
+    for candidate in candidates:
+        if candidate not in occupied and candidate not in RESERVED_HANDLES:
+            return candidate, False
+    for length in range(11, 25):
+        candidate = f"pixo_{digest[:length]}"[:30]
+        if candidate not in occupied:
+            return candidate, True
+    raise RuntimeError(f"could not allocate handle for {user_id}")
 
 
 def main() -> None:
-    with SessionLocal() as db:
-        users = db.query(User).order_by(User.created_at.asc(), User.user_id.asc()).all()
-        occupied = {value for (value,) in db.query(User.handle).filter(User.handle.is_not(None)).all() if value}
-        occupied.update(value for (value,) in db.query(CreatorHandleAlias.handle).all())
+    schema = inspect(engine)
+    tables = set(schema.get_table_names())
+    user_columns = {column["name"] for column in schema.get_columns("users")}
+    handle_expression = "handle" if "handle" in user_columns else "NULL AS handle"
+    purpose_expression = (
+        "internal_purpose"
+        if "internal_purpose" in user_columns
+        else "NULL AS internal_purpose"
+    )
+    with engine.connect() as connection:
+        users = connection.execute(text(
+            "SELECT user_id, nickname, "
+            f"{purpose_expression}, {handle_expression} "
+            "FROM users ORDER BY created_at ASC, user_id ASC"
+        )).mappings().all()
+        existing_handles = [str(row["handle"]) for row in users if row["handle"]]
+        occupied = set(existing_handles)
+        if "creator_handle_aliases" in tables:
+            occupied.update(str(value) for (value,) in connection.execute(
+                text("SELECT handle FROM creator_handle_aliases")
+            ).all())
         generated: list[dict[str, str]] = []
         excluded = 0
         conflicts = 0
         for user in users:
-            if user.handle:
+            if user["handle"]:
                 continue
-            if not should_have_public_handle(user):
+            if user["internal_purpose"] not in (None, "", "social_seed"):
                 excluded += 1
                 continue
-            digest = hashlib.sha256(user.user_id.encode("utf-8")).hexdigest()
-            base = _nickname_handle(user.nickname)
-            candidates = []
-            if len(base) >= 3 and base not in RESERVED_HANDLES:
-                candidates.extend((base, f"{base[:21]}_{digest[:8]}"))
-            candidates.append(f"pixo_{digest[:10]}")
-            handle = next((value for value in candidates if value not in occupied), "")
-            if not handle:
+            handle, used_extended_fallback = _candidate(
+                str(user["nickname"] or ""), str(user["user_id"]), occupied
+            )
+            if used_extended_fallback:
                 conflicts += 1
-                handle = f"pixo_{digest[:24]}"[:30]
             occupied.add(handle)
-            generated.append({"user_id": user.user_id, "handle": handle})
+            generated.append({"user_id": str(user["user_id"]), "handle": handle})
 
-        duplicates = db.query(User.handle).filter(User.handle.is_not(None)).group_by(
-            User.handle
-        ).having(func.count(User.user_id) > 1).count()
+        duplicates = sum(count > 1 for count in Counter(existing_handles).values())
         print(json.dumps({
             "account_count": len(users),
             "generated_handle_count": len(generated),
