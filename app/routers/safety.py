@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, require_bearer_user
+from app.creator_channels import unpin_video
 from app.db import get_db
 from app.deps import require_publish_key
 from app.models import (
@@ -259,6 +260,7 @@ def decide_report(
         if video is not None and video.deleted_at is None:
             video.is_deleted = 1
             video.deleted_at = _now()
+            unpin_video(db, video.id)
     elif payload.action == "remove_comment":
         if row.target_type != "comment":
             raise HTTPException(status_code=400, detail="remove_comment requires a comment report")

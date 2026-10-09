@@ -7,7 +7,10 @@ venv/
 __pycache__/
 *.py[cod]
 *.db
-data/
+data/*
+!data/social-seed/
+data/social-seed/*
+!data/social-seed/prelaunch-v1-manifest.json
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

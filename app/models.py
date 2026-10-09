@@ -281,11 +281,32 @@ class User(Base):
     subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     nickname: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # Public, mutable channel address. Business relations must continue to use
+    # ``user_id``; a handle is only a human-facing resolver key.
+    handle: Mapped[str | None] = mapped_column(
+        String(30), nullable=True, unique=True, index=True
+    )
+    handle_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    profile_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
     avatar_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     avatar_media_object_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
     bio: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    background_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    background_mobile_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    background_desktop_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    background_focus_x: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    background_focus_y: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    content_language: Mapped[str] = mapped_column(String(35), nullable=False, default="")
+    collaboration_email: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    collaboration_email_public: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     birthday: Mapped[str] = mapped_column(
         String(10), nullable=False, default=""
     )  # YYYY-MM-DD；空串表示未设置
@@ -307,6 +328,92 @@ class User(Base):
     creator_activated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CreatorHandleAlias(Base):
+    """A permanent historical handle resolving directly to its owner."""
+
+    __tablename__ = "creator_handle_aliases"
+
+    handle: Mapped[str] = mapped_column(String(30), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CreatorExternalLink(Base):
+    __tablename__ = "creator_external_links"
+    __table_args__ = (
+        UniqueConstraint("user_id", "position", name="uq_creator_external_links_position"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    label: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CreatorPinnedWork(Base):
+    __tablename__ = "creator_pinned_works"
+    __table_args__ = (
+        UniqueConstraint("user_id", "video_id", name="uq_creator_pinned_works_video"),
+        UniqueConstraint("user_id", "position", name="uq_creator_pinned_works_position"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    video_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CreatorTopic(Base):
+    __tablename__ = "creator_topics"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1", index=True
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class CreatorTopicAssignment(Base):
+    __tablename__ = "creator_topic_assignments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "topic_id", name="uq_creator_topic_assignments_pair"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    topic_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CreatorProfileAudit(Base):
+    __tablename__ = "creator_profile_audits"
+    __table_args__ = (
+        Index("ix_creator_profile_audits_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_role: Mapped[str] = mapped_column(String(32), nullable=False, default="creator")
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="web")
+    before_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    after_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

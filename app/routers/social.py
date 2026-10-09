@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from app.auth_user import (
     require_bearer_user,
 )
 from app.config import Settings, get_settings
+from app.creator_channels import channel_relations, ensure_user_handle, resolve_handle
 from app.db import get_db
 from app.deps import require_publish_key
 from app.html_content import (
@@ -27,6 +28,7 @@ from app.models import (
     Comment,
     CommentLike,
     ContentReport,
+    CreatorPinnedWork,
     Follow,
     PublishedVideo,
     PublishedVideoSeo,
@@ -198,6 +200,8 @@ def _enforce_toggle_rate(db: Session, user_id: str, kind: str) -> None:
 
 
 def _profile(db: Session, settings: Settings, row: User, viewer: AppUser | None) -> CreatorProfile:
+    handle = ensure_user_handle(db, row)
+    links, topics, pinned_video_ids = channel_relations(db, row.user_id)
     eligible = db.query(PublishedVideo).filter(
         PublishedVideo.user_id == row.user_id,
         PublishedVideo.is_deleted == 0,
@@ -221,8 +225,23 @@ def _profile(db: Session, settings: Settings, row: User, viewer: AppUser | None)
     return CreatorProfile(
         user_id=row.user_id,
         nickname=row.nickname or "",
+        handle=handle,
+        share_url=f"https://pixopixo.com/@{handle}" if handle else "",
         avatar_url=canonicalize_public_url(settings, row.avatar_url) or "",
         bio=row.bio or "",
+        background_url=canonicalize_public_url(settings, row.background_url) or "",
+        background_mobile_url=canonicalize_public_url(settings, row.background_mobile_url) or "",
+        background_desktop_url=canonicalize_public_url(settings, row.background_desktop_url) or "",
+        background_focus_x=max(0.0, min(1.0, row.background_focus_x)),
+        background_focus_y=max(0.0, min(1.0, row.background_focus_y)),
+        topics=topics,
+        content_language=row.content_language or "",
+        external_links=links,
+        collaboration_email=(
+            row.collaboration_email or None if row.collaboration_email_public else None
+        ),
+        profile_updated_at=_iso(row.profile_updated_at) if row.profile_updated_at else None,
+        pinned_video_ids=pinned_video_ids,
         work_count=int(work_count or 0),
         following_count=following_count,
         follower_count=follower_count,
@@ -345,6 +364,31 @@ def get_social_state(
     )
 
 
+@public_router.get("/creators/by-handle/{handle}", response_model=CreatorProfile)
+def get_creator_by_handle(
+    handle: str,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> CreatorProfile:
+    _enabled(settings, "social_creator_profiles_enabled")
+    row, _is_alias = resolve_handle(db, handle)
+    viewer = _optional_user(request, db)
+    if (
+        row is None
+        or not row.enabled
+        or row.deletion_requested_at is not None
+        or (is_seed_user(row) and not preview_enabled(db))
+    ):
+        raise HTTPException(status_code=404, detail="creator not found")
+    if viewer and users_blocked_between(db, viewer.user_id, row.user_id):
+        raise HTTPException(status_code=404, detail="creator not found")
+    profile = _profile(db, settings, row, viewer)
+    if db.new or db.dirty or db.deleted:
+        db.commit()
+    return profile
+
+
 @public_router.get("/creators/{user_id}", response_model=CreatorProfile)
 def get_creator(
     user_id: str,
@@ -364,7 +408,10 @@ def get_creator(
         raise HTTPException(status_code=404, detail="creator not found")
     if viewer and users_blocked_between(db, viewer.user_id, user_id):
         raise HTTPException(status_code=404, detail="creator not found")
-    return _profile(db, settings, row, viewer)
+    profile = _profile(db, settings, row, viewer)
+    if db.new or db.dirty or db.deleted:
+        db.commit()
+    return profile
 
 
 @public_router.get("/creators/{user_id}/works", response_model=CreatorWorkPage)
@@ -375,6 +422,7 @@ def get_creator_works(
     settings: Annotated[Settings, Depends(get_settings)],
     limit: int = Query(default=20, ge=1, le=50),
     cursor: str | None = None,
+    sort: str = Query(default="latest", pattern="^(latest|popular)$"),
 ) -> CreatorWorkPage:
     get_creator(user_id, request, db, settings)
     viewer = _optional_user(request, db)
@@ -386,7 +434,28 @@ def get_creator_works(
         PublishedVideo.review_status == "approved",
         PublishedVideo.distribution_enabled.is_(True),
         PublishedVideo.cdn_ready.is_(True),
-    ).order_by(PublishedVideo.created_at.desc(), PublishedVideo.id.desc())
+    )
+    total_count = query.count()
+    pinned_rows = db.query(CreatorPinnedWork).filter(
+        CreatorPinnedWork.user_id == user_id
+    ).order_by(CreatorPinnedWork.position.asc()).all()
+    pinned_positions = {row.video_id: row.position for row in pinned_rows}
+    pinned_ids = list(pinned_positions)
+    remaining_order = (
+        ((PublishedVideo.like_count + PublishedVideo.seed_like_count).desc()
+         if preview_enabled(db) else PublishedVideo.like_count.desc())
+        if sort == "popular" else PublishedVideo.created_at.desc()
+    )
+    ordering = []
+    if pinned_ids:
+        ordering.extend((
+            case((PublishedVideo.id.in_(pinned_ids), 0), else_=1),
+            case(pinned_positions, value=PublishedVideo.id, else_=999),
+        ))
+    ordering.extend((
+        remaining_order, PublishedVideo.created_at.desc(), PublishedVideo.id.desc(),
+    ))
+    query = query.order_by(*ordering)
     rows = query.offset(offset).limit(limit + 1).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -416,6 +485,8 @@ def get_creator_works(
             thumbnail_url=feed_item.thumbnail_url,
             share_url=feed_item.share_url,
             interaction_types=(seo[row.id].interaction_types if row.id in seo else []),
+            duration_seconds=(seo[row.id].duration_seconds if row.id in seo else None),
+            required_capabilities=list(row.required_capabilities or []),
             engagement=EngagementSummary(
                 unique_player_count=context.play_counts_by_video_id.get(row.id, 0),
                 like_count=displayed_like_count(row, preview_enabled(db)),
@@ -423,12 +494,14 @@ def get_creator_works(
                 viewer_liked=row.id in liked_ids,
             ),
             review_status=row.review_status,
+            is_pinned=row.id in pinned_positions,
             created_at=_iso(row.created_at),
         ))
     return CreatorWorkPage(
         items=items,
         next_cursor=_cursor(offset + limit) if has_more else None,
         has_more=has_more,
+        total_count=total_count,
     )
 
 
@@ -476,6 +549,7 @@ def _comments_page(
             author=CommentAuthor(
                 user_id=author.user_id,
                 nickname=author.nickname or "",
+                handle=ensure_user_handle(db, author),
                 avatar_url=canonicalize_public_url(settings, author.avatar_url) or "",
             ),
             body="Comment deleted" if deleted else row.body,
@@ -648,7 +722,11 @@ def _remove_comment(db: Session, user: AppUser, comment_id: str, *, hide: bool) 
     author = db.get(User, comment.author_user_id)
     return CommentOut(
         id=comment.id, video_id=comment.video_id,
-        author=CommentAuthor(user_id=comment.author_user_id, nickname=(author.nickname if author else "") or ""),
+        author=CommentAuthor(
+            user_id=comment.author_user_id,
+            nickname=(author.nickname if author else "") or "",
+            handle=ensure_user_handle(db, author) if author else "",
+        ),
         body="Comment deleted", root_comment_id=comment.root_comment_id,
         reply_to_user_id=comment.reply_to_user_id, like_count=max(0, comment.like_count),
         reply_count=max(0, comment.reply_count), is_deleted=True, created_at=_iso(comment.created_at),
@@ -739,7 +817,12 @@ def _notifications(db: Session, settings: Settings, user: AppUser, limit: int, c
     actors = {row.user_id: row for row in db.query(User).filter(User.user_id.in_(actor_ids), User.enabled.is_(True)).all()} if actor_ids else {}
     items = [NotificationOut(
         id=row.id, type=row.type,
-        actor=NotificationActor(user_id=actor.user_id, nickname=actor.nickname or "", avatar_url=canonicalize_public_url(settings, actor.avatar_url) or ""),
+        actor=NotificationActor(
+            user_id=actor.user_id,
+            nickname=actor.nickname or "",
+            handle=ensure_user_handle(db, actor),
+            avatar_url=canonicalize_public_url(settings, actor.avatar_url) or "",
+        ),
         video_id=row.video_id, comment_id=row.comment_id, read=row.read_at is not None,
         created_at=_iso(row.created_at),
     ) for row in rows if (actor := actors.get(row.actor_user_id)) is not None]
@@ -812,6 +895,7 @@ def _web_follow_page(
         items.append(FollowUserOut(
             user_id=peer.user_id,
             nickname=peer.nickname or "",
+            handle=ensure_user_handle(db, peer),
             avatar_url=canonicalize_public_url(settings, peer.avatar_url) or "",
             created_at=_iso(relation.created_at),
         ))

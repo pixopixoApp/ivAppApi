@@ -33,6 +33,7 @@ class SocialState(BaseModel):
 class FollowUserOut(BaseModel):
     user_id: str
     nickname: str = ""
+    handle: str = ""
     avatar_url: str = ""
     created_at: str
 
@@ -43,11 +44,35 @@ class FollowUserPage(BaseModel):
     has_more: bool = False
 
 
+class CreatorTopicOut(BaseModel):
+    id: str
+    name: str
+
+
+class CreatorExternalLinkOut(BaseModel):
+    label: str = ""
+    url: str
+    position: int = 0
+
+
 class CreatorProfile(BaseModel):
     user_id: str
     nickname: str
+    handle: str = ""
+    share_url: str = ""
     avatar_url: str
     bio: str
+    background_url: str = ""
+    background_mobile_url: str = ""
+    background_desktop_url: str = ""
+    background_focus_x: float = 0.5
+    background_focus_y: float = 0.5
+    topics: list[CreatorTopicOut] = Field(default_factory=list)
+    content_language: str = ""
+    external_links: list[CreatorExternalLinkOut] = Field(default_factory=list)
+    collaboration_email: str | None = None
+    profile_updated_at: str | None = None
+    pinned_video_ids: list[str] = Field(default_factory=list)
     work_count: int = 0
     following_count: int = 0
     follower_count: int = 0
@@ -63,8 +88,11 @@ class CreatorWork(BaseModel):
     thumbnail_url: str = ""
     share_url: str = ""
     interaction_types: list[str] = Field(default_factory=list)
+    duration_seconds: float | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
     engagement: EngagementSummary
     review_status: str = "approved"
+    is_pinned: bool = False
     created_at: str
 
 
@@ -78,6 +106,7 @@ class CreatorWorkPage(BaseModel):
 class CommentAuthor(BaseModel):
     user_id: str
     nickname: str
+    handle: str = ""
     avatar_url: str = ""
 
 
@@ -135,6 +164,7 @@ class FollowMutation(BaseModel):
 class NotificationActor(BaseModel):
     user_id: str
     nickname: str
+    handle: str = ""
     avatar_url: str = ""
 
 

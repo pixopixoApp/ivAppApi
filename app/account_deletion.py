@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +20,13 @@ from app.models import (
     CreatorAccessGrant,
     CreatorApplication,
     CreatorCreation,
+    CreatorExternalLink,
+    CreatorHandleAlias,
     CreatorInvite,
+    CreatorPinnedWork,
+    CreatorProfileAudit,
     CreatorSourceGeneration,
+    CreatorTopicAssignment,
     CreatorUpload,
     CreatorVersion,
     EmailCode,
@@ -112,7 +118,9 @@ def delete_account_data(
         row.token for row in db.query(UserToken.token).filter(UserToken.user_id == user_id).all()
     ]
     public_paths = _safe_public_paths(settings, video_ids)
-    avatar_paths = list((Path(settings.media_root) / "avatars").glob(f"{user_id}.*"))
+    avatar_root = Path(settings.media_root) / "avatars"
+    avatar_paths = list(avatar_root.glob(f"{user_id}.*")) + list(avatar_root.glob(f"{user_id}-*"))
+    background_paths = list((Path(settings.media_root) / "backgrounds").glob(f"{user_id}-*"))
 
     if tokens or video_ids:
         conditions = []
@@ -205,6 +213,16 @@ def delete_account_data(
     )
     db.query(CreatorAccessGrant).filter(CreatorAccessGrant.user_id == user_id).delete()
     db.query(CreatorApplication).filter(CreatorApplication.user_id == user_id).delete()
+    db.query(CreatorExternalLink).filter(CreatorExternalLink.user_id == user_id).delete()
+    db.query(CreatorPinnedWork).filter(CreatorPinnedWork.user_id == user_id).delete()
+    db.query(CreatorTopicAssignment).filter(CreatorTopicAssignment.user_id == user_id).delete()
+    # Audits retain operational facts but no longer point at the deleted account.
+    db.query(CreatorProfileAudit).filter(CreatorProfileAudit.user_id == user_id).update(
+        {CreatorProfileAudit.user_id: None}, synchronize_session=False
+    )
+    if user.handle and db.get(CreatorHandleAlias, user.handle) is None:
+        tombstone = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:40]
+        db.add(CreatorHandleAlias(handle=user.handle, user_id=f"deleted:{tombstone}"))
     for invite in (
         db.query(CreatorInvite).filter(CreatorInvite.assigned_user_id == user_id).all()
     ):
@@ -234,6 +252,8 @@ def delete_account_data(
             else:
                 path.unlink(missing_ok=True)
         for path in avatar_paths:
+            path.unlink(missing_ok=True)
+        for path in background_paths:
             path.unlink(missing_ok=True)
     try:
         get_impression_store().clear_user(user_id=user_id)

@@ -40,8 +40,24 @@ class WebProfileOut(BaseModel):
     provider: str
     email: str
     nickname: str
+    handle: str = ""
+    share_url: str = ""
     avatar_url: str
     bio: str
+    background_url: str = ""
+    background_mobile_url: str = ""
+    background_desktop_url: str = ""
+    background_focus_x: float = 0.5
+    background_focus_y: float = 0.5
+    content_language: str = ""
+    collaboration_email: str = ""
+    collaboration_email_public: bool = False
+    external_links: list[dict] = Field(default_factory=list)
+    topics: list[dict] = Field(default_factory=list)
+    pinned_video_ids: list[str] = Field(default_factory=list)
+    handle_changed_at: str | None = None
+    handle_change_available_at: str | None = None
+    profile_updated_at: str | None = None
     following_count: int
     follower_count: int
     work_count: int = 0
@@ -88,8 +104,58 @@ class WebCodeSentOut(BaseModel):
 
 
 class WebProfileUpdateRequest(BaseModel):
-    nickname: str | None = Field(default=None, max_length=64)
-    bio: str | None = Field(default=None, max_length=80)
+    nickname: str | None = Field(default=None, max_length=40)
+    bio: str | None = Field(default=None, max_length=300)
+
+
+class CreatorChannelLinkIn(BaseModel):
+    label: str = Field(default="", max_length=40)
+    url: str = Field(max_length=2048)
+
+
+class CreatorChannelUpdateRequest(BaseModel):
+    nickname: str | None = None
+    handle: str | None = None
+    bio: str | None = None
+    background_focus_x: float | None = Field(default=None, ge=0, le=1)
+    background_focus_y: float | None = Field(default=None, ge=0, le=1)
+    content_language: str | None = None
+    collaboration_email: str | None = None
+    collaboration_email_public: bool | None = None
+    external_links: list[CreatorChannelLinkIn] | None = None
+    topic_ids: list[str] | None = None
+    pinned_video_ids: list[str] | None = None
+
+
+class HandleAvailabilityOut(BaseModel):
+    handle: str
+    available: bool
+    code: str
+    message: str | None = None
+    available_at: str | None = None
+
+
+class CreatorChannelPrivateOut(BaseModel):
+    user_id: str
+    nickname: str
+    handle: str
+    share_url: str
+    avatar_url: str
+    bio: str
+    background_url: str = ""
+    background_mobile_url: str = ""
+    background_desktop_url: str = ""
+    background_focus_x: float = 0.5
+    background_focus_y: float = 0.5
+    content_language: str = ""
+    collaboration_email: str = ""
+    collaboration_email_public: bool = False
+    external_links: list[dict] = Field(default_factory=list)
+    topics: list[dict] = Field(default_factory=list)
+    pinned_video_ids: list[str] = Field(default_factory=list)
+    handle_changed_at: str | None = None
+    handle_change_available_at: str | None = None
+    profile_updated_at: str | None = None
 
 
 class WebPublicationOut(BaseModel):

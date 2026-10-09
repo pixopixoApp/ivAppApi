@@ -28,6 +28,7 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
+from app.creator_channels import unpin_video
 from app.db import engine, get_db
 from app.deps import require_publish_key
 from app.html_content import (
@@ -1635,6 +1636,7 @@ def patch_content_management_detail(
         if payload.review_status == "draft":
             row.distribution_enabled = False
             row.is_tutorial = False
+            unpin_video(db, video_id)
 
     if "cover_media_object_id" in changed:
         # 校验封面 media object 存在且可用（发布后由 ivadmin 通过 publish-cover 上传）。
@@ -1755,6 +1757,8 @@ def review_video(
     if decision not in {"approved", "rejected"}:
         raise HTTPException(status_code=400, detail="status must be approved or rejected")
     row.review_status = decision
+    if decision == "rejected":
+        unpin_video(db, video_id)
     row.reviewed_by = str(payload.get("reviewed_by") or "").strip()[:128]
     row.review_note = str(payload.get("note") or "").strip()[:500]
     row.reviewed_at = datetime.now(timezone.utc)
@@ -1960,6 +1964,7 @@ def update_video_feed_weight(
         row.distribution_enabled = bool(payload.distribution_enabled)
         if not row.distribution_enabled:
             row.is_tutorial = False
+            unpin_video(db, video_id)
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     log.info(
@@ -2025,6 +2030,7 @@ def unpublish_video(
         video_id=video_id,
         reason="operator unpublished the video while CDN was warming",
     )
+    unpin_video(db, video_id)
     db.delete(row)
     db.commit()
 
@@ -2056,6 +2062,7 @@ def trash_published_video(
         row.is_deleted = 1
         row.deleted_at = datetime.now(timezone.utc)
         row.distribution_enabled = False
+        unpin_video(db, video_id)
         cancel_warming_publications(
             db,
             video_id=video_id,

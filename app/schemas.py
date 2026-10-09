@@ -463,6 +463,7 @@ class FeedItemOut(BaseModel):
     share_url: str = Field(default="", description="可分享的作品落地页")
     user_id: str | None = Field(default=None, description="作者 user_id；存量可空")
     nickname: str = Field(default="", description="作者昵称；无作者或未设置则为空串")
+    handle: str = Field(default="", description="作者公开 handle；无作者时为空串")
     avatar_url: str = Field(default="", description="作者头像相对路径；无作者或未设置则为空串")
     thumbnail_url: str = Field(
         default="",
@@ -738,6 +739,7 @@ class FollowingRequest(BaseModel):
 class FollowingItemOut(BaseModel):
     user_id: str = Field(description="用户 id")
     nickname: str = Field(default="", description="昵称")
+    handle: str = Field(default="", description="公开频道 handle")
     avatar_url: str = Field(default="", description="头像相对路径")
     created_at: str = Field(description="关注关系创建时间 ISO8601")
 
@@ -786,8 +788,22 @@ class FollowersResponse(BaseModel):
 class ProfileBodyOut(BaseModel):
     user_id: str = Field(description="用户稳定 id")
     nickname: str = Field(default="", description="昵称")
+    handle: str = Field(default="", description="公开频道 handle")
+    share_url: str = Field(default="", description="公开频道正式地址")
     avatar_url: str = Field(default="", description="头像相对路径")
     bio: str = Field(default="", description="个人介绍")
+    background_url: str = ""
+    background_mobile_url: str = ""
+    background_desktop_url: str = ""
+    background_focus_x: float = 0.5
+    background_focus_y: float = 0.5
+    content_language: str = ""
+    collaboration_email: str = ""
+    collaboration_email_public: bool = False
+    external_links: list[dict] = Field(default_factory=list)
+    topics: list[dict] = Field(default_factory=list)
+    pinned_video_ids: list[str] = Field(default_factory=list)
+    profile_updated_at: str | None = None
     email: str = Field(default="", description="邮箱（邮箱登录时为 subject）")
     enabled: bool = Field(default=True, description="是否启用")
     following_count: int = Field(default=0, description="关注数")
@@ -809,13 +825,13 @@ class ProfileResponse(BaseModel):
 
 
 class ProfileUpdateBodyIn(BaseModel):
-    nickname: str | None = Field(default=None, max_length=64, description="昵称；不传则不改")
+    nickname: str | None = Field(default=None, max_length=40, description="昵称；不传则不改")
     avatar_url: str | None = Field(
         default=None,
         max_length=512,
         description="头像相对路径（以 / 开头）；不传则不改；空串清空",
     )
-    bio: str | None = Field(default=None, max_length=80, description="个人介绍；传空串可清空")
+    bio: str | None = Field(default=None, max_length=300, description="个人介绍；传空串可清空")
 
 
 def _profile_update_head() -> ProtocolHeadIn:
@@ -844,8 +860,21 @@ class PublicProfileBodyOut(BaseModel):
 
     user_id: str = Field(description="用户稳定 id")
     nickname: str = Field(default="", description="昵称")
+    handle: str = Field(default="", description="公开频道 handle")
+    share_url: str = Field(default="", description="公开频道正式地址")
     avatar_url: str = Field(default="", description="头像相对路径")
     bio: str = Field(default="", description="个人介绍")
+    background_url: str = ""
+    background_mobile_url: str = ""
+    background_desktop_url: str = ""
+    background_focus_x: float = 0.5
+    background_focus_y: float = 0.5
+    content_language: str = ""
+    external_links: list[dict] = Field(default_factory=list)
+    topics: list[dict] = Field(default_factory=list)
+    collaboration_email: str | None = None
+    pinned_video_ids: list[str] = Field(default_factory=list)
+    profile_updated_at: str | None = None
     enabled: bool = Field(default=True, description="是否启用")
     following_count: int = Field(default=0, description="关注数")
     follower_count: int = Field(default=0, description="粉丝数")

@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.creator_channels import ensure_user_handle
 from app.credits import provision_new_user
 from app.models import Follow, User
 from app.public_text import record_user_text
@@ -45,6 +46,7 @@ def get_or_create_user(db: Session, *, provider: str, subject: str) -> User:
         source=USER_SOURCE_APP,
     )
     db.add(user)
+    ensure_user_handle(db, user)
     db.flush()
     provision_new_user(db, user)
     return user
@@ -72,15 +74,15 @@ def normalize_relative_avatar(raw: str) -> str:
 
 def normalize_nickname(raw: str) -> str:
     s = raw.strip() if isinstance(raw, str) else ""
-    if len(s) > 64:
-        raise ValueError("nickname too long")
+    if len(s) > 40:
+        raise ValueError("nickname must be at most 40 characters")
     return s
 
 
 def normalize_bio(raw: str) -> str:
     s = raw.strip() if isinstance(raw, str) else ""
-    if len(s) > 80:
-        raise ValueError("bio too long")
+    if len(s) > 300:
+        raise ValueError("bio must be at most 300 characters")
     return s
 
 
@@ -202,6 +204,7 @@ def apply_user_update(
             created_at=now,
         )
         db.add(row)
+        ensure_user_handle(db, row)
         db.flush()
         record_user_text(db, row)
         return row

@@ -267,6 +267,7 @@ def _item_from_published(
     avatar_url = ""
     thumbnail_url = ""
     nickname = ""
+    handle = ""
     if row.user_id:
         author = (
             context.authors_by_id.get(row.user_id)
@@ -276,6 +277,7 @@ def _item_from_published(
         if author is not None:
             avatar_url = canonicalize_public_url(settings, author.avatar_url) or ""
             nickname = author.nickname or ""
+            handle = author.handle or ""
 
     cover = (
         context.covers_by_id.get(row.cover_media_object_id or "")
@@ -402,6 +404,7 @@ def _item_from_published(
         ),
         user_id=row.user_id,
         nickname=nickname,
+        handle=handle,
         avatar_url=avatar_url,
         thumbnail_url=thumbnail_url,
         play_count=play_count,

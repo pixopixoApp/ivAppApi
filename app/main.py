@@ -15,6 +15,7 @@ from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
 from app.routers import (
     admin,
+    creator_channels,
     feed,
     media_storage,
     platform,
@@ -82,6 +83,10 @@ app.include_router(social.public_router)
 app.include_router(social.app_router)
 app.include_router(social.web_router)
 app.include_router(social.operations_router)
+app.include_router(creator_channels.public_router)
+app.include_router(creator_channels.router)
+app.include_router(creator_channels.operations_router)
+app.include_router(creator_channels.media_router)
 app.include_router(social_seed.router)
 app.include_router(web.router)
 app.include_router(web.invite_router)

@@ -27,6 +27,7 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
+from app.creator_channels import unpin_video
 from app.creator_drafts import draft_page, require_other_creations_idle
 from app.creator_interaction_presets import (
     creator_interaction_presets,
@@ -2258,6 +2259,7 @@ def delete_published_video(
     if not bool(video.is_deleted) or video.deleted_at is None:
         video.is_deleted = 1
         video.deleted_at = _now()
+        unpin_video(db, video_id)
         cancel_warming_publications(
             db,
             video_id=video_id,

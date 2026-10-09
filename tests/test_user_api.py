@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import event
 
 from app.db import engine
@@ -119,15 +121,17 @@ def test_follow_rejects_disabled_target(db) -> None:
 
 def test_avatar_upload_no_longer_calls_storage_with_wrong_signature(db) -> None:
     token = _user(db, "avatar-user")
+    image = BytesIO()
+    Image.new("RGB", (4, 4), (18, 52, 86)).save(image, format="PNG")
     with TestClient(app) as client:
         response = client.post(
             "/avatar",
             data={"token": token},
-            files={"file": ("avatar.png", b"not-a-real-image-but-nonempty", "image/png")},
+            files={"file": ("avatar.png", image.getvalue(), "image/png")},
         )
     assert response.status_code == 200
     assert response.json()["head"]["status"] == 0
-    assert response.json()["body"]["avatar_url"].endswith("avatar-user.png")
+    assert response.json()["body"]["avatar_url"].endswith(".webp")
 
 
 class _MemoryImpressions:

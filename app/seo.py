@@ -292,6 +292,7 @@ def seo_public_item(
         "author": {
             "id": row.user_id or "",
             "name": ((author.nickname if author else "") or "Pixopixo Creator"),
+            "handle": ((author.handle if author else "") or ""),
             "avatar_url": ((author.avatar_url if author else "") or ""),
         },
         "thumbnail_url": thumbnail,

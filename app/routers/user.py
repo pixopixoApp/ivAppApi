@@ -16,6 +16,8 @@ from app.auth_user import (
 )
 from app.avatar_storage import AvatarStorageError, store_user_avatar
 from app.config import Settings, get_settings
+from app.creator_channels import channel_relations, ensure_user_handle
+from app.creator_channels import iso as channel_iso
 from app.db import get_db
 from app.logging_config import get_logger
 from app.models import Follow, User
@@ -125,12 +127,28 @@ _FOLLOWEE_FEED_CAP = 500
 
 def _profile_body(db: Session, settings: Settings, user: User) -> ProfileBodyOut:
     fields = to_profile_fields(user)
+    handle = ensure_user_handle(db, user)
+    links, topics, pins = channel_relations(db, user.user_id)
     following_count, follower_count = follow_counts(db, user.user_id)
     return ProfileBodyOut(
         user_id=str(fields["user_id"]),
         nickname=str(fields["nickname"]),
+        handle=handle,
+        share_url=f"https://pixopixo.com/@{handle}" if handle else "",
         avatar_url=canonicalize_public_url(settings, str(fields["avatar_url"])) or "",
         bio=str(fields["bio"]),
+        background_url=canonicalize_public_url(settings, user.background_url) or "",
+        background_mobile_url=canonicalize_public_url(settings, user.background_mobile_url) or "",
+        background_desktop_url=canonicalize_public_url(settings, user.background_desktop_url) or "",
+        background_focus_x=user.background_focus_x,
+        background_focus_y=user.background_focus_y,
+        content_language=user.content_language or "",
+        collaboration_email=user.collaboration_email or "",
+        collaboration_email_public=bool(user.collaboration_email_public),
+        external_links=links,
+        topics=topics,
+        pinned_video_ids=pins,
+        profile_updated_at=channel_iso(user.profile_updated_at),
         email=str(fields["email"]),
         enabled=bool(fields["enabled"]),
         following_count=following_count,
@@ -142,11 +160,26 @@ def _public_profile_body(
     db: Session, settings: Settings, user: User, *, viewer_user_id: str
 ) -> PublicProfileBodyOut:
     following_count, follower_count = follow_counts(db, user.user_id)
+    handle = ensure_user_handle(db, user)
+    links, topics, pins = channel_relations(db, user.user_id)
     return PublicProfileBodyOut(
         user_id=user.user_id,
         nickname=user.nickname or "",
+        handle=handle,
+        share_url=f"https://pixopixo.com/@{handle}" if handle else "",
         avatar_url=canonicalize_public_url(settings, user.avatar_url) or "",
         bio=user.bio or "",
+        background_url=canonicalize_public_url(settings, user.background_url) or "",
+        background_mobile_url=canonicalize_public_url(settings, user.background_mobile_url) or "",
+        background_desktop_url=canonicalize_public_url(settings, user.background_desktop_url) or "",
+        background_focus_x=user.background_focus_x,
+        background_focus_y=user.background_focus_y,
+        content_language=user.content_language or "",
+        external_links=links,
+        topics=topics,
+        collaboration_email=(user.collaboration_email or None) if user.collaboration_email_public else None,
+        pinned_video_ids=pins,
+        profile_updated_at=channel_iso(user.profile_updated_at),
         enabled=bool(user.enabled),
         following_count=following_count,
         follower_count=follower_count,
@@ -190,6 +223,7 @@ def _follow_list_items(
             FollowingItemOut(
                 user_id=peer_id,
                 nickname=(peer.nickname if peer is not None else "") or "",
+                handle=ensure_user_handle(db, peer) if peer is not None else "",
                 avatar_url=(
                     canonicalize_public_url(settings, peer.avatar_url)
                     if peer is not None
@@ -250,8 +284,8 @@ def _follow_page(
     "/avatar",
     response_model=AvatarResponse,
     summary="上传当前用户头像",
-    description="multipart：`token`（登录凭证）+ `file`（jpg/png/webp，最大 2MB）。"
-    "落盘到 MEDIA_ROOT/avatars，更新 avatar_url 为相对路径 `/media/avatars/{user_id}.{ext}`。"
+    description="multipart：`token`（登录凭证）+ `file`（jpg/png/webp，最大 5MB）。"
+    "服务端解码并生成无元数据的方形 WebP，更新 avatar_url 为不可变资源地址。"
     "成功 body 与 profile 同形；非法文件 status=100；无效 token status=101。",
 )
 async def post_avatar(

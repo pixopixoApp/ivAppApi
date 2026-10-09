@@ -24,6 +24,15 @@ from sqlalchemy.orm import Session
 from app.auth_user import AppUser, issue_user_token
 from app.avatar_storage import AvatarStorageError, store_user_avatar
 from app.config import Settings, get_settings
+from app.creator_channels import (
+    channel_relations,
+    ensure_user_handle,
+    handle_change_available_at,
+    now_utc,
+)
+from app.creator_channels import (
+    iso as channel_iso,
+)
 from app.credits import bind_referral_for_new_user, get_referral_reward_config
 from app.db import get_db
 from app.google_auth import GoogleAuthUnavailable, verify_google_id_token
@@ -118,6 +127,8 @@ def _bind_web_invite_if_present(
 
 
 def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
+    handle = ensure_user_handle(db, user)
+    links, topics, pinned_video_ids = channel_relations(db, user.user_id)
     following_count, follower_count = follow_counts(db, user.user_id)
     received_expression = PublishedVideo.like_count
     if preview_enabled(db):
@@ -142,8 +153,24 @@ def _profile(db: Session, settings: Settings, user: User) -> WebProfileOut:
         provider=user.provider,
         email=user.subject if user.provider == "email" else "",
         nickname=user.nickname or "",
+        handle=handle,
+        share_url=f"https://pixopixo.com/@{handle}" if handle else "",
         avatar_url=canonicalize_public_url(settings, user.avatar_url) or "",
         bio=user.bio or "",
+        background_url=canonicalize_public_url(settings, user.background_url) or "",
+        background_mobile_url=canonicalize_public_url(settings, user.background_mobile_url) or "",
+        background_desktop_url=canonicalize_public_url(settings, user.background_desktop_url) or "",
+        background_focus_x=max(0.0, min(1.0, user.background_focus_x)),
+        background_focus_y=max(0.0, min(1.0, user.background_focus_y)),
+        content_language=user.content_language or "",
+        collaboration_email=user.collaboration_email or "",
+        collaboration_email_public=bool(user.collaboration_email_public),
+        external_links=links,
+        topics=topics,
+        pinned_video_ids=pinned_video_ids,
+        handle_changed_at=channel_iso(user.handle_changed_at),
+        handle_change_available_at=channel_iso(handle_change_available_at(user)),
+        profile_updated_at=channel_iso(user.profile_updated_at),
         following_count=following_count,
         follower_count=follower_count,
         work_count=int(work_count or 0),
@@ -426,6 +453,7 @@ def update_web_profile(
             row.bio = normalize_bio(payload.bio)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    row.profile_updated_at = now_utc()
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -456,6 +484,7 @@ async def update_web_avatar(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     row.avatar_url = relative
     row.avatar_media_object_id = media_object_id
+    row.profile_updated_at = now_utc()
     db.add(row)
     db.commit()
     db.refresh(row)
