@@ -75,12 +75,15 @@ def upgrade() -> None:
             batch.add_column(sa.Column("handle_changed_at", sa.DateTime(timezone=True), nullable=True))
         if "profile_updated_at" not in columns:
             batch.add_column(sa.Column("profile_updated_at", sa.DateTime(timezone=True), nullable=True))
+        # MySQL rejects defaults on TEXT columns. Add these as nullable first so
+        # the migration also works on populated tables, backfill them below,
+        # then make them non-null without a server default.
         if "background_url" not in columns:
-            batch.add_column(sa.Column("background_url", sa.Text(), nullable=False, server_default=""))
+            batch.add_column(sa.Column("background_url", sa.Text(), nullable=True))
         if "background_mobile_url" not in columns:
-            batch.add_column(sa.Column("background_mobile_url", sa.Text(), nullable=False, server_default=""))
+            batch.add_column(sa.Column("background_mobile_url", sa.Text(), nullable=True))
         if "background_desktop_url" not in columns:
-            batch.add_column(sa.Column("background_desktop_url", sa.Text(), nullable=False, server_default=""))
+            batch.add_column(sa.Column("background_desktop_url", sa.Text(), nullable=True))
         if "background_focus_x" not in columns:
             batch.add_column(sa.Column("background_focus_x", sa.Float(), nullable=False, server_default="0.5"))
         if "background_focus_y" not in columns:
@@ -91,6 +94,25 @@ def upgrade() -> None:
             batch.add_column(sa.Column("collaboration_email", sa.String(256), nullable=False, server_default=""))
         if "collaboration_email_public" not in columns:
             batch.add_column(sa.Column("collaboration_email_public", sa.Boolean(), nullable=False, server_default=sa.false()))
+
+    for column_name in (
+        "background_url",
+        "background_mobile_url",
+        "background_desktop_url",
+    ):
+        bind.execute(sa.text(f"UPDATE users SET {column_name} = '' WHERE {column_name} IS NULL"))
+    with op.batch_alter_table("users") as batch:
+        for column_name in (
+            "background_url",
+            "background_mobile_url",
+            "background_desktop_url",
+        ):
+            batch.alter_column(
+                column_name,
+                existing_type=sa.Text(),
+                nullable=False,
+                server_default=None,
+            )
 
     rows = bind.execute(sa.text(
         "SELECT user_id, nickname, internal_purpose FROM users "
