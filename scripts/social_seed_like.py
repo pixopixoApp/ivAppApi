@@ -465,7 +465,7 @@ def load_video_targets(db, *, rng: random.Random) -> list[VideoTarget]:
         lifetime = max(LIKES_PER_VIDEO_MIN, min(lifetime, LIKES_PER_VIDEO_MAX))
         # Comment target: proportional to like target, tilted by quality level.
         ratio = rng.uniform(COMMENT_RATIO_MIN, COMMENT_RATIO_MAX)
-        comment_target = int(round(lifetime * ratio * COMMENT_LEVEL_FACTOR[level]))
+        comment_target = round(lifetime * ratio * COMMENT_LEVEL_FACTOR[level])
         comment_target = max(0, min(comment_target, COMMENT_PER_VIDEO_MAX))
         hints = _timeline_hints(timeline)
         type_list = _parse_interaction_types(types)
@@ -592,7 +592,7 @@ def plan_due_likes(
     weighted_pool: list[VideoTarget] = []
     per_video_today_cap: dict[str, int] = {}
     for target in targets:
-        repeats = max(1, int(round(target.weight / 5)))
+        repeats = max(1, round(target.weight / 5))
         weighted_pool.extend([target] * repeats)
         per_video_today_cap[target.video_id] = max(
             1, target.lifetime_target // max(1, RAMP_DAYS_MAX)
@@ -978,7 +978,7 @@ def plan_comments(
         remaining = t.comment_target - state.per_video_total.get(t.video_id, 0)
         if remaining <= 0:
             continue
-        repeats = max(1, int(round(t.weight / 5)))
+        repeats = max(1, round(t.weight / 5))
         weighted.extend([t] * repeats)
     if not weighted:
         return []
@@ -1383,6 +1383,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except SystemExit:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"social-seed-like: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

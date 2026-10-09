@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-
-import pytest
 
 from scripts import social_seed_like as like
 
