@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -12,11 +14,21 @@ from sqlalchemy import inspect, text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.creator_channels import (
-    RESERVED_HANDLES,
-    _nickname_handle,
-)
 from app.db import engine
+
+RESERVED_HANDLES = frozenset({
+    "admin", "api", "assets", "create", "download", "explore", "help",
+    "login", "me", "media", "moderator", "privacy", "settings", "support",
+    "terms", "videos", "www", "pixopixo", "pixo",
+})
+
+
+def _nickname_handle(raw: str) -> str:
+    ascii_value = unicodedata.normalize("NFKD", raw or "").encode(
+        "ascii", "ignore"
+    ).decode()
+    value = re.sub(r"[^a-z0-9_]+", "_", ascii_value.lower()).strip("_")
+    return re.sub(r"_+", "_", value)[:30]
 
 
 def _candidate(nickname: str, user_id: str, occupied: set[str]) -> tuple[str, bool]:
