@@ -7,6 +7,7 @@ from io import BytesIO
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from app.avatar_storage import prepare_backgrounds
 from app.main import app
 from app.models import (
     CreatorProfileAudit,
@@ -202,6 +203,20 @@ def test_channel_images_are_decoded_reencoded_and_type_checked(db) -> None:
         deleted = client.delete("/api/v1/channel/background", headers=_auth(token))
         assert deleted.status_code == 200
         assert deleted.json()["background_url"] == ""
+
+
+def test_channel_background_renditions_use_bounded_banner_ratios() -> None:
+    buffer = BytesIO()
+    Image.new("RGB", (900, 1600), (90, 140, 40)).save(buffer, format="PNG")
+
+    desktop, mobile = prepare_backgrounds(
+        buffer.getvalue(), content_type="image/png", focus_x=0.4, focus_y=0.7,
+    )
+
+    with Image.open(BytesIO(desktop)) as desktop_image:
+        assert desktop_image.size == (2400, 800)
+    with Image.open(BytesIO(mobile)) as mobile_image:
+        assert mobile_image.size == (1440, 810)
 
 
 def test_topic_archive_replacement_is_transactional_deduplicated_and_audited(db) -> None:

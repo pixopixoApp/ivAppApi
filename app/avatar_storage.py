@@ -20,6 +20,8 @@ MAX_AVATAR_BYTES = 5 * 1024 * 1024
 MAX_BACKGROUND_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 AVATAR_SIZE = 512
+BACKGROUND_DESKTOP_SIZE = (2400, 800)
+BACKGROUND_MOBILE_SIZE = (1440, 810)
 
 _CONTENT_TYPE_EXT = {
     "image/jpeg": "jpg",
@@ -124,8 +126,8 @@ def prepare_backgrounds(
     image = _decoded_image(
         raw, content_type=content_type, max_bytes=MAX_BACKGROUND_BYTES, kind="background"
     )
-    desktop = _webp(_cover_crop(image, (2400, 800), focus_x, focus_y), quality=86)
-    mobile = _webp(_cover_crop(image, (1080, 1350), focus_x, focus_y), quality=86)
+    desktop = _webp(_cover_crop(image, BACKGROUND_DESKTOP_SIZE, focus_x, focus_y), quality=86)
+    mobile = _webp(_cover_crop(image, BACKGROUND_MOBILE_SIZE, focus_x, focus_y), quality=86)
     return desktop, mobile
 
 
