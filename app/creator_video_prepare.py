@@ -40,7 +40,11 @@ def prepared_creator_video(source: Path, settings: Settings):
                     "-map",
                     "0:a:0?",
                     "-vf",
-                    "scale=w='min(1080,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    (
+                        "scale=w='min(1080,iw)':h='min(1920,ih)':"
+                        "force_original_aspect_ratio=decrease,"
+                        "scale=w='trunc(iw/2)*2':h=-2"
+                    ),
                     "-c:v",
                     "libx264",
                     "-preset",

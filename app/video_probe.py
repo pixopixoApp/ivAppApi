@@ -27,7 +27,7 @@ def probe_video(path: Path, *, timeout_seconds: float = 15.0) -> VideoMetadata:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "format=duration:stream=width,height",
+                "format=duration:stream=width,height,duration",
                 "-of",
                 "json",
                 str(path),
@@ -40,7 +40,13 @@ def probe_video(path: Path, *, timeout_seconds: float = 15.0) -> VideoMetadata:
         payload = json.loads(completed.stdout)
         streams = payload.get("streams") or []
         stream = streams[0]
-        duration = float((payload.get("format") or {}).get("duration"))
+        format_duration = float((payload.get("format") or {}).get("duration"))
+        stream_duration_value = stream.get("duration")
+        try:
+            stream_duration = float(stream_duration_value)
+        except (TypeError, ValueError):
+            stream_duration = 0
+        duration = stream_duration if stream_duration > 0 else format_duration
         width = int(stream.get("width"))
         height = int(stream.get("height"))
     except (subprocess.SubprocessError, OSError, ValueError, TypeError, IndexError, json.JSONDecodeError) as exc:
