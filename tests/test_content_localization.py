@@ -21,8 +21,14 @@ from app.locale import (
 )
 from app.main import app
 from app.messages import localized_error
-from app.models import ContentLocalization, ContentTranslationJob, PublishedVideo
+from app.models import (
+    ContentLocalization,
+    ContentTranslationJob,
+    PublishedVideo,
+    PublishedVideoSeo,
+)
 from app.protocol_video import compile_runtime_spec, runtime_spec_version_from_compiled
+from app.seo import source_hash as seo_source_hash
 
 
 def _published(video_id: str = "localized") -> PublishedVideo:
@@ -32,6 +38,8 @@ def _published(video_id: str = "localized") -> PublishedVideo:
         source={"interactions": [{"gesture": "tap", "gate_at_ms": 1000}]},
         video_url=f"/media/{video_id}.mp4",
     )
+    runtime["video"][0]["interactions"][0]["success_text"] = "Great move!"
+    runtime["video"][0]["interactions"][0]["miss_text"] = "Try the move again."
     return PublishedVideo(
         id=video_id,
         content_type="runtime",
@@ -53,6 +61,8 @@ def _translated(source: dict, locale: str) -> dict:
     payload["description"] = f"{locale} description"
     for value in payload["interactions"].values():
         value["description"] = f"{locale} action"
+        value["success_text"] = f"{locale} success"
+        value["miss_text"] = f"{locale} miss"
     return payload
 
 
@@ -155,6 +165,8 @@ def test_batch_result_overlays_only_visible_runtime_text(db) -> None:
     original_interaction = before["video"][0]["interactions"][0]
     translated_interaction = translated_runtime["video"][0]["interactions"][0]
     assert translated_interaction["description"] == "ja action"
+    assert translated_interaction["success_text"] == "ja success"
+    assert translated_interaction["miss_text"] == "ja miss"
     for field in ("id", "type", "offset_time_ms", "detection", "on_success", "on_miss"):
         assert translated_interaction[field] == original_interaction[field]
     assert row.runtime_spec == before
@@ -224,6 +236,60 @@ def test_video_detail_displays_localized_title_description_and_runtime(
     assert item["video"][0]["interactions"][0]["description"] == "ja action"
     assert item["localization"]["status"] == "ready"
     assert response.headers["content-language"] == "ja"
+    get_settings.cache_clear()
+
+
+def test_public_seo_derives_interaction_summary_from_localized_runtime(
+    db,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CONTENT_LOCALIZATION_ENABLED", "true")
+    get_settings.cache_clear()
+    row = _published("localized-seo-summary")
+    row.distribution_enabled = True
+    row.cdn_ready = True
+    db.add(row)
+    job = queue_content_translation(db, row)
+    db.commit()
+    assert job is not None
+    source = extract_source_payload(row)
+    apply_translation_result(
+        db,
+        job,
+        {
+            "detected_source_locale": "en",
+            "translations": {"ja": _translated(source, "ja")},
+            "model": "test-model",
+            "usage": {},
+        },
+    )
+    db.add(
+        PublishedVideoSeo(
+            video_id=row.id,
+            slug="localized-seo-summary-12345",
+            page_title=row.title,
+            page_description=row.description,
+            meta_title=f"{row.title} | Pixopixo",
+            meta_description=row.description,
+            interaction_types=["tap"],
+            interaction_summary="Tap once to continue the scene.",
+            thumbnail_url="https://pixopixo.com/posters/localized.jpg",
+            status="ready",
+            source_hash=seo_source_hash(row),
+        )
+    )
+    db.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/public/seo/experiences/localized-seo-summary-12345",
+            headers={"Accept-Language": "ja"},
+        )
+
+    assert response.status_code == 200
+    item = response.json()
+    assert item["interaction_summary"] == "ja action"
+    assert item["interaction_summary_locale"] == "ja"
     get_settings.cache_clear()
 
 

@@ -172,8 +172,8 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
             f"/api/v1/public/seo/experiences/{slug}",
             headers={"Accept-Language": "zh-CN"},
         )
-    assert localized.json()["canonical_url"] == detail.json()["canonical_url"]
-    assert "/zh-hans/" not in localized.json()["canonical_url"]
+    assert localized.json()["canonical_url"].endswith(f"/zh-hans/videos/{slug}")
+    assert localized.json()["canonical_url"] != detail.json()["canonical_url"]
 
 
 def test_explore_orders_by_weight_then_recency_across_filtered_pages(db) -> None:

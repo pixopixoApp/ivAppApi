@@ -1,0 +1,5 @@
+{
+  "errors": {
+    "insufficientCredits": "You need {required} Credits."
+  }
+}

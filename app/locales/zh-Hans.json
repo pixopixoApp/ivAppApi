@@ -1,0 +1,5 @@
+{
+  "errors": {
+    "insufficientCredits": "你需要 {required} Credits。"
+  }
+}

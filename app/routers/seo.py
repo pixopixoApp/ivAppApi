@@ -64,6 +64,17 @@ _INTERACTION_TYPES_BY_GROUP: dict[InteractionGroup, frozenset[str]] = {
     }),
 }
 
+_WEB_LOCALE_PREFIXES = {
+    "zh-Hans": "/zh-hans",
+    "zh-Hant": "/zh-hant",
+    "ja": "/ja",
+    "ko": "/ko",
+    "es": "/es",
+    "pt-BR": "/pt-br",
+    "fr": "/fr",
+    "de": "/de",
+}
+
 
 def _site_url(settings: Settings) -> str:
     return settings.seo_public_base_url.strip().rstrip("/") or "https://pixopixo.com"
@@ -71,6 +82,29 @@ def _site_url(settings: Settings) -> str:
 
 def _cache(response: Response, seconds: int = 300) -> None:
     response.headers["Cache-Control"] = f"public, max-age=0, s-maxage={seconds}, stale-while-revalidate=600"
+
+
+def _localized_video_path(slug: str, locale: str) -> str:
+    return f"{_WEB_LOCALE_PREFIXES.get(locale, '')}/videos/{slug}"
+
+
+def _runtime_interaction_summary(runtime_spec: Any) -> str:
+    if not isinstance(runtime_spec, dict):
+        return ""
+    descriptions: list[str] = []
+    for clip in runtime_spec.get("video") or []:
+        if not isinstance(clip, dict):
+            continue
+        for interaction in clip.get("interactions") or []:
+            if not isinstance(interaction, dict):
+                continue
+            description = str(interaction.get("description") or "").strip()
+            if description and description not in descriptions:
+                descriptions.append(description)
+    # The detailed text is already translated and persisted by stable
+    # video/interaction id. Deriving this SEO view avoids a second LLM field
+    # that could drift away from the instructions used by the Runtime.
+    return " · ".join(descriptions[:3])[:500].rstrip()
 
 
 def _localized_public_item(
@@ -84,7 +118,7 @@ def _localized_public_item(
 ) -> dict[str, Any]:
     site_url = _site_url(settings)
     item = seo_public_item(row, seo, author, site_url=site_url)
-    title, description, _runtime, localization = localized_content(
+    title, description, localized_runtime, localization = localized_content(
         db,
         row,
         locale,
@@ -101,9 +135,19 @@ def _localized_public_item(
     if not use_legacy_english_seo:
         item["meta_title"] = f"{title} | Pixopixo"[:70]
         item["meta_description"] = description[:180]
-    # Locale is a presentation preference, not part of the permalink. Keeping
-    # the historic URL preserves existing search equity and shared links.
-    path = f"/videos/{seo.slug}"
+    item["interaction_summary_locale"] = "en"
+    summary_matches_locale = localization["status"] == "ready" or (
+        localization["status"] == "source"
+        and localization.get("source_locale") == locale
+    )
+    if locale != "en" and summary_matches_locale:
+        localized_summary = _runtime_interaction_summary(localized_runtime)
+        if localized_summary:
+            item["interaction_summary"] = localized_summary
+            item["interaction_summary_locale"] = locale
+    # English keeps the historic permalink; every translated document gets a
+    # stable visible locale path that matches Web canonical/hreflang metadata.
+    path = _localized_video_path(seo.slug, locale)
     item["canonical_url"] = f"{site_url}{path}"
     item["embed_url"] = item["canonical_url"]
     item["localization"] = localization
@@ -167,11 +211,12 @@ def resolve_public_experience(
     if result is None:
         raise HTTPException(status_code=404, detail="experience not found")
     row, seo, _author = result
+    locale = request_locale(request)
     _cache(response)
     return {
         "id": row.id,
         "slug": seo.slug,
-        "canonical_url": f"{_site_url(settings)}/videos/{seo.slug}",
+        "canonical_url": f"{_site_url(settings)}{_localized_video_path(seo.slug, locale)}",
     }
 
 

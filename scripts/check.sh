@@ -14,6 +14,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "[check] Localization catalogs and content boundaries"
+"$PYTHON_BIN" "$ROOT_DIR/scripts/check_localization_boundaries.py"
+
 echo "[check] Python syntax"
 PYTHONPYCACHEPREFIX="$CACHE_DIR/pycache" "$PYTHON_BIN" -m compileall -q \
   "$ROOT_DIR/app" "$ROOT_DIR/migrations" "$ROOT_DIR/scripts"
