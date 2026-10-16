@@ -131,8 +131,8 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
             },
         )
         assert generated.status_code == 200
-        assert generated.json()["ai_title_written"] is True
-        assert generated.json()["ai_description_written"] is True
+        assert generated.json()["ai_title_written"] is False
+        assert generated.json()["ai_description_written"] is False
 
         listing = client.get("/api/v1/public/seo/experiences")
         touch_listing = client.get(
@@ -166,6 +166,14 @@ def test_backfill_generation_and_public_permalink(db, monkeypatch) -> None:
     assert detail.status_code == 200
     assert detail.json()["canonical_url"].endswith(f"/videos/{slug}")
     assert resolved.json()["canonical_url"] == detail.json()["canonical_url"]
+
+    with TestClient(app) as client:
+        localized = client.get(
+            f"/api/v1/public/seo/experiences/{slug}",
+            headers={"Accept-Language": "zh-CN"},
+        )
+    assert localized.json()["canonical_url"] == detail.json()["canonical_url"]
+    assert "/zh-hans/" not in localized.json()["canonical_url"]
 
 
 def test_explore_orders_by_weight_then_recency_across_filtered_pages(db) -> None:

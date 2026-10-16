@@ -22,6 +22,7 @@ from app.auth_user import (
     resolve_request_token,
 )
 from app.config import Settings, get_settings
+from app.content_localization import localized_content
 from app.credits import activate_referral_from_android, bind_referral_for_new_user
 from app.db import get_db
 from app.feed_rank import (
@@ -46,6 +47,7 @@ from app.impressions import (
     get_recommend_store,
     user_seen_key,
 )
+from app.locale import request_locale
 from app.logging_config import get_logger
 from app.models import (
     AnalyticsLog,
@@ -257,6 +259,7 @@ def _item_from_published(
     public_share_base_url: str = "",
     supported_runtime_spec_versions: frozenset[str] = LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
     context: FeedItemContext | None = None,
+    locale: str = "en",
 ) -> FeedItemOut | None:
     if getattr(row, "is_deleted", 0) != 0 or row.deleted_at is not None:
         return None
@@ -309,6 +312,14 @@ def _item_from_published(
             thumbnail_url = candidate
 
     content_type = row.content_type or CONTENT_TYPE_RUNTIME
+    localized_title, localized_description, localized_runtime_spec, localization = (
+        localized_content(
+            db,
+            row,
+            locale,
+            enabled=settings.content_localization_enabled,
+        )
+    )
     clips = None
     html_url = None
     bridge_version = None
@@ -318,7 +329,7 @@ def _item_from_published(
             return None
         try:
             clips = read_runtime_spec(
-                canonicalize_public_payload(settings, row.runtime_spec),
+                canonicalize_public_payload(settings, localized_runtime_spec),
                 item_id=row.id,
                 version=row.runtime_spec_version,
             )
@@ -383,8 +394,8 @@ def _item_from_published(
         item_id=row.id,
         level=level,
         content_type=content_type,
-        title=row.title or "",
-        description=row.description or "",
+        title=localized_title,
+        description=localized_description,
         share_url=published_share_url(
             content_type=content_type,
             item_id=row.id,
@@ -435,6 +446,7 @@ def _item_from_published(
         html_url=html_url,
         bridge_version=bridge_version,
         required_capabilities=required_capabilities,
+        localization=localization,
     )
 
 
@@ -464,6 +476,7 @@ def list_published_items(
     cursor_secret: str,
     public_share_base_url: str = "",
     supported_runtime_spec_versions: frozenset[str] = LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS,
+    locale: str = "en",
 ) -> PublishedItemsPage:
     """Keyset-paginate persisted, visible Runtime and HTML items (newest first)."""
     q = (
@@ -516,6 +529,9 @@ def list_published_items(
             == LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS
         ) and cursor_versions != sorted(supported_runtime_spec_versions):
             raise CursorError("cursor runtime capabilities changed")
+        cursor_locale = values.get("locale")
+        if not (cursor_locale is None and locale == "en") and cursor_locale != locale:
+            raise CursorError("cursor locale changed")
         created_at = datetime_from_cursor_value(values.get("created_at"))
         row_id = values.get("id")
         if not isinstance(row_id, str) or not row_id:
@@ -549,6 +565,7 @@ def list_published_items(
             public_share_base_url=public_share_base_url,
             supported_runtime_spec_versions=supported_runtime_spec_versions,
             context=context,
+            locale=locale,
         )
         if item is None:
             continue
@@ -566,6 +583,7 @@ def list_published_items(
                 "created_at": datetime_to_cursor_value(last_row.created_at),
                 "id": last_row.id,
                 "experience_spec_versions": sorted(supported_runtime_spec_versions),
+                "locale": locale,
             },
             secret=cursor_secret,
         )
@@ -793,6 +811,7 @@ def _next_video_ids(
     cursor_token: str | None,
     cursor_secret: str,
     supported_runtime_spec_versions: frozenset[str],
+    locale: str,
 ) -> tuple[list[str], str | None]:
     weight_ordered, tutorial_id = _ordered_pool(
         db,
@@ -858,6 +877,9 @@ def _next_video_ids(
             == LEGACY_CLIENT_RUNTIME_SPEC_VERSIONS
         ) and cursor_versions != sorted(supported_runtime_spec_versions):
             raise CursorError("cursor runtime capabilities changed")
+        cursor_locale = values.get("locale")
+        if not (cursor_locale is None and locale == "en") and cursor_locale != locale:
+            raise CursorError("cursor locale changed")
     else:
         state = _locked_recommend_cursor(db, state_key=state_key)
         if cycle_resume_cursor is not None:
@@ -878,6 +900,7 @@ def _next_video_ids(
             values={
                 "index": new_cursor,
                 "experience_spec_versions": sorted(supported_runtime_spec_versions),
+                "locale": locale,
             },
             secret=cursor_secret,
         )
@@ -1296,6 +1319,7 @@ def _build_redis_recommend_ids(
     user_id: str | None,
     ssid: str,
     settings: Settings,
+    locale: str,
 ) -> tuple[list[str], bool, str]:
     """Redis 推荐主流程：橄榄型逐档抽样 → 高质量补位 → 回放 → 体验曲线排序。
 
@@ -1313,13 +1337,13 @@ def _build_redis_recommend_ids(
     is_guest = not user_id
     seen_key = None
     if is_guest:
-        seen_key = user_seen_key(ssid, is_guest=True)
+        seen_key = user_seen_key(f"{ssid}:locale:{locale}", is_guest=True)
         store.clean_expired_seen(
             seen_key=seen_key,
             expire_ts=int(__import__("time").time()) - settings.recommend_guest_seen_ttl_seconds,
         )
     else:
-        seen_key = user_seen_key(user_id)
+        seen_key = user_seen_key(f"{user_id}:locale:{locale}")
         store.clean_expired_seen(
             seen_key=seen_key,
             expire_ts=int(__import__("time").time())
@@ -1424,6 +1448,7 @@ def post_video(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VideoResponse:
+    locale = request_locale(request)
     token = resolve_request_token(request, payload.head, act="video")
     user = resolve_current_user(request, db, token)
     limit = payload.body.limit
@@ -1449,6 +1474,7 @@ def post_video(
                 user_id=user.user_id if user else None,
                 ssid=ssid,
                 settings=settings,
+                locale=locale,
             )
         except (RedisError, ImpressionUnavailableError) as exc:
             log.warning(
@@ -1463,9 +1489,9 @@ def post_video(
         # 在 recommend_cursors 里插入一行造成表膨胀。
         stable_ssid = client_ssid or "anonymous"
         state_key = (
-            f"feed:user:{user.user_id}:spec:{capability_key}"
+            f"feed:user:{user.user_id}:locale:{locale}:spec:{capability_key}"
             if user
-            else f"feed:ssid:{stable_ssid}:spec:{capability_key}"
+            else f"feed:ssid:{stable_ssid}:locale:{locale}:spec:{capability_key}"
         )
         try:
             video_ids, next_cursor = _next_video_ids(
@@ -1476,6 +1502,7 @@ def post_video(
                 cursor_token=payload.body.cursor,
                 cursor_secret=settings.cursor_secret or settings.publish_key,
                 supported_runtime_spec_versions=supported_runtime_spec_versions,
+                locale=locale,
             )
         except CursorError as exc:
             log.warning("video invalid cursor err=%s", exc)
@@ -1509,6 +1536,7 @@ def post_video(
                 public_share_base_url=settings.public_share_base_url,
                 supported_runtime_spec_versions=supported_runtime_spec_versions,
                 context=context,
+                locale=locale,
             )
             if item is not None:
                 items.append(item)
@@ -1555,6 +1583,7 @@ def post_video(
             public_share_base_url=settings.public_share_base_url,
             supported_runtime_spec_versions=supported_runtime_spec_versions,
             context=context,
+            locale=locale,
         )
         if item is not None:
             items.append(item)
@@ -1624,6 +1653,7 @@ def post_video_detail(
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> VideoDetailResponse:
+    locale = request_locale(request)
     video_id = payload.body.video_id.strip()
     supported_runtime_spec_versions = normalize_client_runtime_spec_versions(
         payload.body.supported_experience_spec_versions,
@@ -1676,6 +1706,7 @@ def post_video_detail(
             [row],
             viewer_user_id=viewer.user_id if viewer else None,
         ),
+        locale=locale,
     )
     if item is None:
         return video_detail_error(ver=settings.server_ver, head_in=payload.head)

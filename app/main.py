@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.auth_user import AppAuthError
 from app.cdn_cache import validate_cdn_config
 from app.config import get_settings, validate_environment_contract
+from app.locale import LocaleMiddleware, request_locale
 from app.logging_config import get_logger, setup_logging
 from app.media_cache import initialize_cache
+from app.messages import localized_error
 from app.oss_storage import validate_oss_config
 from app.protocol_envelope import auth_fail_payload
 from app.routers import (
     admin,
     creator_channels,
     feed,
+    locale_detection,
     media_storage,
     platform,
     safety,
@@ -67,11 +72,13 @@ app = FastAPI(
     ],
     lifespan=lifespan,
 )
+app.add_middleware(LocaleMiddleware)
 app.include_router(admin.router)
 app.include_router(admin.media_router)
 app.include_router(media_storage.router)
 app.include_router(feed.public_router)
 app.include_router(feed.auth_router)
+app.include_router(locale_detection.router)
 app.include_router(user.upload_router)
 app.include_router(user.auth_router)
 app.include_router(platform.public_router)
@@ -92,6 +99,29 @@ app.include_router(web.router)
 app.include_router(web.invite_router)
 app.include_router(seo.public_router)
 app.include_router(seo.internal_router)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def localized_http_error_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    detail = exc.detail
+    if isinstance(detail, dict) and detail.get("code") == "INSUFFICIENT_CREDITS":
+        message = str(detail.get("message") or "You need more Credits.")
+        required_match = re.search(r"\b(\d+)\b", message)
+        required = int(required_match.group(1)) if required_match else 1
+        detail = localized_error(
+            request_locale(request),
+            error_code="INSUFFICIENT_CREDITS",
+            message_key="errors.insufficientCredits",
+            message_args={"required": required},
+            fallback=message,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": detail},
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(AppAuthError)

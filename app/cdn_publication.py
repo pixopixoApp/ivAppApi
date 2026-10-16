@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.content_localization import queue_content_translation
 from app.models import (
     CdnCacheJob,
     CdnPublicationGate,
@@ -91,6 +92,11 @@ def _apply_payload(
     db.add(row)
     record_published_video_text(db, row)
     mark_seo_stale(db, row)
+    # Queue only after the staged payload is active so an update can never
+    # translate the previous public title/runtime by accident. The queue is
+    # source-hash idempotent, so creator publications that queued earlier are
+    # harmlessly deduplicated here.
+    queue_content_translation(db, row)
     creation = db.get(CreatorCreation, row.id)
     if creation is not None and isinstance(row.runtime_spec, dict):
         creation.runtime_spec = row.runtime_spec

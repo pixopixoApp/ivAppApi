@@ -73,6 +73,8 @@ services:
       MEDIA_CACHE_ROOT: /data/media-cache
       CREATOR_LOCAL_UPLOAD_ENABLED: ${CREATOR_LOCAL_UPLOAD_ENABLED:-true}
       CREATOR_LEGACY_OSS_UPLOAD_ENABLED: ${CREATOR_LEGACY_OSS_UPLOAD_ENABLED:-true}
+      GEOIP_COUNTRY_DATABASE: ${GEOIP_COUNTRY_DATABASE:-/data/geoip/GeoLite2-Country.mmdb}
+      GEOIP_TRUST_PROXY_HEADERS: ${GEOIP_TRUST_PROXY_HEADERS:-false}
     ports:
       - "0.0.0.0:${API_PORT:-8100}:8100"  # TEST: temp public bind, revert to 127.0.0.1
     volumes:
@@ -81,6 +83,7 @@ services:
       - ./scripts:/app/scripts:ro
       - ${HTML_IMPORT_SPOOL_HOST_PATH:-./volumes/html-imports}:/data/html-imports
       - ${MEDIA_CACHE_HOST_PATH:-/opt/play_video/shared/media-cache}:/data/media-cache
+      - ./data/geoip:/data/geoip:ro
     networks:
       default:
       pixo-backend:

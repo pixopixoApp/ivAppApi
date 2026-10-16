@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.cdn_cache import enqueue_private_media_prefetch
 from app.config import Settings, get_settings, validate_environment_contract
+from app.content_localization import process_next_content_translation
 from app.credits import release_reference, settle_reference
 from app.db import SessionLocal, engine
 from app.logging_config import get_logger, setup_logging
@@ -1180,7 +1181,12 @@ def main() -> int:
                 generated = process_next_source_generation(settings)
                 created = process_next_creator_version(settings)
                 expired = process_next_expired_source(settings)
-                processed = normalized or generated or created or expired
+                with SessionLocal() as localization_db:
+                    translated = process_next_content_translation(
+                        localization_db,
+                        settings,
+                    )
+                processed = normalized or generated or created or expired or translated
         if rebuild_interval > 0:
             now = time.monotonic()
             if now >= next_rebuild_at:

@@ -185,6 +185,80 @@ class PublishedVideoSeoSlugAlias(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ContentLocalization(Base):
+    """Validated machine translation for one immutable source revision."""
+
+    __tablename__ = "content_localizations"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_type",
+            "entity_id",
+            "locale",
+            name="uq_content_localizations_entity_locale",
+        ),
+        Index(
+            "ix_content_localizations_status_locale",
+            "status",
+            "locale",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_type: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    locale: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_locale: Mapped[str] = mapped_column(String(16), nullable=False, default="en")
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ready", index=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ContentTranslationJob(Base):
+    """Durable ivapp-owned request submitted to ivadmin for one source hash."""
+
+    __tablename__ = "content_translation_jobs"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_content_translation_jobs_request_id"),
+        Index(
+            "ix_content_translation_jobs_claim",
+            "status",
+            "next_retry_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_locale: Mapped[str] = mapped_column(String(16), nullable=False, default="en")
+    target_locales: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    source_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class PublicTextIssue(Base):
     """Non-blocking audit record for text that may not be English.
 

@@ -11,6 +11,9 @@ data/*
 !data/social-seed/
 data/social-seed/*
 !data/social-seed/prelaunch-v1-manifest.json
+!data/geoip/
+data/geoip/*
+!data/geoip/README.md
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

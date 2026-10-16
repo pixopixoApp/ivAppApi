@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import String, cast, or_
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
+from app.content_localization import localized_content
 from app.db import get_db
 from app.deps import require_publish_key
+from app.locale import request_locale
 from app.models import (
     MediaObject,
     PublishedVideo,
@@ -27,7 +29,6 @@ from app.schemas_seo import (
 from app.seo import (
     SEO_STATUSES,
     ensure_seo_row,
-    is_placeholder_text,
     mark_seo_stale,
     seo_public_item,
     source_hash,
@@ -72,8 +73,46 @@ def _cache(response: Response, seconds: int = 300) -> None:
     response.headers["Cache-Control"] = f"public, max-age=0, s-maxage={seconds}, stale-while-revalidate=600"
 
 
+def _localized_public_item(
+    db: Session,
+    row: PublishedVideo,
+    seo: PublishedVideoSeo,
+    author: Any,
+    *,
+    settings: Settings,
+    locale: str,
+) -> dict[str, Any]:
+    site_url = _site_url(settings)
+    item = seo_public_item(row, seo, author, site_url=site_url)
+    title, description, _runtime, localization = localized_content(
+        db,
+        row,
+        locale,
+        enabled=settings.content_localization_enabled,
+    )
+    use_legacy_english_seo = (
+        locale == "en"
+        and row.content_type == "runtime"
+        and localization["status"] != "ready"
+    )
+    if not use_legacy_english_seo:
+        item["title"] = title
+        item["description"] = description
+    if not use_legacy_english_seo:
+        item["meta_title"] = f"{title} | Pixopixo"[:70]
+        item["meta_description"] = description[:180]
+    # Locale is a presentation preference, not part of the permalink. Keeping
+    # the historic URL preserves existing search equity and shared links.
+    path = f"/videos/{seo.slug}"
+    item["canonical_url"] = f"{site_url}{path}"
+    item["embed_url"] = item["canonical_url"]
+    item["localization"] = localization
+    return item
+
+
 @public_router.get("/experiences")
 def list_public_experiences(
+    request: Request,
     response: Response,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -99,10 +138,15 @@ def list_public_experiences(
         .limit(page_size)
         .all()
     )
-    site_url = _site_url(settings)
+    locale = request_locale(request)
     _cache(response)
     return {
-        "items": [seo_public_item(row, seo, author, site_url=site_url) for row, seo, author in rows],
+        "items": [
+            _localized_public_item(
+                db, row, seo, author, settings=settings, locale=locale
+            )
+            for row, seo, author in rows
+        ],
         "page": page,
         "page_size": page_size,
         "total": total,
@@ -114,6 +158,7 @@ def list_public_experiences(
 @public_router.get("/resolve/{video_id}")
 def resolve_public_experience(
     video_id: str,
+    request: Request,
     response: Response,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -133,6 +178,7 @@ def resolve_public_experience(
 @public_router.get("/experiences/{slug}")
 def get_public_experience(
     slug: str,
+    request: Request,
     response: Response,
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -149,8 +195,10 @@ def get_public_experience(
     if result is None:
         raise HTTPException(status_code=404, detail="experience not found")
     row, seo, author = result
-    site_url = _site_url(settings)
-    item = seo_public_item(row, seo, author, site_url=site_url)
+    locale = request_locale(request)
+    item = _localized_public_item(
+        db, row, seo, author, settings=settings, locale=locale
+    )
     related_rows = (
         visible_experience_query(db)
         .filter(PublishedVideo.id != row.id)
@@ -159,7 +207,14 @@ def get_public_experience(
         .all()
     )
     item["related"] = [
-        seo_public_item(other, other_seo, other_author, site_url=site_url)
+        _localized_public_item(
+            db,
+            other,
+            other_seo,
+            other_author,
+            settings=settings,
+            locale=locale,
+        )
         for other, other_seo, other_author in related_rows
     ]
     _cache(response)
@@ -297,15 +352,10 @@ def put_seo_metadata(
     if payload.source_hash != current_hash:
         raise HTTPException(status_code=409, detail="published source changed during generation")
     seo = ensure_seo_row(db, row)
+    # SEO generation writes only the derived SEO document. Creator-authored
+    # canonical fields are immutable and are never replaced with generated copy.
     title_written = False
     description_written = False
-    if not seo.title_locked and is_placeholder_text(row.title):
-        row.title = payload.title.strip()
-        title_written = True
-    if not seo.description_locked and is_placeholder_text(row.description):
-        row.description = payload.description.strip()
-        description_written = True
-    # Source content may have been filled above. Bind readiness to the final row.
     final_hash = source_hash(row)
     if seo.generated_at is None and seo.status != "ready":
         seo.slug = unique_slug(db, payload.title, video_id=row.id)

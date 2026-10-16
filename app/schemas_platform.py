@@ -391,6 +391,7 @@ class CreatorPublishRequest(BaseModel):
     version_id: str | None = Field(default=None, max_length=64)
     title: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=1200)
+    source_locale_hint: str | None = Field(default=None, max_length=35)
 
 
 class CreatorPublishResponse(BaseModel):

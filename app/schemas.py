@@ -422,6 +422,14 @@ class InteractionOut(BaseModel):
     id: str
     type: str
     description: str
+    success_text: str | None = Field(
+        default=None,
+        description="可选的成功反馈显示文本；仅本地化覆盖，不影响动作语义",
+    )
+    miss_text: str | None = Field(
+        default=None,
+        description="可选的失败反馈显示文本；仅本地化覆盖，不影响动作语义",
+    )
     offset_time_ms: int
     active_until_ms: int | None = Field(
         default=None,
@@ -447,6 +455,14 @@ class ClipOut(BaseModel):
     def _omit_nulls(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
         return {k: v for k, v in data.items() if v is not None}
+
+
+class LocalizationOut(BaseModel):
+    requested_locale: str
+    resolved_locale: str
+    source_locale: str
+    status: Literal["source", "pending", "ready", "unsupported_content_type"]
+    machine_translated: bool
 
 
 class FeedItemOut(BaseModel):
@@ -488,6 +504,10 @@ class FeedItemOut(BaseModel):
     html_url: str | None = Field(default=None, description="HTML：受信 HTTPS 入口")
     bridge_version: int | None = Field(default=None, description="HTML Bridge 版本")
     required_capabilities: list[str] = Field(default_factory=list)
+    localization: LocalizationOut | None = Field(
+        default=None,
+        description="请求语言解析与作品翻译状态；旧客户端可安全忽略",
+    )
 
     @model_validator(mode="after")
     def _validate_content_payload(self) -> FeedItemOut:

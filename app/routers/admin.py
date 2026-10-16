@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
+from app.content_localization import SUPPORTED_LOCALES, queue_content_translation
 from app.creator_channels import unpin_video
 from app.db import engine, get_db
 from app.deps import require_publish_key
@@ -42,11 +44,14 @@ from app.html_content import (
 )
 from app.impressions import ImpressionUnavailableError, get_impression_store
 from app.interaction_inventory import interaction_filter_keys
+from app.locale import canonical_locale
 from app.logging_config import get_logger
 from app.media_api import RuntimeObjectPublishRequest, RuntimePreviewRequest
 from app.media_service import MediaServiceError, media_mode_is_oss
 from app.models import (
     AnalyticsLog,
+    ContentLocalization,
+    ContentTranslationJob,
     CreatorCreation,
     HtmlPackage,
     MediaObject,
@@ -116,6 +121,223 @@ log = get_logger(__name__)
 
 _CONTENT_MODE_SINGLE = "single"
 _CONTENT_MODE_STORY = "story"
+
+
+@router.get("/content-localizations/metrics")
+def content_localization_metrics(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+) -> dict[str, Any]:
+    """Aggregate translation health without exposing creator-authored text."""
+    total_runtime = (
+        db.query(func.count(PublishedVideo.id))
+        .filter(
+            PublishedVideo.is_deleted == 0,
+            PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+        )
+        .scalar()
+        or 0
+    )
+    statuses = dict(
+        db.query(ContentTranslationJob.status, func.count(ContentTranslationJob.id))
+        .group_by(ContentTranslationJob.status)
+        .all()
+    )
+    ready_entities: dict[str, set[str]] = {
+        locale: set() for locale in SUPPORTED_LOCALES
+    }
+    localized_rows = (
+        db.query(ContentLocalization.locale, ContentLocalization.entity_id)
+        .join(
+            PublishedVideo,
+            (ContentLocalization.entity_type == "published_video")
+            & (ContentLocalization.entity_id == PublishedVideo.id),
+        )
+        .filter(
+            ContentLocalization.status == "ready",
+            PublishedVideo.is_deleted == 0,
+            PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+        )
+        .all()
+    )
+    for locale, entity_id in localized_rows:
+        if locale in ready_entities:
+            ready_entities[locale].add(entity_id)
+    source_rows = (
+        db.query(ContentTranslationJob.source_locale, ContentTranslationJob.entity_id)
+        .join(
+            PublishedVideo,
+            (ContentTranslationJob.entity_type == "published_video")
+            & (ContentTranslationJob.entity_id == PublishedVideo.id),
+        )
+        .filter(
+            ContentTranslationJob.status == "ready",
+            PublishedVideo.is_deleted == 0,
+            PublishedVideo.content_type == CONTENT_TYPE_RUNTIME,
+        )
+        .distinct()
+        .all()
+    )
+    for source_locale, entity_id in source_rows:
+        locale = canonical_locale(source_locale)
+        if locale is not None:
+            ready_entities[locale].add(entity_id)
+    ready_by_locale = {
+        locale: len(entity_ids) for locale, entity_ids in ready_entities.items()
+    }
+    durations = []
+    rows = (
+        db.query(ContentTranslationJob.started_at, ContentTranslationJob.completed_at)
+        .filter(
+            ContentTranslationJob.status == "ready",
+            ContentTranslationJob.started_at.is_not(None),
+            ContentTranslationJob.completed_at.is_not(None),
+        )
+        .order_by(ContentTranslationJob.completed_at.desc())
+        .limit(1000)
+        .all()
+    )
+    for started_at, completed_at in rows:
+        if started_at and completed_at:
+            durations.append(max(0.0, (completed_at - started_at).total_seconds()))
+    expected = total_runtime * len(SUPPORTED_LOCALES)
+    ready_total = sum(int(ready_by_locale.get(locale, 0)) for locale in SUPPORTED_LOCALES)
+    return {
+        "eligible_runtime_works": total_runtime,
+        "jobs_by_status": {status: int(statuses.get(status, 0)) for status in (
+            "queued", "running", "partial", "ready", "failed", "stale"
+        )},
+        "coverage_by_locale": {
+            locale: {
+                "ready": int(ready_by_locale.get(locale, 0)),
+                "eligible": total_runtime,
+                "ratio": round(int(ready_by_locale.get(locale, 0)) / total_runtime, 4)
+                if total_runtime else 1.0,
+            }
+            for locale in SUPPORTED_LOCALES
+        },
+        "average_translation_seconds": round(sum(durations) / len(durations), 3)
+        if durations else None,
+        "source_fallback_ratio": round(max(0, expected - ready_total) / expected, 4)
+        if expected else 0.0,
+        "input_tokens": int(db.query(func.sum(ContentTranslationJob.input_tokens)).scalar() or 0),
+        "output_tokens": int(db.query(func.sum(ContentTranslationJob.output_tokens)).scalar() or 0),
+    }
+
+
+@router.get("/content-localizations/jobs")
+def content_localization_jobs(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+    status: Annotated[str | None, Query(max_length=16)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, Any]:
+    query = db.query(ContentTranslationJob)
+    if status:
+        query = query.filter(ContentTranslationJob.status == status)
+    rows = query.order_by(ContentTranslationJob.created_at.desc()).limit(limit).all()
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "entity_type": row.entity_type,
+                "entity_id": row.entity_id,
+                "source_hash": row.source_hash,
+                "source_locale": row.source_locale,
+                "target_locales": row.target_locales,
+                "status": row.status,
+                "attempt": row.attempt,
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+                "last_error": row.last_error,
+                "created_at": row.created_at,
+                "started_at": row.started_at,
+                "completed_at": row.completed_at,
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.post("/content-localizations/retry")
+def retry_content_localizations(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+    job_id: Annotated[str | None, Query(max_length=64)] = None,
+) -> dict[str, int]:
+    query = db.query(ContentTranslationJob).filter(
+        ContentTranslationJob.status.in_(("failed", "partial"))
+    )
+    if job_id:
+        query = query.filter(ContentTranslationJob.id == job_id)
+    rows = query.order_by(ContentTranslationJob.created_at.asc()).limit(500).all()
+    for row in rows:
+        ready = {
+            value[0]
+            for value in db.query(ContentLocalization.locale).filter(
+                ContentLocalization.entity_type == row.entity_type,
+                ContentLocalization.entity_id == row.entity_id,
+                ContentLocalization.source_hash == row.source_hash,
+                ContentLocalization.status == "ready",
+            )
+        }
+        row.target_locales = [locale for locale in SUPPORTED_LOCALES if locale not in ready]
+        if not row.target_locales:
+            row.status = "ready"
+            row.completed_at = datetime.now(timezone.utc)
+            continue
+        row.status = "queued"
+        row.attempt = 0
+        row.request_id = f"retry:{row.id}:{uuid.uuid4().hex[:12]}"
+        row.next_retry_at = None
+        row.lease_until = None
+        row.completed_at = None
+        row.last_error = ""
+        row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"queued": len(rows)}
+
+
+@router.post("/content-localizations/retranslate")
+def retranslate_content_localizations(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_publish_key)],
+    model: Annotated[str | None, Query(max_length=128)] = None,
+    prompt_version: Annotated[str | None, Query(max_length=64)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, int]:
+    query = db.query(ContentLocalization).filter(ContentLocalization.status == "ready")
+    if model:
+        query = query.filter(ContentLocalization.model == model)
+    if prompt_version:
+        query = query.filter(ContentLocalization.prompt_version == prompt_version)
+    localizations = query.order_by(ContentLocalization.updated_at.asc()).limit(limit * 9).all()
+    entity_ids = list(dict.fromkeys(row.entity_id for row in localizations))[:limit]
+    queued = 0
+    now = datetime.now(timezone.utc)
+    for entity_id in entity_ids:
+        video = db.get(PublishedVideo, entity_id)
+        if video is None or video.is_deleted or video.content_type != CONTENT_TYPE_RUNTIME:
+            continue
+        job = queue_content_translation(db, video)
+        if job is None:
+            continue
+        for localization in localizations:
+            if localization.entity_id == entity_id and localization.source_hash == job.source_hash:
+                localization.status = "stale"
+                localization.updated_at = now
+        job.status = "queued"
+        job.attempt = 0
+        job.target_locales = list(SUPPORTED_LOCALES)
+        job.request_id = f"retranslate:{job.id}:{uuid.uuid4().hex[:8]}"
+        job.next_retry_at = None
+        job.lease_until = None
+        job.completed_at = None
+        job.last_error = ""
+        job.updated_at = now
+        queued += 1
+    db.commit()
+    return {"queued": queued}
 
 
 def _activate_public_creator(db: Session, user_id: str | None, activated_at: datetime) -> None:
@@ -662,6 +884,14 @@ async def publish(
     ],
     version: Annotated[str, Form(min_length=1, max_length=64, description="内容版本号")],
     user_id: Annotated[str, Form(min_length=1, max_length=64, description="作者 user_id")],
+    title: Annotated[
+        str | None,
+        Form(max_length=120, description="发布页确认后的最终标题"),
+    ] = None,
+    description: Annotated[
+        str | None,
+        Form(max_length=4000, description="发布页确认后的最终作品说明"),
+    ] = None,
     content_mode: Annotated[
         str, Form(description="内容模式：single 或 story，默认 single")
     ] = _CONTENT_MODE_SINGLE,
@@ -675,6 +905,10 @@ async def publish(
     created_at: Annotated[
         str | None,
         Form(description="可选：源 runs.created_at（ISO8601），用于 published_videos.created_at"),
+    ] = None,
+    source_locale_hint: Annotated[
+        str | None,
+        Form(description="可选 BCP 47 原文语言提示；最终以翻译服务检测结果为准"),
     ] = None,
     timeline: Annotated[
         str | None, Form(description="single 模式：timeline JSON 字符串")
@@ -832,6 +1066,8 @@ async def publish(
             bridge_version=None,
             required_capabilities=[],
             version=version,
+            title=(title or "").strip(),
+            description=(description or "").strip(),
             user_id=author_id,
             content_mode=mode,
             feed_weight=weight,
@@ -843,6 +1079,7 @@ async def publish(
         )
         db.add(row)
         record_published_video_text(db, row)
+        queue_content_translation(db, row, source_locale_hint=source_locale_hint)
         ensure_seo_row(db, row)
         db.commit()
         log.info(
@@ -874,6 +1111,10 @@ async def publish(
     row.bridge_version = None
     row.required_capabilities = []
     row.version = version
+    if title is not None:
+        row.title = title.strip()
+    if description is not None:
+        row.description = description.strip()
     row.user_id = author_id
     row.content_mode = mode
     if feed_weight is not None:
@@ -884,6 +1125,7 @@ async def publish(
         row.is_tutorial = tutorial_flag
     row.updated_at = now
     record_published_video_text(db, row)
+    queue_content_translation(db, row, source_locale_hint=source_locale_hint)
     mark_seo_stale(db, row)
     db.commit()
     log.info(
@@ -1685,6 +1927,7 @@ def patch_content_management_detail(
 
     row.updated_at = datetime.now(timezone.utc)
     record_published_video_text(db, row)
+    queue_content_translation(db, row)
     mark_seo_stale(db, row)
     db.commit()
     db.refresh(row)

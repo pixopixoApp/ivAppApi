@@ -184,6 +184,7 @@ class RuntimeObjectPublishRequest(BaseModel):
     assets: list[RuntimePublishAssetRequest] = Field(min_length=1, max_length=200)
     title: str = Field(default="", max_length=120)
     description: str = Field(default="", max_length=1200)
+    source_locale_hint: str | None = Field(default=None, max_length=35)
     feed_weight: int | None = None
     is_tutorial: bool | None = None
     # Optional cover media object id (uploaded via /internal/v1/publish-cover).

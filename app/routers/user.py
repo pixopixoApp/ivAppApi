@@ -19,6 +19,7 @@ from app.config import Settings, get_settings
 from app.creator_channels import channel_relations, ensure_user_handle
 from app.creator_channels import iso as channel_iso
 from app.db import get_db
+from app.locale import request_locale
 from app.logging_config import get_logger
 from app.models import Follow, User
 from app.pagination import (
@@ -845,6 +846,7 @@ def post_user_videos(
                 payload.body.supported_experience_spec_versions,
                 payload.body.supported_camera_continuous_targets,
             ),
+            locale=request_locale(request),
         )
     except CursorError:
         return user_videos_error(ver=settings.server_ver, head_in=payload.head)
@@ -897,6 +899,7 @@ def post_my_videos(
                 payload.body.supported_experience_spec_versions,
                 payload.body.supported_camera_continuous_targets,
             ),
+            locale=request_locale(request),
         )
     except CursorError:
         return my_videos_error(ver=settings.server_ver, head_in=payload.head)
@@ -957,6 +960,7 @@ def post_following_feed(
                 payload.body.supported_experience_spec_versions,
                 payload.body.supported_camera_continuous_targets,
             ),
+            locale=request_locale(request),
         )
     except CursorError:
         return following_feed_error(ver=settings.server_ver, head_in=payload.head)

@@ -17,6 +17,8 @@ def test_admin_publish_compiles_before_persisting_and_preserves_old_media_on_err
         "video_id": "single-demo",
         "version": "1",
         "user_id": "author",
+        "title": "Tap the light",
+        "description": "Tap when the light appears.",
         "content_mode": "single",
         "timeline": json.dumps(
             {"interactions": [{"gesture": "mic_level", "gate_at_ms": 500}]}
@@ -47,6 +49,8 @@ def test_admin_publish_compiles_before_persisting_and_preserves_old_media_on_err
     db.expire_all()
     row = db.get(PublishedVideo, "single-demo")
     assert row.version == "1"
+    assert row.title == "Tap the light"
+    assert row.description == "Tap when the light appears."
     interaction = row.runtime_spec["video"][0]["interactions"][0]
     assert interaction["detection"]["response_window_ms"] == 0
     assert Path("/tmp/ivapp-pytest-media/single-demo.mp4").read_bytes() == b"old-video"

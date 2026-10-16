@@ -27,6 +27,7 @@ from app.cdn_publication import (
     stage_publication_gate,
 )
 from app.config import Settings, get_settings
+from app.content_localization import queue_content_translation
 from app.creator_channels import unpin_video
 from app.creator_drafts import draft_page, require_other_creations_idle
 from app.creator_interaction_presets import (
@@ -2201,6 +2202,11 @@ def publish_creation(
             db.add(version)
         row.updated_at = now
         record_published_video_text(db, published)
+        queue_content_translation(
+            db,
+            published,
+            source_locale_hint=payload.source_locale_hint,
+        )
         ensure_seo_row(db, published)
         record_creator_creation_text(db, row)
         if version is not None:

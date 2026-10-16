@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     cursor_secret: str = ""
     server_ver: str = "1.2"
     log_level: str = "INFO"
+    geoip_country_database: str = ""
+    geoip_trust_proxy_headers: bool = False
     # Where published mp4 files live (compose bind: ./volumes → /volumes)
     media_root: str = "/volumes/media"
 
@@ -166,6 +168,10 @@ class Settings(BaseSettings):
     creator_internal_key: str = ""
     creator_ivadmin_timeout_seconds: float = 30.0
     creator_worker_poll_seconds: float = 2.0
+    content_translation_request_timeout_seconds: float = 150.0
+    # Translation writes are always safe to queue. This flag only controls
+    # whether localized values replace canonical creator text on read paths.
+    content_localization_enabled: bool = False
     creator_video_max_bytes: int = 120 * 1024 * 1024
     creator_web_source_max_bytes: int = 1024 * 1024 * 1024
     creator_video_max_duration_seconds: int = 30
