@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import secrets
@@ -38,6 +40,8 @@ from app.media_api import (
     InternalUploadSessionRequest,
     MediaObjectDownloadOut,
     MediaObjectOut,
+    ReferenceImageUploadRequest,
+    ReferenceImageUploadResponse,
     RetireLegacyJsonObjectsRequest,
     UploadSessionOut,
 )
@@ -68,7 +72,16 @@ from app.models import (
     MediaObject,
     MediaUploadSession,
 )
-from app.oss_storage import OssStorageError, delete_object, public_url, sign_get_url
+from app.oss_storage import (
+    OssObjectNotFoundError,
+    OssStorageError,
+    delete_object,
+    head_object,
+    object_key,
+    public_url,
+    sign_get_url,
+    upload_bytes,
+)
 from app.schemas_platform import CreatorUploadOut
 from app.video_probe import VideoProbeError, probe_video
 from app.web_session import require_creator_user
@@ -822,3 +835,93 @@ def finalize_creator_upload(
     db.commit()
     db.refresh(row)
     return _creator_upload_out(row)
+
+
+# ---------- 参考图入库（ivadmin AI 视频生成） ----------
+
+_REFERENCE_IMAGE_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+_REFERENCE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+
+
+@router.post(
+    "/internal/v1/media/reference-images",
+    dependencies=[Depends(require_publish_key)],
+    response_model=ReferenceImageUploadResponse,
+)
+def upload_reference_image(
+    payload: ReferenceImageUploadRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ReferenceImageUploadResponse:
+    """把 data URL 图片落到公开 OSS 桶，回传上游可直接抓取的公网地址。
+
+    Seedance / Vidu 只接受公网可访问的图片 URL；ivadmin 不持有阿里云凭证，
+    因此由这里完成入库。对象按内容 sha256 命名，重复图片天然去重且可长期保存。
+    """
+    raw_data_url = payload.data_url.strip()
+    try:
+        header, b64 = raw_data_url.split(",", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid data URL") from exc
+
+    if not header.startswith("data:"):
+        raise HTTPException(status_code=400, detail="invalid data URL")
+    meta = header[len("data:") :]
+    mime = meta.split(";", 1)[0].strip().lower()
+    extension = _REFERENCE_IMAGE_MIME.get(mime)
+    if extension is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported image type: {mime or 'unknown'}",
+        )
+
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid image base64") from exc
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty image payload")
+    if len(raw) > _REFERENCE_IMAGE_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="image exceeds 20MB limit")
+
+    digest = hashlib.sha256(raw).hexdigest()
+    key = object_key(
+        settings,
+        "reference-images",
+        payload.namespace,
+        digest[:2],
+        f"{digest}{extension}",
+    )
+
+    deduplicated = True
+    try:
+        head_object(settings, key=key)
+    except OssObjectNotFoundError:
+        deduplicated = False
+    except OssStorageError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not deduplicated:
+        try:
+            upload_bytes(
+                settings,
+                key=key,
+                payload=raw,
+                content_type=mime,
+                public=True,
+                immutable=True,
+            )
+        except OssStorageError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return ReferenceImageUploadResponse(
+        url=public_url(settings, key),
+        object_key=key,
+        sha256=digest,
+        content_type=mime,
+        size_bytes=len(raw),
+        deduplicated=deduplicated,
+    )

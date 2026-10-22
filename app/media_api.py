@@ -207,3 +207,30 @@ class RuntimePreviewRequest(BaseModel):
     timeline: dict[str, Any] | None = None
     story: dict[str, Any] | None = None
     assets: list[RuntimePublishAssetRequest] = Field(min_length=1, max_length=200)
+
+
+class ReferenceImageUploadRequest(BaseModel):
+    """ivadmin 参考图入库请求。
+
+    ivadmin 的 AI 视频生成需要把参考图以「公网 URL」形式交给 Seedance / Vidu，
+    因此由 ivapp 负责落 OSS 并回传公开地址；ivadmin 自身不持有阿里云凭证。
+    """
+
+    data_url: str = Field(
+        min_length=32,
+        description="data:image/...;base64,... 形式的内联图片",
+    )
+    namespace: str = Field(
+        default="seedance-reference",
+        pattern=r"^[a-z0-9][a-z0-9-]{1,62}$",
+        description="OSS 对象 key 的二级目录，用于按来源归类",
+    )
+
+
+class ReferenceImageUploadResponse(BaseModel):
+    url: str
+    object_key: str
+    sha256: str
+    content_type: str
+    size_bytes: int
+    deduplicated: bool = False
