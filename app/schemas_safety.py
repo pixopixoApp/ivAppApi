@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ReportTargetType = Literal["video", "user", "comment"]
+ReportTargetType = Literal["video", "user", "comment", "ai_source", "ai_version"]
 ReportStatus = Literal["pending", "actioned", "dismissed"]
 
 
@@ -22,6 +22,7 @@ class SafetyReportOut(BaseModel):
     target_id: str
     target_user_id: str | None = None
     target_label: str = ""
+    target_context: dict = Field(default_factory=dict)
     reporter_label: str = ""
     reason: str
     details: str

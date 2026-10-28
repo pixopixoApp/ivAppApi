@@ -220,3 +220,58 @@ def test_email_account_deletion_requires_a_valid_deactivation_code(db, monkeypat
     assert rejected.status_code == 400
     assert accepted.status_code == 200
     assert db.get(User, "email-delete") is None
+
+
+def test_ai_reports_are_private_and_reach_moderation(db, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from app.models import CreatorCreation, CreatorSourceGeneration, CreatorVersion
+    monkeypatch.setattr("app.routers.safety.get_settings", lambda: SimpleNamespace(
+        public_share_base_url="https://api.example.com",
+    ))
+
+    token = _login(db, "creator")
+    other_token = _login(db, "other")
+    _published(db, "own-video", "creator")
+    now = datetime.now(timezone.utc)
+    db.add(CreatorCreation(id="creation-1", user_id="creator", status="ready"))
+    db.add(CreatorSourceGeneration(
+        id="generation-1", creation_id="creation-1", user_id="creator", attempt=1,
+        request_id="request-1", original_prompt="A prompt", quota_date="2026-10-28",
+        status="ready", expires_at=now + timedelta(days=1), ivadmin_job_id="job-1", upload_id="upload-1",
+    ))
+    db.add(CreatorVersion(
+        id="version-1", creation_id="creation-1", user_id="creator", number=1,
+        request_id="version-request-1", status="ready", brief="A version",
+        runtime_spec={"video": []},
+    ))
+    db.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+    other = {"Authorization": f"Bearer {other_token}"}
+    moderation = {"X-Publish-Key": "test-publish-key"}
+    with TestClient(app) as client:
+        def report(target_type, target_id, auth=headers):
+            return client.post("/api/v1/safety/reports", headers=auth, json={
+                "target_type": target_type, "target_id": target_id,
+                "reason": "dangerous_acts", "details": "unsafe result",
+            })
+
+        own_video = report("video", "own-video")
+        source = report("ai_source", "generation-1")
+        version = report("ai_version", "version-1")
+        assert all(response.status_code == 200 for response in (own_video, source, version))
+        assert report("ai_source", "generation-1", other).status_code == 404
+        assert report("ai_version", "version-1", other).status_code == 404
+        assert report("ai_source", "missing").status_code == 404
+        assert report("user", "creator").status_code == 400
+        listed = client.get("/internal/v1/moderation/reports?target_type=ai_source", headers=moderation)
+        assert listed.status_code == 200
+        item = listed.json()["items"][0]
+        assert item["target_context"]["job_id"] == "job-1"
+        assert item["target_context"]["prompt"] == "A prompt"
+        assert item["target_context"]["preview_url"] == "https://api.example.com/api/v1/creator/previews/upload-1"
+        assert item["details"] == "unsafe result"
+        decided = client.post(f"/internal/v1/moderation/reports/{item['id']}/decision",
+                              headers=moderation, json={"status": "actioned", "action": "none"})
+        assert decided.status_code == 200
+        assert decided.json()["status"] == "actioned"

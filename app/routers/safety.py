@@ -8,12 +8,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth_user import AppUser, require_bearer_user
+from app.config import get_settings
 from app.creator_channels import unpin_video
 from app.db import get_db
 from app.deps import require_publish_key
 from app.models import (
     Comment,
     ContentReport,
+    CreatorSourceGeneration,
+    CreatorVersion,
     Follow,
     PublishedVideo,
     User,
@@ -50,9 +53,26 @@ def _iso(value: datetime | None) -> str | None:
 def _report_out(db: Session, row: ContentReport) -> SafetyReportOut:
     reporter = db.get(User, row.reporter_user_id)
     target_user = db.get(User, row.target_user_id) if row.target_user_id else None
+    target_context = {}
+    if row.target_type == "ai_source":
+        generation = db.get(CreatorSourceGeneration, row.target_id)
+        if generation:
+            target_context = {"creation_id": generation.creation_id, "attempt": generation.attempt,
+                              "kind": generation.generation_kind, "prompt": generation.original_prompt,
+                              "upload_id": generation.upload_id, "job_id": generation.ivadmin_job_id}
+            public_base = get_settings().public_share_base_url.rstrip("/")
+            if generation.upload_id and public_base.startswith(("https://", "http://")):
+                target_context["preview_url"] = f"{public_base}/api/v1/creator/previews/{generation.upload_id}"
+    elif row.target_type == "ai_version":
+        version = db.get(CreatorVersion, row.target_id)
+        if version:
+            target_context = {"creation_id": version.creation_id, "version": version.number,
+                              "prompt": version.brief, "runtime_spec": version.runtime_spec}
     if row.target_type == "video":
         video = db.get(PublishedVideo, row.target_id)
         target_label = (video.title if video is not None else "") or row.target_id
+    elif row.target_type in {"ai_source", "ai_version"}:
+        target_label = f"AI result ({row.target_type}): {row.target_id}"
     elif row.target_type == "comment":
         comment = db.get(Comment, row.target_id)
         target_label = ((comment.body[:80] if comment else "") or row.target_id)
@@ -65,6 +85,7 @@ def _report_out(db: Session, row: ContentReport) -> SafetyReportOut:
         target_id=row.target_id,
         target_user_id=row.target_user_id,
         target_label=target_label,
+        target_context=target_context,
         reporter_label=((reporter.nickname if reporter else "") or row.reporter_user_id),
         reason=row.reason,
         details=row.details or "",
@@ -98,12 +119,19 @@ def create_report(
         ):
             raise HTTPException(status_code=404, detail="comment not found")
         target_user_id = comment.author_user_id
+    elif payload.target_type in {"ai_source", "ai_version"}:
+        model = {"ai_source": CreatorSourceGeneration, "ai_version": CreatorVersion}[payload.target_type]
+        result = db.get(model, target_id)
+        # Draft results are private. Do not reveal whether another user's result exists.
+        if result is None or result.user_id != user.user_id:
+            raise HTTPException(status_code=404, detail="AI result not found")
+        target_user_id = None
     else:
         target = db.get(User, target_id)
         if target is None or not target.enabled:
             raise HTTPException(status_code=404, detail="user not found")
         target_user_id = target.user_id
-    if target_user_id == user.user_id:
+    if payload.target_type in {"user", "comment"} and target_user_id == user.user_id:
         raise HTTPException(status_code=400, detail="cannot report yourself")
 
     existing = (
@@ -220,7 +248,7 @@ def list_blocks(
 def list_reports(
     db: Annotated[Session, Depends(get_db)],
     status: Literal["pending", "actioned", "dismissed"] | None = None,
-    target_type: Literal["video", "user", "comment"] | None = None,
+    target_type: Literal["video", "user", "comment", "ai_source", "ai_version"] | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> SafetyReportPage:
