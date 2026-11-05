@@ -42,6 +42,7 @@ from app.media_api import (
     MediaObjectOut,
     ReferenceImageUploadRequest,
     ReferenceImageUploadResponse,
+    ReferenceMediaUploadRequest,
     RetireLegacyJsonObjectsRequest,
     UploadSessionOut,
 )
@@ -891,6 +892,119 @@ def upload_reference_image(
     key = object_key(
         settings,
         "reference-images",
+        payload.namespace,
+        digest[:2],
+        f"{digest}{extension}",
+    )
+
+    deduplicated = True
+    try:
+        head_object(settings, key=key)
+    except OssObjectNotFoundError:
+        deduplicated = False
+    except OssStorageError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not deduplicated:
+        try:
+            upload_bytes(
+                settings,
+                key=key,
+                payload=raw,
+                content_type=mime,
+                public=True,
+                immutable=True,
+            )
+        except OssStorageError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return ReferenceImageUploadResponse(
+        url=public_url(settings, key),
+        object_key=key,
+        sha256=digest,
+        content_type=mime,
+        size_bytes=len(raw),
+        deduplicated=deduplicated,
+    )
+
+
+# ---------- 参考视频 / 参考音频入库（ivadmin AI 视频生成） ----------
+
+# Seedance 只接受公网可访问的媒体地址；这里把上传的参考视频/音频落到公开 OSS。
+_REFERENCE_MEDIA_MIME = {
+    # 参考视频
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-m4v": ".m4v",
+    # 参考音频
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+}
+_REFERENCE_VIDEO_MAX_BYTES = 200 * 1024 * 1024
+_REFERENCE_AUDIO_MAX_BYTES = 20 * 1024 * 1024
+
+
+@router.post(
+    "/internal/v1/media/reference-media",
+    dependencies=[Depends(require_publish_key)],
+    response_model=ReferenceImageUploadResponse,
+)
+def upload_reference_media(
+    payload: ReferenceMediaUploadRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ReferenceImageUploadResponse:
+    """把 data URL 参考视频/音频落到公开 OSS 桶，回传上游可抓取的公网地址。
+
+    ivadmin 自身的 /uploads 路由需要后台登录态，火山方舟抓取会 401，
+    因此参考媒体一律走这里入公开 OSS。对象按内容 sha256 命名，天然去重。
+    """
+    raw_data_url = payload.data_url.strip()
+    try:
+        header, b64 = raw_data_url.split(",", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid data URL") from exc
+
+    if not header.startswith("data:"):
+        raise HTTPException(status_code=400, detail="invalid data URL")
+    meta = header[len("data:") :]
+    mime = meta.split(";", 1)[0].strip().lower()
+    extension = _REFERENCE_MEDIA_MIME.get(mime)
+    if extension is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported media type: {mime or 'unknown'}",
+        )
+
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid media base64") from exc
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty media payload")
+
+    is_audio = mime.startswith("audio/")
+    limit = _REFERENCE_AUDIO_MAX_BYTES if is_audio else _REFERENCE_VIDEO_MAX_BYTES
+    if len(raw) > limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"audio exceeds {_REFERENCE_AUDIO_MAX_BYTES // (1024 * 1024)}MB limit"
+                if is_audio
+                else f"video exceeds {_REFERENCE_VIDEO_MAX_BYTES // (1024 * 1024)}MB limit"
+            ),
+        )
+
+    digest = hashlib.sha256(raw).hexdigest()
+    key = object_key(
+        settings,
+        "reference-media",
         payload.namespace,
         digest[:2],
         f"{digest}{extension}",

@@ -234,3 +234,22 @@ class ReferenceImageUploadResponse(BaseModel):
     content_type: str
     size_bytes: int
     deduplicated: bool = False
+
+
+class ReferenceMediaUploadRequest(BaseModel):
+    """ivadmin 参考媒体（视频 / 音频）入库请求。
+
+    Seedance 要求参考视频、参考音频必须是公网可访问的 http(s) 地址；
+    ivadmin 自身的 /uploads 路由需要后台登录态，上游抓取会 401，
+    因此统一由 ivapp 落公开 OSS 并回传公网地址。
+    """
+
+    data_url: str = Field(
+        min_length=32,
+        description="data:video/... 或 data:audio/...;base64,... 形式的内联媒体",
+    )
+    namespace: str = Field(
+        default="seedance-reference",
+        pattern=r"^[a-z0-9][a-z0-9-]{1,62}$",
+        description="OSS 对象 key 的二级目录，用于按来源归类",
+    )
